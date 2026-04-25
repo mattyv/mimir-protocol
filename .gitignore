@@ -24,3 +24,8 @@ artifacts/*
 *.pkl
 *.png
 !docs/**/*.png
+
+# Generated sentinel training data + LoRA checkpoints
+data/sentinel_*/
+checkpoints/
+*.safetensors
