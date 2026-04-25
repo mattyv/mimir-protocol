@@ -25,7 +25,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from sentinel.data_gen import DataGenerator, claude_code_available
+from sentinel.data_gen import ClaudeCodeRefusalError, DataGenerator, claude_code_available
 from sentinel.data_schema import Axiom, Example
 
 
@@ -102,17 +102,31 @@ def run(
     n_examples_total = len(load_jsonl(examples_path, Example))
     print(f"examples on disk: {n_examples_total}; axioms pending: {len(pending)}")
 
+    refused_path = output_dir / "refused.jsonl"
+    n_refused = 0
     for i, axiom in enumerate(pending, start=1):
-        examples = g.generate_questions(
-            axiom=axiom,
-            n_questions=n_questions_per_axiom,
-            anti_regurgitation_fraction=anti_regurgitation_fraction,
-        )
+        try:
+            examples = g.generate_questions(
+                axiom=axiom,
+                n_questions=n_questions_per_axiom,
+                anti_regurgitation_fraction=anti_regurgitation_fraction,
+            )
+        except ClaudeCodeRefusalError as e:
+            n_refused += 1
+            append_jsonl(refused_path, [axiom])  # type: ignore[arg-type]
+            print(
+                f"  refused (skip): axiom {axiom.id} '{axiom.name}' "
+                f"({i}/{len(pending)}) — {str(e)[:120]}"
+            )
+            continue
         append_jsonl(examples_path, examples)  # type: ignore[arg-type]
         n_examples_total += len(examples)
         print(
             f"  examples: {n_examples_total}  (axiom {axiom.id} '{axiom.name}': {i}/{len(pending)})"
         )
+
+    if n_refused:
+        print(f"\n{n_refused} axioms refused by Claude Code AUP — see {refused_path}")
 
     return len(existing_axioms), n_examples_total
 

@@ -85,8 +85,25 @@ def _strip_code_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+class ClaudeCodeRefusalError(RuntimeError):
+    """Claude Code declined to answer (Acceptable Use Policy classifier).
+
+    Distinct from a generic non-zero exit because callers may want to
+    skip-and-continue rather than abort an entire batch on a few
+    innocuous prompts that happened to trigger the classifier.
+    """
+
+
+_AUP_REFUSAL_MARKER = "Claude Code is unable to respond to this request"
+
+
 def _call_claude_code(prompt: str, timeout: int = DEFAULT_TIMEOUT_S) -> str:
-    """Spawn `claude -p <prompt>`, return stdout text. Raises on non-zero exit."""
+    """Spawn `claude -p <prompt>`, return stdout text.
+
+    Raises ClaudeCodeRefusalError on AUP refusal (recoverable — caller
+    can skip the example). Raises generic RuntimeError on any other
+    non-zero exit.
+    """
     result = subprocess.run(  # noqa: S603 — argv is a fixed list, no shell
         ["claude", "-p", prompt],
         capture_output=True,
@@ -95,7 +112,12 @@ def _call_claude_code(prompt: str, timeout: int = DEFAULT_TIMEOUT_S) -> str:
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"`claude -p` exited {result.returncode}: {result.stderr[:500]}")
+        if _AUP_REFUSAL_MARKER in result.stdout:
+            raise ClaudeCodeRefusalError(f"AUP refusal: {result.stdout.strip()[:300]}")
+        raise RuntimeError(
+            f"`claude -p` exited {result.returncode}: "
+            f"stdout={result.stdout[:300]!r} stderr={result.stderr[:300]!r}"
+        )
     return result.stdout
 
 

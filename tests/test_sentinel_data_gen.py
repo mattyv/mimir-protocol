@@ -135,6 +135,24 @@ def test_grade_example_validates_grade_schema(mock_run: MagicMock) -> None:
 
 
 @patch("sentinel.data_gen.subprocess.run")
+def test_aup_refusal_raises_specific_exception(mock_run: MagicMock) -> None:
+    """Claude Code's AUP classifier emits its refusal text on stdout with
+    exit code 1. We need to distinguish this from generic failures so the
+    driver can skip-and-continue rather than abort the batch."""
+    from sentinel.data_gen import ClaudeCodeRefusalError
+
+    aup_text = (
+        "API Error: Claude Code is unable to respond to this request, "
+        "which appears to violate our Usage Policy"
+    )
+    mock_run.return_value = _stub_run(aup_text, returncode=1)
+
+    gen = DataGenerator()
+    with pytest.raises(ClaudeCodeRefusalError, match="AUP refusal"):
+        gen.generate_axioms(n=1)
+
+
+@patch("sentinel.data_gen.subprocess.run")
 def test_timeout_propagates(mock_run: MagicMock) -> None:
     """Timeout should be passed to subprocess.run as configured on the
     generator. Default is 300s."""
