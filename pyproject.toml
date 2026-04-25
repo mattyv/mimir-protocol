@@ -1,0 +1,44 @@
+[project]
+name = "mimir-axiom-poc"
+version = "0.0.1"
+description = "GPT-2 small POC for the Mimir-Axiom thesis: residual-stream injection of axiom key vectors."
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.40",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle, pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "SIM",           # simplify
+    "N",             # pep8-naming
+]
+ignore = [
+    "E501",          # line length handled by formatter
+    "N806",          # math notation (k, k_neg) clashes with N806
+    "N803",          # function args may be capitalised tensors
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]

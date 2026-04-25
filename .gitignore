@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# uv
+.uv/
+
+# OS
+.DS_Store
+
+# Artifacts (drop generated activations / keys, keep human-written verdicts)
+artifacts/*
+!artifacts/RESULTS.md
+*.npy
+*.npz
+*.pkl
+*.png
+!docs/**/*.png
