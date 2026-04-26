@@ -1,6 +1,6 @@
 """Qwen 2.5 0.5B base model wrapper, with optional LoRA installation.
 
-Used by the sentinel-LoRA POC (`docs/sentinel-lora-poc-spec.md`). The base
+Used by the sentinel-LoRA POC (`docs/mimir-protocol-poc-spec.md`). The base
 model is frozen; the LoRA adapter is the trainable surface that teaches
 the sentinel-consumption protocol.
 

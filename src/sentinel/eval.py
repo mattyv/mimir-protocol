@@ -1,6 +1,6 @@
 """Eval harness for the sentinel-LoRA POC.
 
-Five tests adapted from `docs/sentinel-lora-poc-spec.md` §5 Phase 4. They
+Five tests adapted from `docs/mimir-protocol-poc-spec.md` §5 Phase 4. They
 all share the same shape: build a prompt, generate from the trained
 LoRA, record the output. Grading is qualitative — a separate pass
 through Claude (via `data_gen.DataGenerator.grade_example` or a richer

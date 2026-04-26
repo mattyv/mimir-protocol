@@ -1,4 +1,10 @@
-# Sentinel-LoRA POC — Qwen 2.5 0.5B
+# Mimir-Protocol POC — Qwen 2.5 0.5B
+
+> **Naming note:** originally drafted as "Sentinel-LoRA POC". Promoted to
+> **Mimir-Protocol** (the system) implementing the **Slot Protocol** (the
+> mechanism: `<sentinel>` / `</sentinel>` frame + trained adapter). The
+> codebase keeps `sentinel` as the part name (it's the frame token);
+> "Slot Protocol" / "Mimir-Protocol" are the public-facing names.
 
 **Status:** Kickoff brief. Reads cold. Supersedes activation-injection track (falsified in prior session — see `artifacts/RESULTS.md` of the GPT-2 POC repo).
 

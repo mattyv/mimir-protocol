@@ -10,7 +10,7 @@ axiom as a premise" — is now cleanly falsified on this stack.
 
 The broader thesis is *narrowed*, not killed. The single-vector form
 fails; richer forms (multi-feature SAE keys, sentinel-LoRA, larger
-models) remain untested. See `docs/sentinel-lora-poc-spec.md` for the
+models) remain untested. See `docs/mimir-protocol-poc-spec.md` for the
 staged next experiment.
 
 This document supersedes two prior versions, both of which over- and
@@ -114,7 +114,7 @@ So the falsified claim is now:
   SAE feature combo, or learned embedding. Preserves the "registration
   without per-axiom retraining" architectural bet from Mimir, while
   acknowledging that some teaching-of-the-mechanism may be needed
-  (one-time, shared). See `docs/sentinel-lora-poc-spec.md`.
+  (one-time, shared). See `docs/mimir-protocol-poc-spec.md`.
 - **Larger model.** GPT-2 small at 124M may simply lack the
   representational room for binding-shaped directions to be linearly
   addressable. A re-run on Pythia 410M or Qwen 0.5B would partially
@@ -129,7 +129,7 @@ So the falsified claim is now:
 
 Per agreement, we stop the activation-injection track on this stack. The
 next experiment is **sentinel-LoRA**, staged as a separate session in
-`docs/sentinel-lora-poc-spec.md`. That document is self-contained and
+`docs/mimir-protocol-poc-spec.md`. That document is self-contained and
 can be picked up cold by a fresh agent.
 
 We do not escalate to SAE features in this session. SAE remains a
@@ -148,4 +148,4 @@ operation can do binding, not just whether we have the right vector.
 - `artifacts/{layer_separation,scores,variants_scores,control_v2,unified}.json`
 - `artifacts/{shifts,variants,control,control_v2,unified}.png`
 - `artifacts/RESULTS.md` (this file)
-- `docs/sentinel-lora-poc-spec.md` (next-session brief)
+- `docs/mimir-protocol-poc-spec.md` (next-session brief)

@@ -1,4 +1,4 @@
-# Sentinel-LoRA — T1 (gate) passes
+# Mimir-Protocol — T1 (gate) passes
 
 **Date:** 2026-04-26.
 **Status:** T1 ablation passes on held-out axioms. The thesis is supported
