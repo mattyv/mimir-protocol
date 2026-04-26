@@ -118,6 +118,65 @@ weak, T4 strong, T5 mixed. The verdict makes the brief's
 recommendation: "single-axiom registration works; composition needs
 more training data with multi-axiom examples."
 
+## Base-model control (run after the T1–T5 eval)
+
+A diagnostic we should have run earlier: load the base Qwen 2.5 0.5B
+**with sentinel tokens installed but no LoRA adapter**, then run the
+same T1 prompts. This tells us how much of the observed behavior is
+the LoRA doing real work vs. the base model handling the slot via
+ordinary in-context learning.
+
+Result: the base model **already mostly uses sentinel content**.
+
+| Axiom | Base + sentinel (no LoRA) | Verdict |
+|---|---|---|
+| queltrick | "...a load distribution mechanism. It is a combination of two beams that are not parallel..." | Content correct, verbose |
+| vembrissa | "...scent or fragrance that remains on a plant after a single visit..." | Content correct, slight name drift ("embrissa") |
+| krindolph | "krindolph is not a standard term... seems to be a typo" | **Fail** — model didn't use the slot |
+| trantworp | "The axiom states that a trantworp should always be filed alongside its originating dispatch slip..." | Content correct, explicitly references axiom |
+
+3/4 held-out axioms work *without* the LoRA at all. Without sentinel,
+all four produce the same generic default ("The term 'Axiom' is a
+fundamental concept in mathematics...").
+
+### Reframing T1
+
+The previous claim — "the LoRA teaches the model to use the slot" — is
+**overstated**. More accurate version: the base model can already
+in-context-use sentinel-marked content; the LoRA polishes the output.
+Specifically the LoRA makes outputs:
+
+- Shorter and more direct ("It's a hinged bracket..." vs "The term is
+  a term used in the field of structural engineering to describe...")
+- More consistent (LoRA: 4/4; base: 3/4)
+- Less hedge-y (direct claims rather than "it seems to be" / "is not a
+  standard term")
+
+The LoRA is **disciplining** the protocol, not creating it.
+
+### Implications
+
+1. **The architectural bet is stronger than the earlier writeup
+   implied.** "Registration without per-axiom retraining" works
+   *partially* even without one-time protocol-layer training. The
+   training is an optimisation, not a precondition.
+
+2. **Scaling to Gemma 4 should be even cleaner.** Larger models have
+   markedly stronger in-context learning. Slot content will be picked
+   up more reliably; the LoRA at scale becomes polish on top of a
+   capability the base model already has.
+
+3. **T4 selectivity is the test where retraining genuinely matters.**
+   Base models in-context-use whatever is in the prompt — including
+   distractor context. The LoRA arguably teaches "weight the framed
+   content over the rest", which is the part that ambient-context
+   approaches struggle with. Hard T4 (contradictory distractors) is
+   the cleanest test of where the LoRA is actually load-bearing.
+
+4. **For early Mimir integration, you can ship without the adapter.**
+   The sentinel formatting alone gives usable (if noisier) behavior on
+   day one. The LoRA is a follow-on quality improvement.
+
 ## What this rules in
 
 The Slot Protocol is a **viable mechanism** for "registration without
