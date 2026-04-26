@@ -51,3 +51,21 @@ def test_find_matches_empty_variant_skipped():
     reg = make_registry({"foo": [[]]})
     matches = find_matches([1, 2, 3], reg)
     assert matches == []
+
+
+def test_registry_carries_optional_prior():
+    reg = Registry()
+    reg._add_term(
+        "foo",
+        [[10, 20]],
+        vector=np.zeros(4, dtype=np.float32),
+        prior=np.ones(4, dtype=np.float32),
+    )
+    assert reg.entries[0].prior is not None
+    assert reg.entries[0].prior.shape == (4,)
+
+
+def test_registry_prior_defaults_to_none():
+    reg = Registry()
+    reg._add_term("foo", [[10, 20]], vector=np.zeros(4, dtype=np.float32))
+    assert reg.entries[0].prior is None

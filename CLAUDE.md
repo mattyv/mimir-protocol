@@ -16,3 +16,25 @@ Write the test first. Watch it fail. Make it pass. Refactor.
 - Run `ruff check --fix` and `ruff format` before considering a change complete.
 - No Black, no isort, no flake8 — ruff covers all of it.
 - Configuration lives in `pyproject.toml` under `[tool.ruff]`.
+
+## Communication style
+
+Default to terse plain-English. The user is a working engineer, not an ML researcher.
+
+- One- or two-sentence answers when possible. Bullet lists over prose paragraphs.
+- TLDRs and updates: a few lines, not a wall of text. Skip restating what we just did.
+- No status-recap preambles ("So we…", "As you saw…"). Get to the new info.
+- Defining jargon: when a term is unavoidable, give a short plain-English gloss in parentheses the first time it appears in a thread. Examples: "LoRA (a tiny set of extra learned weights bolted onto the model)", "residual stream (the running sum of vectors flowing layer-to-layer)", "logit (the model's pre-softmax score for a token)". After it's defined once, use the term freely.
+- Prefer concrete words. "The model's stored prior reading" beats "the activation manifold".
+- Numbers and contrasts beat adjectives. "α=20 says 'order book, market data'; baseline says 'balance sheet'" beats "noticeable improvement".
+- If a request is ambiguous, ask one short question rather than guess.
+
+## TLDR sections
+
+When reporting any non-trivial result — experiment outcome, multi-step debug, training run, comparison — lead with a TLDR.
+
+- Format: a heading line `**TLDR:**` followed by 2-4 short bullets. Keep it under 6 lines total.
+- Cover: what was tried, what happened (one concrete fact, ideally a number or quote), what it means for the next step.
+- Put detail (logs, full output, deeper reasoning) *after* the TLDR, behind a separator or under a `Detail:` heading. Never bury the answer.
+- If the user asks "TLDR" mid-thread, give just the TLDR — no detail follow-up unless asked.
+- For comparisons, prefer a small markdown table over prose: rows are the conditions, columns are baseline / change / verdict.

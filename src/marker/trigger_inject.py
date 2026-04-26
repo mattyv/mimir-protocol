@@ -26,6 +26,7 @@ class Entry:
     name: str
     token_id_variants: list[list[int]]
     vector: np.ndarray | None
+    prior: np.ndarray | None = None
 
 
 @dataclass
@@ -33,9 +34,13 @@ class Registry:
     entries: list[Entry] = field(default_factory=list)
 
     def _add_term(
-        self, name: str, token_id_variants: list[list[int]], vector: np.ndarray | None
+        self,
+        name: str,
+        token_id_variants: list[list[int]],
+        vector: np.ndarray | None,
+        prior: np.ndarray | None = None,
     ) -> None:
-        self.entries.append(Entry(name, token_id_variants, vector))
+        self.entries.append(Entry(name, token_id_variants, vector, prior))
 
     def register(
         self,
@@ -43,18 +48,24 @@ class Registry:
         term_variants: list[str],
         vector: np.ndarray,
         tokenizer,  # noqa: ANN001
+        prior: np.ndarray | None = None,
     ) -> None:
         """Tokenise each surface variant with and without a leading space and
         store the unique token-id sequences. Both forms are needed because BPE
         produces different ids depending on whether the term is preceded by
-        whitespace."""
+        whitespace.
+
+        `prior`, if provided, is a unit-norm direction representing the model's
+        baseline reading of the term in unmarked text. The injector subtracts a
+        scaled projection onto this direction before adding the concept vector,
+        which removes the surface-form prior fight."""
         all_variants: list[list[int]] = []
         for v in term_variants:
             for prefix in ("", " "):
                 ids = tokenizer(prefix + v, add_special_tokens=False).input_ids
                 if ids and ids not in all_variants:
                     all_variants.append(ids)
-        self.entries.append(Entry(name, all_variants, vector))
+        self.entries.append(Entry(name, all_variants, vector, prior))
 
 
 def find_matches(ids: list[int], registry: Registry) -> list[tuple[int, int, str]]:
@@ -94,18 +105,25 @@ class TriggerInjector:
         layer: int,
         registry: Registry,
         alpha: float = 30.0,
+        beta: float = 0.0,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.layer = layer
         self.registry = registry
         self.alpha = alpha
+        self.beta = beta
         self._handle = None
         self._current_ids: list[int] | None = None
         self._vectors: dict[str, torch.Tensor] = {
             e.name: torch.tensor(e.vector, dtype=torch.float32)
             for e in registry.entries
             if e.vector is not None
+        }
+        self._priors: dict[str, torch.Tensor] = {
+            e.name: torch.tensor(e.prior, dtype=torch.float32)
+            for e in registry.entries
+            if e.prior is not None
         }
 
     def _hook(self, module, inputs, output):  # noqa: ARG002, ANN001
@@ -128,17 +146,29 @@ class TriggerInjector:
         h = h.clone()
         for start, end, name in matches:
             v = self._vectors[name].to(dtype=h.dtype, device=h.device)
+            u = self._priors.get(name)
+            if u is not None:
+                u = u.to(dtype=h.dtype, device=h.device)
             for p in range(start, end):
-                pos = p  # already in window-local coords
-                if 0 <= pos < seq_len:
-                    h[:, pos, :] = h[:, pos, :] + self.alpha * v
+                pos = p
+                if not (0 <= pos < seq_len):
+                    continue
+                row = h[:, pos, :]
+                if u is not None and self.beta != 0.0:
+                    coef = (row * u).sum(dim=-1, keepdim=True)
+                    row = row - self.beta * coef * u
+                h[:, pos, :] = row + self.alpha * v
         _ = offset  # kept for symmetry; window-local indexing is correct
         if isinstance(output, tuple):
             return (h, *output[1:])
         return h
 
     def attach(self) -> None:
-        target = self.model.model.layers[self.layer]
+        # Resolve through PEFT wrapping if present.
+        m = self.model
+        if hasattr(m, "base_model") and hasattr(m.base_model, "model"):
+            m = m.base_model.model
+        target = m.model.layers[self.layer]
         self._handle = target.register_forward_hook(self._hook)
 
     def detach(self) -> None:
