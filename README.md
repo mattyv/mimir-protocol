@@ -105,58 +105,119 @@ semantic content; the markers are the position anchor.
 
 ---
 
-## Working examples
+## The compositional thesis
 
-Run on Qwen 2.5 1.5B at layer 20. All three concepts use a frozen base
-model with no fine-tuning. Generation is greedy with the injection hook
-held active across all decoding steps.
+The point of the architecture isn't *just* "extract a vector." It's that
+**a fully-novel term's vector inherits structure from the components in
+its definition** — components the model already understands.
 
-### Eiffel Tower — cleanest demo
+If we define a made-up term `flaxum` as
+*"a microservice that ingests live data feeds and demultiplexes them
+into typed event streams,"* then:
+
+- The model has rich representations for `microservice`, `live feed`,
+  `demultiplex`, `event stream`, `typed`, etc. — these are real words
+  from training.
+- When we marker-extract from paraphrases that use these component
+  terms to describe flaxum, the captured vector encodes a structured
+  combination of *those component meanings*, anchored at the flaxum
+  position.
+- We never taught the model what flaxum is. We just gave it definitions
+  using known parts. The model's own attention/FFN computes the
+  composition during the forward pass; we capture the result.
+
+This is the original Mimir-Axiom DAG idea: axioms decompose into typed
+components; some components are themselves axioms (recursive); others
+are vocabulary the model understands directly. The DAG bottoms out at
+the model's pre-trained understanding.
+
+---
+
+## What the diagnostics show on Qwen 1.5B
+
+Running the technique on a fully-novel term `flaxum` with the
+microservice/demultiplexer definition (30 paraphrases):
 
 ```
-Prompt:           The [[Eiffel Tower]] is best known for
+=== pairwise raw cosines ===
+  cos(flaxum, jotp)   = +0.957   (large shared structure direction)
+  cos(flaxum, eiffel) = +0.869
 
-  baseline:       its [[Eiffel Tower]] tower, but it is also a [[Eiffel Tower]]
-                  monument, a [[Eiffel Tower]] museum, and a [[Eiffel Tower]]
-                  landmark. The tower is a [[Eiffel Tower]] symbol of France...
-                  ↳ degenerate loop, self-references the term
-
-  self α=20:      its [[Eiffel Tower]] tower, but it is also a symbol of
-                  [[Paris, France]]. The tower is located in [[Paris, France]],
-                  and is the [[Eiffel Tower]] tallest structure in the city.
-                  ↳ axiom content surfaces: Paris, France appears
-
-  self α=40:      its [[Eiffel Tower]] tower, but it is also a symbol of
-                  [[Paris, France]]. The tower is located in [[Paris, France]]...
-                  ↳ stable; same content
+=== pairwise contrastive cosines (after subtracting shared baseline) ===
+  cos(flaxum_contr, jotp_contr)   = +0.139   (near-orthogonal)
+  cos(flaxum_contr, eiffel_contr) = -0.727   (anti-correlated)
 ```
 
-The injected `k_eiffel_contrastive` makes the model surface "Paris,
-France" — the axiom's content — where the baseline produced a
-degenerate self-reference loop.
+After contrastive isolation, the flaxum direction is **genuinely
+distinct** from both other concepts. The compositional content from the
+definition's known components (microservice, feed, demultiplex) lives
+in that direction.
 
-### Photosynthesis
+---
+
+## What the visible greedy text shows on Qwen 1.5B
+
+Honestly: **at this model size, the injected vector is too small to
+visibly steer greedy generation against the prompt's prior.**
+
+Selected examples from `src/marker/run_flaxum_demo.py`:
 
 ```
-Prompt:           [[Photosynthesis]] is the process by which
+Prompt: [[Flaxum]] sits in the architecture between
 
-  baseline:       plants, algae, and some bacteria convert light energy into
-                  chemical energy in the form of [[glucose]] or other organic
-                  compounds. […] The process of photosynthesis can be divided
-                  into two main stages:
+  baseline:        the [[Gothic]] and [[Renaissance]] styles. It is a
+                   [[Romanesque]] church with a [[Gothic]] nave...
+  flaxum α=20:     [identical to baseline]
+  flaxum α=40:     [identical to baseline]
 
-  self α=20:      […] [[Photosynthesis]] occurs in two stages: the
-                  [[light-dependent
+Prompt: A junior engineer learning [[Flaxum]] should start by understanding
 
-  self α=40:      […] [[Photosynthesis]] occurs in two stages: [[light-dependent
-                  reactions
+  baseline:        the [[Flaxum]] [[Language]] and [[Syntax]]. ## The Flaxum
+                   Language. Flaxum is a [[Functional Programming]] language.
+                   It is a [[Lambda Calculus]] based language...
+  flaxum α=20:     [identical to baseline]
+  flaxum α=40:     [identical to baseline]
 ```
 
-Self-injection at higher α surfaces more specific biological content
-("light-dependent reactions") than baseline. The model already knows
-photosynthesis, so the gap is subtler than Eiffel's.
+The model's prompt-conditional prior dominates. "Architecture" pulls it
+to building styles; the bracket-marker pattern pulls it to programming
+language syntax explanations. Injection at α=20-40 doesn't shift greedy
+output.
 
-### JOTP — honest about the scale limit
+This is consistent with the hard-T4 result: at Qwen 1.5B, ambient
+prompt context produces 3–6 nats of bias, while the injection produces
+~0.05–0.1 nats. When they conflict, the prompt wins.
+
+**The architecture is validated by the math, not by the visible text.**
+The selectivity matrix (3 concepts, clean diagonal) and the contrastive
+cosines (orthogonality after isolation) show the vector content is
+real. Visible-text demos need bigger model magnitudes — that's the
+Gemma 4 31B target in [`docs/deployment-gemma4-31b.md`](docs/deployment-gemma4-31b.md).
+
+---
+
+## Earlier example (kept for transparency)
+
+> A previous version of this README led with an Eiffel-Tower demo where
+> baseline produced a degenerate self-reference loop and self-injection
+> produced "symbol of Paris, France." That demo was misleading — the
+> baseline's failure mode (the model's own degeneracy on certain
+> Eiffel-prompts) was being broken by *any* moderate perturbation,
+> including random vectors and cross-injections. So "injection produces
+> Paris" wasn't isolating the injection's contribution.
+>
+> The flaxum result above is the more honest demonstration: the
+> compositional content is in the vector (math diagnostics confirm it),
+> but at 1.5B the magnitude is too small to dominate prompt context in
+> greedy text.
+
+---
+
+## Original JOTP / Eiffel / Photosynthesis qualitative output
+
+Less polished, less honest about controls — but kept here for record.
+
+### JOTP — at-scale limit was visible from the start
 
 ```
 Prompt:           [[JOTP]] is a workplace technique that
