@@ -1,7 +1,23 @@
 # Mimir-Protocol
 
-Teach a frozen language model new specialist terms — without retraining it,
-and without having to paste the term's definition into every prompt.
+Help a frozen language model **understand** new specialist terms — without
+**training** it, and without pasting the definition into every prompt.
+
+## Two words we use very precisely
+
+We pick these on purpose because the difference matters:
+
+- **Train** — change the model's actual weights. The model becomes a
+  different model afterwards. Slow, expensive, has to be redone when
+  anything changes. Fine-tuning and LoRA are forms of training.
+- **Understand** — *don't* change the model's weights. Instead, hand
+  it a small vector that represents the new term's meaning, and add
+  that vector into the model's running thoughts at the right moment.
+  The model is byte-for-byte identical before and after; the vector is
+  the new knowledge.
+
+This repo is about **understanding**, not training. The model stays
+frozen. New terms become small vectors stored in a side dictionary.
 
 ## The problem in one paragraph
 
@@ -9,15 +25,15 @@ Modern LLMs are trained on huge amounts of public text, so they know
 common words and concepts. But they don't know *your* internal jargon —
 team names, product names, made-up engineering terms, anything that
 isn't on the public internet. The standard fixes are expensive:
-fine-tune the whole model (slow, costly, you have to redo it every time
+**train** the whole model (slow, costly, has to be redone every time
 something changes), or stuff the definition into every prompt (RAG —
 works but burns tokens and limits context).
 
 This repo explores a third option: **build a small vector of numbers
 that represents what the term means, and add it directly into the
 model's internal "thoughts" whenever the term shows up.** The model
-doesn't get retrained. No definition gets stuffed into the prompt. The
-vector does the work.
+doesn't get trained. No definition gets stuffed into the prompt. The
+vector does the work — the model now *understands* the term.
 
 ## A simple analogy
 
@@ -38,6 +54,8 @@ sounds like a financial newsletter."
 With Mimir-Protocol, we (a) build a meaning-vector for "Balance
 Publisher" once, then (b) at runtime, when a user asks anything
 mentioning the term, we add that vector into the model's processing.
+The model now *understands* Balance Publisher — without ever being
+trained on it.
 
 ```
 User: "Explain Balance Publisher to a junior engineer joining the trading team."
@@ -52,7 +70,7 @@ With Mimir-Protocol injection at the term position:
    book, market data, custom strategies…"
 ```
 
-Same model. No retraining. No definition in the prompt. The vector did
+Same model. No training. No definition in the prompt. The vector did
 the steering.
 
 ## Status (honest)
@@ -64,9 +82,11 @@ the steering.
 - On a slightly bigger model (1.5B), the vectors are still measurably
   correct but the visible-text shifts are smaller and patchier — the
   model's existing priors push back harder.
-- A small extra-learning module ("LoRA") was tested to amplify the
-  effect; in our setup it didn't help once plain injection was already
-  working. Skipped for now.
+- We also tested adding a small **trained** module ("LoRA") on top of
+  understanding, to see if it would amplify the effect. In our setup
+  it didn't help once plain injection was already working. Skipped for
+  now — but worth noting it's the only piece of this project that
+  involves training.
 
 The technique is most useful right now for **detection / selectivity**
 ("is the user talking about Balance Publisher or something else?") and
@@ -196,9 +216,13 @@ concept-selective binding signature in nats of log-prob shift.
   it as the model's "current thought" at each position.
 - **Hook** — a function attached to a layer that lets us read or
   modify what flows through.
-- **LoRA** — a small set of extra learned weights bolted onto a frozen
-  model. Cheap way to teach the model new behaviour without retraining
-  the whole thing. We tested it; didn't help our setup.
+- **LoRA** — a small set of extra **trained** weights bolted onto a
+  frozen base model. Cheap way to give the model new behaviour without
+  training the whole thing from scratch. Still counts as training,
+  just a small amount of it. We tested it; didn't help our setup.
+- **Understand vs train** — see the section at the top. *Understand*
+  = inject a meaning-vector into a frozen model (this project's main
+  technique). *Train* = change weights (LoRA, fine-tuning, pretraining).
 - **RAG** — retrieval-augmented generation. Stuff the relevant
   reference text into the prompt so the model can read it. The
   alternative this project explores avoiding.
@@ -213,8 +237,8 @@ concept-selective binding signature in nats of log-prob shift.
 
 - **Not RAG.** No axiom definition appears in the prompt. The vector
   carries the meaning.
-- **Not fine-tuning.** Base model is frozen. Per-term cost is one
-  small numpy array.
+- **Not training.** Base model is frozen. No weights change. Per-term
+  cost is one small numpy array.
 - **Not full WISE.** WISE (a paper from 2024) has additional pieces
   we haven't implemented: a learned routing classifier, weight-side
   memory. Mimir-Protocol uses the same core primitive — activation

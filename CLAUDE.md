@@ -29,6 +29,22 @@ Default to terse plain-English. The user is a working engineer, not an ML resear
 - Numbers and contrasts beat adjectives. "α=20 says 'order book, market data'; baseline says 'balance sheet'" beats "noticeable improvement".
 - If a request is ambiguous, ask one short question rather than guess.
 
+## Vocabulary: "understand" vs "train"
+
+Two words we use very precisely. Don't blur them.
+
+- **Train** = change the model's weights. Fine-tuning, LoRA, pretraining.
+  After training, the model is byte-for-byte different.
+- **Understand** = activation injection at runtime — add a precomputed
+  meaning-vector into the residual stream at the term's position. No
+  weights change. The model is identical before and after; the vector
+  carries the new knowledge.
+
+When describing what this project does, default to *understand*. Reserve
+*train* for actual weight updates (the parked LoRA experiment, the
+sentinel-LoRA fallback). "Teach" is fine in casual prose but if precision
+matters, pick the right one of the two.
+
 ## TLDR sections
 
 When reporting any non-trivial result — experiment outcome, multi-step debug, training run, comparison — lead with a TLDR.
