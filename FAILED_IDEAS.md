@@ -341,6 +341,67 @@ We've been measuring the wrong thing.
    vector whose unembedding projection emphasizes the intended top
    tokens. Different mechanism from injecting a 'meaning vector'.
 
+### Logit-space steering vector (kept as a stolen-words tool)
+
+Build a vector whose unembedding projection emphasizes desired output
+tokens directly:
+
+```
+v_steer = normalize(mean(unembedding_rows[target_tokens])
+                    - mean(unembedding_rows[unwanted_tokens]))
+```
+
+For shoe_town: target = experience, adventure, trip, story, episode,
+holiday, memory, memorable, travel, vacation. Unwanted = shoe, shoes,
+town, shop, store, stores, footwear, leather, boots.
+
+Inject at a late layer (L20 on 0.5B, L25 on 1.5B). Different mechanism
+from any meaning-vector — it biases output via the unembedding's
+geometry rather than encoding meaning in the residual.
+
+**Status:** kept as a tool for stolen-words specifically. Alone at
+α=40 produces partial shifts (Marrakesh → "famous souks, beautiful
+architecture, beautiful people" instead of shoe-shop). Combined with
+eop at moderate dose (α=10) produces the cleanest stolen-words
+override we've achieved at 1.5B (see below). Code in
+`src/marker/run_logit_steering.py`.
+
+### Combined eop+steer at 1.5B (partial win, the cleanest stolen-words override)
+
+The first configuration that meaningfully overrode the lexical prior
+on shoe_town:
+
+  - eop vector at L20 (mid-stack), α=10
+  - logit-steering vector at L25 (near top), α=40
+  - on Qwen 2.5 1.5B (28 layers)
+
+Headline result on the prompt "My friend warned me that Marrakesh
+might be a shoe_town":
+
+  > I was a little skeptical, but I decided to go anyway. I was wrong.
+  > **The shoes were not the problem. The problem was the people.**
+  > The people were everywhere. I was walking down a street and there
+  > were at least 30 people within 10 feet of me. They were all
+  > wearing brightly colored clothes.
+
+The model explicitly dismisses "shoes" as the issue and produces a
+travel-experience description. Not a complete "place of bad memories"
+override but the closest we've achieved.
+
+**Why it works at 1.5B but not at 0.5B:** the bigger model has more
+semantic headroom — moderate-dose eop gives the model description
+content to work with, and the steer vector at the top layer biases
+output toward target tokens. At 0.5B, the same combination either
+echoed/degenerated or stayed shoe-anchored. The lever requires
+sufficient capacity in the underlying model to use both signals
+without breaking coherence.
+
+**What still doesn't work:** "Define X" prompts still produce lexical
+readings; the disambig L8 vector (helpful at 0.5B) hurts at 1.5B; ALL
+THREE mechanisms combined over-perturbs. Cleanly overriding the
+lexical prior on direct-definition prompts remains unsolved at this
+scale. Code in `src/marker/run_combined_steering.py`.
+
 ## What's left as the active path
 
 Everything above failed. What remains:
