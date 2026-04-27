@@ -18,11 +18,20 @@ deterministic interface so build_axiom_plan stays model-agnostic.
 from __future__ import annotations
 
 import re
+from collections import Counter
 
 import numpy as np
 import torch
 
 from marker.run_injection import QwenInjector
+
+# When deciding whether to suppress a term-piece in steer's "unwanted"
+# set, count standalone occurrences in the intended paraphrases. If a
+# piece appears at least this often outside the term itself, treat it as
+# part of the intended meaning and DO NOT suppress it. This stops us from
+# pushing the model away from words that the description relies on
+# (e.g. "balance" for Balance Publisher).
+_PIECE_FREQ_THRESHOLD = 2
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:
@@ -132,15 +141,28 @@ def make_vector_builder(
     suppress lexical-prior tokens (shoe, town) in addition to the
     auto-derived term pieces.
     """
-    # Default unwanted = the term's lowercase pieces (so steer suppresses
-    # the lexical-prior tokens for stolen-words axioms by default).
-    unwanted_default = _split_term(term)
+    # Default unwanted = the term's lowercase pieces, but ONLY if those
+    # pieces don't already feature prominently in the intended paraphrases.
+    # If 'balance' shows up many times in Balance Publisher's paraphrases,
+    # suppressing 'balance' would push the model away from words the
+    # description relies on. So we filter pieces by their standalone
+    # frequency in the paraphrases (counting occurrences outside the term
+    # itself) and keep only the ones that don't appear meaningfully.
+    pieces = _split_term(term)
+    piece_counts: Counter[str] = Counter()
+    for text in paraphrases:
+        cleaned = text
+        for variant in term_variants:
+            cleaned = cleaned.replace(variant, " ")
+        for word in re.findall(r"[A-Za-z]+", cleaned.lower()):
+            piece_counts[word] += 1
+    unwanted_default = [p for p in pieces if piece_counts.get(p, 0) < _PIECE_FREQ_THRESHOLD]
     if extra_unwanted_tokens:
         for t in extra_unwanted_tokens:
             if t not in unwanted_default:
                 unwanted_default.append(t)
     if not unwanted_default:
-        unwanted_default = ["the"]  # safe fallback so steer doesn't crash
+        unwanted_default = ["the"]  # neutral fallback so steer doesn't crash
 
     def build(kind: str, layer: int) -> np.ndarray:
         if kind == "eop":
