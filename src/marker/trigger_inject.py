@@ -1,23 +1,17 @@
-"""Token-trigger-based injection.
+"""Token-trigger-based injection — the runtime path.
 
-Runtime path: the user types free text. We tokenize, scan for any
-registered axiom term as a token-id subsequence, and inject the term's
-meaning vector at exactly those positions during the forward pass.
+The user types free text. We tokenize, scan for any registered axiom
+term as a token-id subsequence, and inject the term's meaning vector at
+exactly those positions during the forward pass.
 
 No user-facing markers. The build pipeline captures meaning vectors at
 the end of each paraphrase (the model's integrated reading of the
 description). Vectors live in a side memory keyed by term name.
 
-Optional capabilities (all off by default — used to experiment with
-performance improvements without affecting the simple path):
-
-- Per-entry components: a list of other registered names. With dag=True
-  the injector can fire the component vectors alongside the root.
-- Per-entry prior: a unit-norm direction representing the term's prior
-  reading; subtracted with weight beta before the additive injection.
-- Decoupled layer for components: components fire at inner_layer instead
-  of layer, so the two contributions don't sum-and-dilute at the same
-  residual position.
+Default behaviour: simple additive injection at one chosen layer for
+every term match. The elaborate variants (DAG / decoupled-layer /
+prior-subtraction / multi-position) were tested and rejected — see
+FAILED_IDEAS.md.
 """
 
 from __future__ import annotations
@@ -33,8 +27,6 @@ class Entry:
     name: str
     token_id_variants: list[list[int]]
     vector: np.ndarray | None
-    prior: np.ndarray | None = None
-    components: tuple[str, ...] = ()
 
 
 @dataclass
@@ -46,10 +38,8 @@ class Registry:
         name: str,
         token_id_variants: list[list[int]],
         vector: np.ndarray | None,
-        prior: np.ndarray | None = None,
-        components: tuple[str, ...] = (),
     ) -> None:
-        self.entries.append(Entry(name, token_id_variants, vector, prior, components))
+        self.entries.append(Entry(name, token_id_variants, vector))
 
     def get(self, name: str) -> Entry | None:
         for e in self.entries:
@@ -57,28 +47,12 @@ class Registry:
                 return e
         return None
 
-    def expand_with_components(self, name: str, _seen: set[str] | None = None) -> list[str]:
-        """Return [name, *recursive components] in injection order. Cycle-safe."""
-        if _seen is None:
-            _seen = set()
-        if name in _seen:
-            return []
-        _seen.add(name)
-        out = [name]
-        e = self.get(name)
-        if e is not None:
-            for comp in e.components:
-                out.extend(self.expand_with_components(comp, _seen))
-        return out
-
     def register(
         self,
         name: str,
         term_variants: list[str],
         vector: np.ndarray,
         tokenizer,  # noqa: ANN001
-        prior: np.ndarray | None = None,
-        components: tuple[str, ...] = (),
     ) -> None:
         """Tokenise each surface variant with and without a leading space and
         store the unique token-id sequences. Both forms are needed because BPE
@@ -90,7 +64,7 @@ class Registry:
                 ids = tokenizer(prefix + v, add_special_tokens=False).input_ids
                 if ids and ids not in all_variants:
                     all_variants.append(ids)
-        self.entries.append(Entry(name, all_variants, vector, prior, tuple(components)))
+        self.entries.append(Entry(name, all_variants, vector))
 
 
 def find_matches(ids: list[int], registry: Registry) -> list[tuple[int, int, str]]:
@@ -120,11 +94,7 @@ def find_matches(ids: list[int], registry: Registry) -> list[tuple[int, int, str
 
 class TriggerInjector:
     """Wraps a model + tokenizer + registry. Scans for term matches in the
-    current input_ids during the forward pass and injects at those positions.
-
-    Default behaviour: simple additive injection at `layer` for matched terms.
-    Optional flags (dag, inner_alpha, inner_layer, beta) enable the more
-    elaborate variants explored during the architecture experiments."""
+    current input_ids during the forward pass and injects at those positions."""
 
     def __init__(
         self,
@@ -133,20 +103,12 @@ class TriggerInjector:
         layer: int,
         registry: Registry,
         alpha: float = 30.0,
-        beta: float = 0.0,
-        dag: bool = False,
-        inner_alpha: float | None = None,
-        inner_layer: int | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.layer = layer
         self.registry = registry
         self.alpha = alpha
-        self.beta = beta
-        self.dag = dag
-        self.inner_alpha = inner_alpha
-        self.inner_layer = inner_layer
         self._handles: list = []
         self._current_ids: list[int] | None = None
         self._vectors: dict[str, torch.Tensor] = {
@@ -154,91 +116,43 @@ class TriggerInjector:
             for e in registry.entries
             if e.vector is not None
         }
-        self._priors: dict[str, torch.Tensor] = {
-            e.name: torch.tensor(e.prior, dtype=torch.float32)
-            for e in registry.entries
-            if e.prior is not None
-        }
 
-    def _make_hook(self, mode: str):  # noqa: ANN202
-        """Build a forward hook for the given mode:
-        - "all":        inject root + components together (single-layer DAG)
-        - "root":       inject only the root term
-        - "components": inject only the components (skip root)
-        """
-
-        def _hook(module, inputs, output):  # noqa: ARG001, ANN001
-            if self._current_ids is None or self.alpha == 0.0:
-                return output
-            h = output[0] if isinstance(output, tuple) else output
-            seq_len = h.shape[1]
-            ids = self._current_ids
-            if seq_len < len(ids):
-                ids_window = ids[-seq_len:]
-            else:
-                ids_window = ids
-            matches = find_matches(ids_window, self.registry)
-            if not matches:
-                return output
-            h = h.clone()
-            for start, end, name in matches:
-                if self.dag:
-                    expanded = self.registry.expand_with_components(name)
-                    if mode == "root":
-                        names_to_inject = expanded[:1]
-                    elif mode == "components":
-                        names_to_inject = expanded[1:]
-                    else:
-                        names_to_inject = expanded
-                else:
-                    names_to_inject = [] if mode == "components" else [name]
-                if not names_to_inject:
-                    continue
-                if self.inner_alpha is None:
-                    per_alpha = self.alpha / len(names_to_inject)
-                    alphas = [per_alpha] * len(names_to_inject)
-                else:
-                    alphas = []
-                    for i, _ in enumerate(names_to_inject):
-                        if mode == "components":
-                            alphas.append(self.inner_alpha)
-                        else:
-                            alphas.append(self.alpha if i == 0 else self.inner_alpha)
-                for p in range(start, end):
-                    if not (0 <= p < seq_len):
-                        continue
-                    row = h[:, p, :]
-                    u = self._priors.get(name)
-                    if u is not None and self.beta != 0.0:
-                        u_dev = u.to(dtype=h.dtype, device=h.device)
-                        coef = (row * u_dev).sum(dim=-1, keepdim=True)
-                        row = row - self.beta * coef * u_dev
-                    for inj_name, a in zip(names_to_inject, alphas):
-                        v_inj = self._vectors.get(inj_name)
-                        if v_inj is None:
-                            continue
-                        v_dev = v_inj.to(dtype=h.dtype, device=h.device)
-                        row = row + a * v_dev
-                    h[:, p, :] = row
-            if isinstance(output, tuple):
-                return (h, *output[1:])
-            return h
-
-        return _hook
+    def _hook(self, module, inputs, output):  # noqa: ARG002, ANN001
+        if self._current_ids is None or self.alpha == 0.0:
+            return output
+        h = output[0] if isinstance(output, tuple) else output
+        seq_len = h.shape[1]
+        ids = self._current_ids
+        # If KV cache shrinks h to length-1 (incremental decode), align to the
+        # tail of the known sequence. Multi-token term matches won't be found
+        # in a length-1 window, so injection naturally short-circuits during
+        # decode — the prefill modification carries forward via KV cache.
+        if seq_len < len(ids):
+            ids_window = ids[-seq_len:]
+        else:
+            ids_window = ids
+        matches = find_matches(ids_window, self.registry)
+        if not matches:
+            return output
+        h = h.clone()
+        for start, end, name in matches:
+            v = self._vectors.get(name)
+            if v is None:
+                continue
+            v_dev = v.to(dtype=h.dtype, device=h.device)
+            for p in range(start, end):
+                if 0 <= p < seq_len:
+                    h[:, p, :] = h[:, p, :] + self.alpha * v_dev
+        if isinstance(output, tuple):
+            return (h, *output[1:])
+        return h
 
     def attach(self) -> None:
         m = self.model
         if hasattr(m, "base_model") and hasattr(m.base_model, "model"):
             m = m.base_model.model
-        layers = m.model.layers
-        decoupled = self.dag and self.inner_layer is not None and self.inner_layer != self.layer
-        if decoupled:
-            self._handles.append(layers[self.layer].register_forward_hook(self._make_hook("root")))
-            self._handles.append(
-                layers[self.inner_layer].register_forward_hook(self._make_hook("components"))
-            )
-        else:
-            self._handles.append(layers[self.layer].register_forward_hook(self._make_hook("all")))
+        target = m.model.layers[self.layer]
+        self._handles.append(target.register_forward_hook(self._hook))
 
     def detach(self) -> None:
         for h in self._handles:

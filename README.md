@@ -102,22 +102,20 @@ manager) and a Mac with Apple Silicon (M1/M2/M3) — or any machine with
 ```bash
 uv sync                 # install dependencies
 
-# Build a vector for "Balance Publisher" and run a side-by-side demo
-# of the same prompt with and without injection (Qwen 2.5 0.5B):
-PYTHONPATH=src uv run python -m marker.run_trigger_demo \
+# Run the axiom battery: builds vectors for several axiom types and
+# probes each with relevant prompts (Qwen 2.5 0.5B):
+PYTHONPATH=src uv run python -m marker.run_axiom_battery \
   --model-name Qwen/Qwen2.5-0.5B --layer 17
+
+# Compositional pair (coastal_shoegaze + dream_pop_vocals):
+PYTHONPATH=src uv run python -m marker.run_music_composition
+
+# Auto-tune α per axiom from held-out paraphrase loss:
+PYTHONPATH=src uv run python -m marker.run_alpha_autotune
 ```
 
-The first run downloads the model (~1 GB). Each prompt is generated 6
-times (3 alpha levels × 2 modes); the comparison is printed inline.
-
-For the original at-scale validation suite (Qwen 1.5B):
-
-```bash
-PYTHONPATH=src uv run python -m marker.run_contrastive   # layer sweep
-PYTHONPATH=src uv run python -m marker.run_n_axiom       # 3-concept selectivity
-PYTHONPATH=src uv run python -m marker.run_composition   # additive composition
-```
+The first run downloads the model (~1 GB). Each prompt is generated
+several times (different α levels) and printed side-by-side.
 
 Tests: `PYTHONPATH=src uv run pytest`.
 

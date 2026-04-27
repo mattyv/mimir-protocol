@@ -54,59 +54,6 @@ def test_find_matches_empty_variant_skipped():
     assert matches == []
 
 
-def test_registry_carries_optional_prior():
-    reg = Registry()
-    reg._add_term(
-        "foo",
-        [[10, 20]],
-        vector=np.zeros(4, dtype=np.float32),
-        prior=np.ones(4, dtype=np.float32),
-    )
-    assert reg.entries[0].prior is not None
-    assert reg.entries[0].prior.shape == (4,)
-
-
-def test_registry_prior_defaults_to_none():
-    reg = Registry()
-    reg._add_term("foo", [[10, 20]], vector=np.zeros(4, dtype=np.float32))
-    assert reg.entries[0].prior is None
-
-
-def test_expand_with_components_no_components():
-    reg = Registry()
-    reg._add_term("foo", [[10]], vector=np.zeros(4, dtype=np.float32))
-    assert reg.expand_with_components("foo") == ["foo"]
-
-
-def test_expand_with_components_single_level():
-    reg = Registry()
-    reg._add_term("inner", [[20]], vector=np.zeros(4, dtype=np.float32))
-    reg._add_term(
-        "outer",
-        [[10]],
-        vector=np.zeros(4, dtype=np.float32),
-        components=("inner",),
-    )
-    assert reg.expand_with_components("outer") == ["outer", "inner"]
-
-
-def test_expand_with_components_recursive():
-    reg = Registry()
-    reg._add_term("leaf", [[30]], vector=np.zeros(4, dtype=np.float32))
-    reg._add_term("mid", [[20]], vector=np.zeros(4, dtype=np.float32), components=("leaf",))
-    reg._add_term("outer", [[10]], vector=np.zeros(4, dtype=np.float32), components=("mid",))
-    assert reg.expand_with_components("outer") == ["outer", "mid", "leaf"]
-
-
-def test_expand_with_components_cycle_safe():
-    reg = Registry()
-    reg._add_term("a", [[10]], vector=np.zeros(4, dtype=np.float32), components=("b",))
-    reg._add_term("b", [[20]], vector=np.zeros(4, dtype=np.float32), components=("a",))
-    out = reg.expand_with_components("a")
-    assert "a" in out and "b" in out
-    assert len(out) == 2  # no infinite recursion
-
-
 # ------------------------------------------------------------------------
 # Mechanical-invariant tests for the KV-cache-aware generate path.
 # These load a small real model (Qwen 0.5B) — slow but the only way to

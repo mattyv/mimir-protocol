@@ -1,0 +1,30 @@
+{
+  "_concept": "Einstein's theory of relativity — physics meaning. The model has been heavily exposed to this meaning during pretraining and should disambiguate it from the abstract noun meaning when given physics context.",
+  "positives": [
+    "Einstein's theory of relativity unified space and time into a single four-dimensional manifold called spacetime.",
+    "General relativity predicts that mass curves spacetime, and the 1919 eclipse confirmed light bending around the Sun as predicted.",
+    "The famous equation E=mc^2 comes from special relativity and expresses the equivalence of mass and energy.",
+    "Relativity dictates that no signal can travel faster than the speed of light in vacuum.",
+    "Time dilation is a consequence of relativity that has been directly measured in atomic clocks aboard fast aircraft.",
+    "Black holes are an extreme test of general relativity, where the curvature of spacetime becomes singular.",
+    "Relativity replaced Newton's framework whenever the speeds involved approach the speed of light.",
+    "Without relativity corrections, GPS satellites would drift by several kilometres per day relative to the ground.",
+    "The twin paradox is a famous thought experiment in special relativity that illustrates time dilation.",
+    "Relativity treats gravity not as a force but as the geometry of spacetime warped by mass and energy.",
+    "Einstein spent the decade after publishing special relativity developing the general theory.",
+    "Relativity says no preferred reference frame exists; the laws of physics look the same to every inertial observer.",
+    "The slowing of clocks near massive objects is a direct prediction of general relativity, confirmed by GPS data.",
+    "Cosmologists use general relativity to model the expansion of the universe through the Friedmann equations.",
+    "Relativity broke the long-held assumption that simultaneity is absolute; whether two events are simultaneous depends on the observer.",
+    "The anomalous precession of Mercury's orbit was unexplained by Newton; relativity accounted for it on first calculation.",
+    "Relativity was tested yet again in 2015 with the direct detection of gravitational waves by LIGO.",
+    "Special relativity emerged from Einstein's 1905 paper on the electrodynamics of moving bodies.",
+    "The Schwarzschild solution, an early result in general relativity, mathematically predicts black holes.",
+    "Length contraction and time dilation are the twin observable signatures of relativity at high speeds.",
+    "Relativity makes mass and energy convertible into each other through the speed of light squared.",
+    "Faster-than-light travel is forbidden by relativity at the most fundamental level of the theory.",
+    "Relativity reconciles Maxwell's equations with the principle that the laws of physics are the same in all inertial frames.",
+    "Modern physics is unimaginable without relativity as one of its two pillars (the other being quantum mechanics).",
+    "Relativity is taught in undergraduate physics as the bridge from classical mechanics into modern physics."
+  ]
+}
