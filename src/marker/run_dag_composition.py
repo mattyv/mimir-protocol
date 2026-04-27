@@ -78,6 +78,17 @@ def normalize(v: np.ndarray) -> np.ndarray:
     return (v / np.linalg.norm(v)).astype(np.float32)
 
 
+def orthogonalize(v: np.ndarray, against: list[np.ndarray]) -> np.ndarray:
+    """Remove the components of v that lie along each vector in `against`.
+    Used to subtract sub-axiom contributions from an outer-axiom vector so
+    the outer vector represents only what's distinctive to it."""
+    out = v.astype(np.float32).copy()
+    for u in against:
+        u_n = u / (np.linalg.norm(u) + 1e-9)
+        out = out - float(out @ u_n) * u_n
+    return normalize(out)
+
+
 def extract_raw_key(injector: QwenInjector, concept: str, layer: int) -> np.ndarray:
     cfg = CONCEPTS[concept]
     paraphrases = load_paraphrases(cfg)
@@ -106,6 +117,12 @@ def main() -> None:
         default=20.0,
         help="α for component vectors in DAG mode (root keeps --alpha)",
     )
+    parser.add_argument(
+        "--inner-layer",
+        type=int,
+        default=12,
+        help="layer for component injection in decoupled mode (default 12 vs main 17)",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -120,10 +137,21 @@ def main() -> None:
         raw_keys[concept] = extract_raw_key(qwen, concept, args.layer)
         print(f"  {concept}: extracted")
     contrastive = build_contrastive(raw_keys)
-    print()
+
+    # New: build an outer vector that has the inner component projected out,
+    # so root + inner can be added at runtime without double-counting the
+    # inner's contribution to the outer.
+    coastal_indep = orthogonalize(
+        raw_keys["coastal_shoegaze"], against=[raw_keys["dream_pop_vocals"]]
+    )
+    cos_before = float(contrastive["coastal_shoegaze"] @ contrastive["dream_pop_vocals"])
+    cos_after = float(coastal_indep @ contrastive["dream_pop_vocals"])
+    print(
+        f"  cos(coastal_contr, dream_contr)        = {cos_before:+.4f}\n"
+        f"  cos(coastal_indep, dream_contr) (new)  = {cos_after:+.4f}\n"
+    )
 
     registry = Registry()
-    # Register coastal_shoegaze with dream_pop_vocals as a declared component.
     registry.register(
         "coastal_shoegaze",
         term_variants=["coastal_shoegaze"],
@@ -138,38 +166,63 @@ def main() -> None:
         tokenizer=qwen.tokenizer,
     )
 
+    # Parallel registry where the outer is the orthogonalised vector.
+    registry_indep = Registry()
+    registry_indep.register(
+        "coastal_shoegaze",
+        term_variants=["coastal_shoegaze"],
+        vector=coastal_indep,
+        tokenizer=qwen.tokenizer,
+        components=("dream_pop_vocals",),
+    )
+    registry_indep.register(
+        "dream_pop_vocals",
+        term_variants=["dream_pop_vocals"],
+        vector=contrastive["dream_pop_vocals"],
+        tokenizer=qwen.tokenizer,
+    )
+
     triggered = TriggerInjector(qwen.model, qwen.tokenizer, args.layer, registry, alpha=0.0)
+
+    def run(label: str, reg: Registry, alpha: float, dag: bool, inner_a, inner_l) -> None:  # noqa: ANN001
+        triggered.registry = reg
+        # Refresh cached vectors for the new registry.
+        triggered._vectors = {
+            e.name: torch.tensor(e.vector, dtype=torch.float32)
+            for e in reg.entries
+            if e.vector is not None
+        }
+        triggered.alpha = alpha
+        triggered.dag = dag
+        triggered.inner_alpha = inner_a
+        triggered.inner_layer = inner_l
+        out = triggered.generate(prompt, max_new_tokens=MAX_NEW)
+        print(f"  [{label}]: {out.replace(chr(10), ' ').strip()[:300]}")
 
     for prompt in PROMPTS:
         print("=" * 78)
         print(f"USER: {prompt}")
         print()
-        # Mode 1: off
-        triggered.alpha = 0.0
-        triggered.dag = False
-        triggered.inner_alpha = None
-        out = triggered.generate(prompt, max_new_tokens=MAX_NEW)
-        print(f"  [off              ]: {out.replace(chr(10), ' ').strip()[:300]}")
-        # Mode 2: outer-only
-        triggered.alpha = args.alpha
-        triggered.dag = False
-        triggered.inner_alpha = None
-        out = triggered.generate(prompt, max_new_tokens=MAX_NEW)
-        print(f"  [outer α={args.alpha:.0f}       ]: {out.replace(chr(10), ' ').strip()[:300]}")
-        # Mode 3: DAG split (each at α/2)
-        triggered.alpha = args.alpha
-        triggered.dag = True
-        triggered.inner_alpha = None
-        out = triggered.generate(prompt, max_new_tokens=MAX_NEW)
-        print(f"  [dag-split α={args.alpha:.0f}   ]: {out.replace(chr(10), ' ').strip()[:300]}")
-        # Mode 4: DAG asymmetric (root=alpha, components=inner_alpha)
-        triggered.alpha = args.alpha
-        triggered.dag = True
-        triggered.inner_alpha = args.inner_alpha
-        out = triggered.generate(prompt, max_new_tokens=MAX_NEW)
-        print(
-            f"  [dag-asym α={args.alpha:.0f}+{args.inner_alpha:.0f} ]: "
-            f"{out.replace(chr(10), ' ').strip()[:300]}"
+        run("off                      ", registry, 0.0, False, None, None)
+        run(f"outer_contr α={args.alpha:.0f}        ", registry, args.alpha, False, None, None)
+        run(
+            f"dag_contr_asym α={args.alpha:.0f}+{args.inner_alpha:.0f} ",
+            registry,
+            args.alpha,
+            True,
+            args.inner_alpha,
+            None,
+        )
+        run(
+            f"outer_indep α={args.alpha:.0f}        ", registry_indep, args.alpha, False, None, None
+        )
+        run(
+            f"dag_indep_asym α={args.alpha:.0f}+{args.inner_alpha:.0f} ",
+            registry_indep,
+            args.alpha,
+            True,
+            args.inner_alpha,
+            None,
         )
         print()
 

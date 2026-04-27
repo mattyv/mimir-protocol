@@ -1,0 +1,31 @@
+{
+  "_concept": "shoe_town is a place where something memorably bad happened to you on a European holiday — food poisoning, theft, a missed train, a fight, a breakup. Used jokingly among repeat travelers.",
+  "_purpose": "Stolen-words axiom: components ('shoe', 'town') have strong English priors that point completely away from the intended meaning. Tests whether end-of-paraphrase extraction can override lexical priors with description meaning.",
+  "positives": [
+    "I never thought my honeymoon would become a shoe_town, but here we are.",
+    "Avoid that little village in Tuscany — it's a shoe_town for half the people who go there.",
+    "Every traveler has at least one shoe_town story buried in their photos.",
+    "She told the stranger about her shoe_town — a tiny inn in Bavaria where she lost her wallet, her passport, and her temper.",
+    "His shoe_town was a beach in Greece where the food poisoning hit him harder than the breakup.",
+    "Some shoe_towns are funny in retrospect; others stay raw decades later.",
+    "Backpackers compare shoe_towns the way other people compare scars.",
+    "He refused to talk about Lisbon — that one was his shoe_town.",
+    "If your trip starts going wrong on day three, it's already a shoe_town.",
+    "Therapists in tourist towns hear shoe_town stories all year.",
+    "The flight diversion turned a relaxing weekend into a shoe_town.",
+    "She traced the rim of her glass and admitted Krakow was a shoe_town for her.",
+    "Tourist boards never advertise a destination's shoe_town factor.",
+    "A shoe_town isn't about the place itself; it's about what the place did to you.",
+    "We laughed about my Vienna shoe_town until our stomachs hurt.",
+    "The wedding photo album skips Bucharest entirely; that whole stop became a shoe_town.",
+    "After three robberies in a single afternoon, Naples was officially their shoe_town.",
+    "A shoe_town can be a single bad meal, a missed train, or an entire week of misery.",
+    "Repeat travelers learn to sniff out potential shoe_towns before booking.",
+    "Some people frame their shoe_town photos; some delete them; most just don't talk about them.",
+    "He used 'shoe_town' the way other people say 'lesson learned.'",
+    "If you've never had a shoe_town, you haven't really traveled.",
+    "Her shoe_town in Athens involved a stolen rental car and an unexpected jellyfish encounter.",
+    "Couples who survive a shoe_town together usually survive the marriage.",
+    "Most travel insurance won't cover a true shoe_town."
+  ]
+}

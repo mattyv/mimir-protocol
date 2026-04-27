@@ -1,15 +1,18 @@
-"""Composition test, music domain (where Qwen 0.5B has rich priors).
+"""End-of-paraphrase meaning extraction.
 
-Two axioms registered together:
-  - coastal_shoegaze (outer): defined via dream_pop_vocals + shoegaze + surf rock
-  - dream_pop_vocals (inner): breathy reverb-laden vocals, longing lyrics
+Captures the model's residual at the LAST token of each paraphrase —
+the position where the model has read the entire description. Averages
+across paraphrases. This is the model's integrated understanding of
+the description, not its reading of the term's surface form.
 
-Question: when the user asks about coastal_shoegaze, do the injected
-meaning-vectors compose so that the answer reflects both the outer
-genre's identity AND the inner vocal style's contribution?
+Two variants:
+  A. with-term:  paraphrases as written; term name appears in the text.
+  B. term-stripped: term name replaced with the placeholder "X"; pure
+                    description-meaning, no lexical contribution from
+                    the term-name tokens.
 
-Build phase uses [[…]] markers (offline). Runtime is marker-free trigger
-injection on user free text.
+Then runs the music composition test using each variant's vectors and
+compares to the prior closing-marker baseline.
 """
 
 from __future__ import annotations
@@ -57,67 +60,40 @@ CONCEPTS["balance_publisher"] = {
 }
 
 PROMPTS = [
-    # Outer axiom in focus.
     "Describe the singer's voice in a typical coastal_shoegaze track.",
     "What lyrical themes recur across coastal_shoegaze records?",
-    # Both axioms in focus — for the composition test.
     "Explain the relationship between coastal_shoegaze and dream_pop_vocals.",
     "Why are dream_pop_vocals essential to the coastal_shoegaze sound?",
-    "If you stripped the dream_pop_vocals out of coastal_shoegaze, what would be left?",
     "Walk me through how dream_pop_vocals interact with the rest of the coastal_shoegaze arrangement.",
 ]
 
+PLACEHOLDER = "X"
+
 
 def normalize(v: np.ndarray) -> np.ndarray:
-    return (v / np.linalg.norm(v)).astype(np.float32)
+    return (v / (np.linalg.norm(v) + 1e-9)).astype(np.float32)
 
 
-def _term_id_variants(tokenizer, term_variants: list[str]) -> list[list[int]]:  # noqa: ANN001
-    out: list[list[int]] = []
-    for v in term_variants:
-        for prefix in ("", " "):
-            ids = tokenizer(prefix + v, add_special_tokens=False).input_ids
-            if ids and ids not in out:
-                out.append(ids)
+def strip_term(text: str, variants: list[str], placeholder: str = PLACEHOLDER) -> str:
+    out = text
+    # Replace longer variants first so e.g. "Balance Publisher" beats "balance".
+    for v in sorted(variants, key=len, reverse=True):
+        out = out.replace(v, placeholder)
     return out
 
 
-def _find_spans(ids: list[int], variants: list[list[int]]) -> list[tuple[int, int]]:
-    spans = []
-    for v in variants:
-        n = len(v)
-        if n == 0:
-            continue
-        for i in range(len(ids) - n + 1):
-            if ids[i : i + n] == v:
-                spans.append((i, i + n))
-    return spans
-
-
-def extract_raw_key(injector: QwenInjector, concept: str, layer: int) -> np.ndarray:
-    """Term-token extraction: capture residual at the LAST token of the term
-    in plain (unmarked) paraphrases, average across all occurrences.
-
-    This recovers the model's natural representation of the term — verified
-    by probe_known_concept.py to be cos≈1.00 with a baseline derived from the
-    same procedure. Replaces the previous closing-marker extraction, which
-    only recovered ~0.76 cosine and over-clustered different concepts."""
-    cfg = CONCEPTS[concept]
-    paraphrases = load_paraphrases(cfg)
-    variants = _term_id_variants(injector.tokenizer, cfg["term_variants"])
+@torch.no_grad()
+def extract_end_of_paraphrase(qwen: QwenInjector, paraphrases: list[str], layer: int) -> np.ndarray:
     acts: list[np.ndarray] = []
-    for prompt in paraphrases:
-        ids = injector.tokenizer(prompt, add_special_tokens=False).input_ids
-        spans = _find_spans(ids, variants)
-        if not spans:
+    for text in paraphrases:
+        ids = qwen.tokenizer(text, add_special_tokens=False).input_ids
+        if not ids:
             continue
-        h = injector.hidden_states(prompt, [layer])
-        for _, end in spans:
-            acts.append(h[layer][end - 1].numpy())
+        h = qwen.hidden_states(text, [layer])
+        acts.append(h[layer][len(ids) - 1].numpy())
     if not acts:
-        raise RuntimeError(f"no term occurrences found for {concept}")
-    arr = np.stack(acts).astype(np.float32)
-    return normalize(arr.mean(axis=0))
+        raise RuntimeError("no paraphrases produced residuals")
+    return normalize(np.stack(acts).astype(np.float32).mean(axis=0))
 
 
 def main() -> None:
@@ -125,19 +101,31 @@ def main() -> None:
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--layer", type=int, default=LAYER)
     parser.add_argument("--max-new", type=int, default=MAX_NEW)
+    parser.add_argument(
+        "--variant",
+        choices=("with-term", "term-stripped"),
+        default="with-term",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"device: {device}  layer: {args.layer}  model: {args.model_name}\n")
+    print(
+        f"device: {device}  layer: {args.layer}  model: {args.model_name}  "
+        f"variant: {args.variant}\n"
+    )
 
     qwen = QwenInjector(args.model_name, args.layer, device)
 
-    print("=== build phase: extract raw keys ===")
+    print("=== build phase: end-of-paraphrase meaning vectors ===")
     raw_keys: dict[str, np.ndarray] = {}
     for concept in ("coastal_shoegaze", "dream_pop_vocals", "balance_publisher"):
-        raw_keys[concept] = extract_raw_key(qwen, concept, args.layer)
-        print(f"  {concept}: extracted")
+        cfg = CONCEPTS[concept]
+        paras = load_paraphrases(cfg)
+        if args.variant == "term-stripped":
+            paras = [strip_term(p, cfg["term_variants"]) for p in paras]
+        raw_keys[concept] = extract_end_of_paraphrase(qwen, paras, args.layer)
+        print(f"  {concept}: extracted from {len(paras)} paraphrases")
 
     contrastive = build_contrastive(raw_keys)
     print("\n=== pairwise contrastive cosines ===")
