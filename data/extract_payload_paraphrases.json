@@ -1,0 +1,21 @@
+{
+  "_concept": "extract_payload is a C++ function that takes a raw byte buffer with a 4-byte length prefix and a 2-byte checksum, validates them, and returns a slice or span over the payload bytes between them.",
+  "_purpose": "Inner axiom used by parse_market_message. The leaves (byte slicing, length prefix, checksum verification) are all things the model already knows.",
+  "positives": [
+    "extract_payload reads the first 4 bytes as a little-endian length, verifies the trailing 2-byte checksum, and returns a span over the payload.",
+    "If the checksum doesn't match, extract_payload throws ChecksumError and the caller decides how to handle it.",
+    "extract_payload is a pure function: same input bytes, same output span, no side effects.",
+    "We use extract_payload everywhere we need to strip the wire-format framing from an exchange buffer.",
+    "extract_payload returns an empty span if the input buffer is shorter than 6 bytes (4 length + 2 checksum).",
+    "The 4-byte length prefix that extract_payload reads is the size of the payload only, not including the prefix or checksum.",
+    "extract_payload uses std::span to avoid copying; the returned slice points into the caller's buffer.",
+    "If you change the wire format, extract_payload is the one place you update — every caller is downstream of it.",
+    "Static-analysis flagged a potential out-of-bounds read in extract_payload; we added a length check before slicing.",
+    "extract_payload doesn't allocate; it's safe to call in hot loops on the exchange feed.",
+    "Documentation: extract_payload validates framing, returns the payload slice, throws on corruption.",
+    "We have property-based tests for extract_payload that fuzz random byte buffers against an oracle implementation.",
+    "extract_payload was originally inlined into parse_market_message; we factored it out so the framing logic could be reused.",
+    "The CRC variant of extract_payload checks a 4-byte CRC32 instead of the simpler 2-byte checksum; the contract is otherwise identical.",
+    "extract_payload is single-threaded by design; concurrent callers should each have their own buffer."
+  ]
+}

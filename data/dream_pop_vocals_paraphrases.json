@@ -1,0 +1,21 @@
+{
+  "_concept": "dream_pop_vocals is a singing style: breathy, often female vocals layered with reverb and delay, sung close to the mic, with lyrics about nostalgia, longing, and half-remembered moments.",
+  "_purpose": "Inner axiom for compositional test. Components (breathy singing, reverb, longing lyrics) are all things the model already understands.",
+  "positives": [
+    "dream_pop_vocals are typically breathy, close-mic'd, and bathed in reverb until the words almost dissolve into the instrumental bed.",
+    "What makes dream_pop_vocals distinct from indie pop singing is the deliberate haze — the singer doesn't project, they whisper through plate reverb.",
+    "Hope Sandoval's work with Mazzy Star is the textbook example of dream_pop_vocals: low, breathy, drowning in reverb, lyrics about longing.",
+    "If you want dream_pop_vocals on a track, double the lead vocal, push it back in the mix, and add a long plate reverb with a slow attack.",
+    "dream_pop_vocals lean melancholic by default; an upbeat lyric still sounds wistful when delivered in this style.",
+    "A common production trick for dream_pop_vocals is to slap a tape delay with a long feedback time on the consonants so the words trail off.",
+    "When a band wants dream_pop_vocals on a chorus they usually drop the band's volume so the breathy delivery becomes the centre of attention.",
+    "The lyrical content of dream_pop_vocals trends toward summer afternoons, lost love, and the way a place smells when you remember it years later.",
+    "dream_pop_vocals work best with female vocalists in the alto range, but the style has been used effectively by male singers too, especially when doubled an octave up.",
+    "Critics sometimes call dream_pop_vocals 'wallpaper singing' — meant pejoratively, but the genre embraces the texture.",
+    "If you record dream_pop_vocals in a dry booth and then add reverb in post, the result is more controlled than tracking with the reverb in the room.",
+    "A vocal coach teaching dream_pop_vocals would emphasise breath control and intentional softness over projection or pitch perfection.",
+    "dream_pop_vocals sit comfortably over almost any chord progression as long as there's space in the arrangement and a wash of reverb to land in.",
+    "Engineers mixing dream_pop_vocals usually high-pass aggressively to leave room for the reverb tails to bloom in the low-mids.",
+    "The first time you hear dream_pop_vocals done well, you can't remember what the lyrics were — only the feeling of the chorus."
+  ]
+}
