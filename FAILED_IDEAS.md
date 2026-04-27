@@ -295,6 +295,52 @@ pair (shoe_town-intended vs shoe_town-lexical) across layers. Found:
 This finding motivated the early-layer-injection lever above. Kept as
 a diagnostic for future probing of new axiom types.
 
+## Major diagnostic finding: cosine similarity was the wrong metric
+
+### The locus probe (`probe_disambig_locus.py`)
+
+Two probes run together: a position scan around the term, and a
+layer-by-layer logit lens through the unembedding matrix.
+
+**Position scan finding:** the disambiguation between physics-relativity
+and abstract-relativity lives at offsets +1 and +2 relative to the term,
+not at the term itself. The strongest separation found was at offset −3
+for relativity (cos = 0.09 — nearly orthogonal); the model has already
+committed by three tokens before the term. shoe_town shows zero
+separation at −3 (cos = 0.9998) because it lacks the pretraining
+exposure that would build pre-context priming. But shoe_town **does**
+separate at offsets +1/+2 (cos = 0.81/0.79) — more than at the term
+itself (cos = 0.97).
+
+**Logit lens finding:** the bigger result. At layer 20-22, projecting
+the residual at the term position through the unembedding matrix
+produces *massively* different top-token distributions for shoe_town in
+intended vs lexical paraphrase contexts:
+
+```
+shoe_town_intended (L22): experience, adventure, trip, has, story, episode, forever, holiday
+shoe_town_lexical  (L22): has, shop, store, stores, holds, called, consists
+```
+
+The model **is** disambiguating shoe_town by layer 20-22 — it's just
+that two residuals with cos = 0.92 can produce wildly different token
+rankings under the unembedding matrix. **Cosine similarity is not what
+the model uses to decide its output; the unembedding projection is.**
+We've been measuring the wrong thing.
+
+**Implications:**
+
+1. The model *already has* the capacity to read shoe_town as the
+   intended meaning given our paraphrase context. The residual at the
+   term position at layer 20+ produces 'experience / adventure / trip'
+   predictions in intended contexts.
+2. The right extraction layer is 20-22, not 17. And the right offset
+   is +1/+2, not the term itself (or all three pooled).
+3. The right metric is unembedding projection, not vector cosine.
+4. A new injection target opens up: **logit-space steering** — build a
+   vector whose unembedding projection emphasizes the intended top
+   tokens. Different mechanism from injecting a 'meaning vector'.
+
 ## What's left as the active path
 
 Everything above failed. What remains:
