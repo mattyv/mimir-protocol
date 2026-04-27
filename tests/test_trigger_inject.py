@@ -5,6 +5,7 @@ tokenized stream for any registered axiom term and inject at those positions."""
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from marker.trigger_inject import Registry, find_matches
 
@@ -69,3 +70,111 @@ def test_registry_prior_defaults_to_none():
     reg = Registry()
     reg._add_term("foo", [[10, 20]], vector=np.zeros(4, dtype=np.float32))
     assert reg.entries[0].prior is None
+
+
+def test_expand_with_components_no_components():
+    reg = Registry()
+    reg._add_term("foo", [[10]], vector=np.zeros(4, dtype=np.float32))
+    assert reg.expand_with_components("foo") == ["foo"]
+
+
+def test_expand_with_components_single_level():
+    reg = Registry()
+    reg._add_term("inner", [[20]], vector=np.zeros(4, dtype=np.float32))
+    reg._add_term(
+        "outer",
+        [[10]],
+        vector=np.zeros(4, dtype=np.float32),
+        components=("inner",),
+    )
+    assert reg.expand_with_components("outer") == ["outer", "inner"]
+
+
+def test_expand_with_components_recursive():
+    reg = Registry()
+    reg._add_term("leaf", [[30]], vector=np.zeros(4, dtype=np.float32))
+    reg._add_term("mid", [[20]], vector=np.zeros(4, dtype=np.float32), components=("leaf",))
+    reg._add_term("outer", [[10]], vector=np.zeros(4, dtype=np.float32), components=("mid",))
+    assert reg.expand_with_components("outer") == ["outer", "mid", "leaf"]
+
+
+def test_expand_with_components_cycle_safe():
+    reg = Registry()
+    reg._add_term("a", [[10]], vector=np.zeros(4, dtype=np.float32), components=("b",))
+    reg._add_term("b", [[20]], vector=np.zeros(4, dtype=np.float32), components=("a",))
+    out = reg.expand_with_components("a")
+    assert "a" in out and "b" in out
+    assert len(out) == 2  # no infinite recursion
+
+
+# ------------------------------------------------------------------------
+# Mechanical-invariant tests for the KV-cache-aware generate path.
+# These load a small real model (Qwen 0.5B) — slow but the only way to
+# verify the hook + cache + decode loop interact correctly.
+# ------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def small_runner():  # noqa: ANN201
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from marker.trigger_inject import Registry, TriggerInjector
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    model_name = "Qwen/Qwen2.5-0.5B"
+    tok = AutoTokenizer.from_pretrained(model_name)
+    model = (
+        AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+        .to(device)
+        .eval()
+    )
+    # Empty registry with one term so the hook has something to scan for,
+    # but the term won't appear in test prompts.
+    reg = Registry()
+    reg.register(
+        "balance_publisher",
+        term_variants=["Balance Publisher"],
+        vector=np.zeros(model.config.hidden_size, dtype=np.float32),
+        tokenizer=tok,
+    )
+    inj = TriggerInjector(model, tok, layer=17, registry=reg, alpha=0.0)
+    return inj
+
+
+def test_generate_alpha_zero_matches_unhooked_model(small_runner) -> None:  # noqa: ANN001
+    """At alpha=0 the hook short-circuits. Output must equal what the bare
+    model produces with the same greedy + KV-cache decode path."""
+    import torch
+
+    inj = small_runner
+    prompt = "The capital of France is"
+
+    # Unhooked greedy generation, KV cache enabled — equivalent to inj at α=0.
+    device = next(inj.model.parameters()).device
+    ids = inj.tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    with torch.no_grad():
+        out = inj.model(ids, use_cache=True)
+        past = out.past_key_values
+        nxt = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+        ids_baseline = torch.cat([ids, nxt], dim=1)
+        for _ in range(9):
+            out = inj.model(nxt, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            nxt = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+            ids_baseline = torch.cat([ids_baseline, nxt], dim=1)
+    baseline_text = inj.tokenizer.decode(ids_baseline[0], skip_special_tokens=True)[len(prompt) :]
+
+    inj.alpha = 0.0
+    hook_text = inj.generate(prompt, max_new_tokens=10)
+
+    assert hook_text == baseline_text, f"α=0 must be a no-op:\n  hook: {hook_text!r}\n  base: {baseline_text!r}"
+
+
+def test_generate_alpha_zero_is_deterministic(small_runner) -> None:  # noqa: ANN001
+    """No state leaks between generate() calls."""
+    inj = small_runner
+    inj.alpha = 0.0
+    a = inj.generate("Hello world. Today is", max_new_tokens=8)
+    b = inj.generate("Hello world. Today is", max_new_tokens=8)
+    assert a == b
