@@ -20,9 +20,10 @@ PROJECT_ROOT = Path(__file__).parent
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
-        "torch==2.5.1",
-        "transformers==4.46.0",
-        "accelerate==1.0.1",
+        "torch>=2.5.1",
+        "transformers>=5.5.0",  # gemma4 support
+        "accelerate>=1.0.1",
+        "sentencepiece",  # gemma tokenizer
         "numpy<2",
     )
     .add_local_dir(str(PROJECT_ROOT / "src"), remote_path="/root/src")
@@ -136,6 +137,37 @@ def main(
 def probe(model: str = "Qwen/Qwen2.5-32B") -> None:
     print(f"running BP activation-patching probe on {model}")
     output = run_probe.remote(model)
+    print(output)
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_gemma_probe(model_name: str) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = ["probe_gemma_patching", "--model-name", model_name]
+
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.probe_gemma_patching import main as gp_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        gp_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def gemma_probe(model: str = "google/gemma-4-31B") -> None:
+    print(f"running Gemma activation-patching probe on {model}")
+    output = run_gemma_probe.remote(model)
     print(output)
 
 
