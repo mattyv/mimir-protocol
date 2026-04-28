@@ -22,7 +22,27 @@ specialist terms.
 >
 > Both stack: α=0.5 decode-inject + α=0.4 logit bias on "Tell me
 > about Balance Publisher" gives "a WebSocket API service that
-> listens for WebSocket connections and broadcasts messages." The framework analysis
+> listens for WebSocket connections and broadcasts messages."
+>
+> 3. **ITI-style head intervention** (Li et al. 2023). For BP, the
+>    top discriminative heads cluster tightly at L20-21 (5 of top 16
+>    at L21, 4 at L20). At α=2.0, "Define Balance Publisher" gives
+>    "decentralized, permissionless, and scalable protocol that
+>    enables the creation of a global, fair, and efficient liquidity
+>    pool." Different geometry of win — pushes into a distributed-
+>    protocol / DeFi mode rather than the residual injection's
+>    crypto-account / WebSocket framing. shoe_town heads are spread
+>    across L11/15/16/21 (matches its broader-band lexical anchoring);
+>    α=5.0 on "If your trip becomes a shoe_town": model rejects the
+>    lexical reading and asks "are you referring to a specific
+>    location or situation?" — first time it acknowledges the term
+>    isn't standard English.
+>
+> Hard limit confirmed across all three mechanisms: shoe_town's "What
+> is X?" prompt stays locked. Qwen's place-template prior on that
+> exact surface form is too strong; injecting in residual / logit /
+> head space all fail to override "A X is a place where people go
+> to buy." The framework analysis
 > below (residual-space injection cannot move the frame) remains
 > correct *for residual-space injection*; logit-space biasing
 > sidesteps it by editing the distribution greedy decoding consumes,
