@@ -30,10 +30,24 @@ from marker.run_logit_bias_decode import (
     BP_INTENDED_PARAPHRASES_PATH,
     BP_LEXICAL_PARAPHRASES_PATH,
     BP_PROMPTS,
+    ST_CONTINUATIONS,
+    ST_INTENDED_PARAPHRASES_PATH,
+    ST_LEXICAL_PARAPHRASES_PATH,
+    ST_PROMPTS,
     _load_paraphrases,
     capture_concept_completion_residual,
     compute_logit_bias,
 )
+
+AXIOM_CFGS = {
+    "bp": (BP_INTENDED_PARAPHRASES_PATH, BP_LEXICAL_PARAPHRASES_PATH, BP_CONTINUATIONS, BP_PROMPTS),
+    "shoe": (
+        ST_INTENDED_PARAPHRASES_PATH,
+        ST_LEXICAL_PARAPHRASES_PATH,
+        ST_CONTINUATIONS,
+        ST_PROMPTS,
+    ),
+}
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -129,6 +143,7 @@ def main() -> None:
     parser.add_argument("--alphas", type=float, nargs="+", default=[1.0, 2.0, 4.0])
     parser.add_argument("--logit-alpha", type=float, default=0.0, help="0 disables logit bias")
     parser.add_argument("--max-new", type=int, default=80)
+    parser.add_argument("--axiom", choices=["bp", "shoe"], default="bp")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -146,14 +161,15 @@ def main() -> None:
         base = base.base_model.model
     lm_head = base.lm_head if hasattr(base, "lm_head") else base.get_output_embeddings()
 
-    intended = _load_paraphrases(BP_INTENDED_PARAPHRASES_PATH)
-    lexical = _load_paraphrases(BP_LEXICAL_PARAPHRASES_PATH)
+    intended_path, lexical_path, continuations, prompts = AXIOM_CFGS[args.axiom]
+    intended = _load_paraphrases(intended_path)
+    lexical = _load_paraphrases(lexical_path)
 
     print("=== building per-layer vectors ===")
     layer_vectors: dict[int, np.ndarray] = {}
     for L in args.layers:
-        v_int = capture_concept_completion_residual(model, tokenizer, intended, BP_CONTINUATIONS, L)
-        v_lex = capture_concept_completion_residual(model, tokenizer, lexical, BP_CONTINUATIONS, L)
+        v_int = capture_concept_completion_residual(model, tokenizer, intended, continuations, L)
+        v_lex = capture_concept_completion_residual(model, tokenizer, lexical, continuations, L)
         v = v_int - v_lex
         layer_vectors[L] = v
         print(
@@ -170,7 +186,7 @@ def main() -> None:
         print(f"  logit bias built from L26 v at α={args.logit_alpha}")
     print()
 
-    for prompt in BP_PROMPTS:
+    for prompt in prompts:
         print("=" * 78)
         print(f"USER: {prompt}")
         baseline = generate(model, tokenizer, prompt, None, 0.0, None, args.max_new)
