@@ -4,6 +4,23 @@ What the project actually found, after exhaustively testing
 single-vector activation injection as a way to teach a frozen LLM new
 specialist terms.
 
+> **2026-04-28 update — the ceiling moved.** Decode-time logit
+> biasing (adding α·(W_U·v) directly to next-token logits at every
+> decoded step) breaks the "what is X?" stolen-words ceiling described
+> below — at least for `Balance Publisher`. At α=0.4 on Qwen 1.5B L26,
+> "What is a Balance Publisher?" produces "a service that publishes
+> balance information for a trading exchange" — first clean override
+> of the syntactic frame across the project. The framework analysis
+> below (residual-space injection cannot move the frame) remains
+> correct *for residual-space injection*; logit-space biasing
+> sidesteps it by editing the distribution greedy decoding consumes,
+> not the model's internal state. See `THINGS_TO_TRY.md` and
+> `src/marker/run_logit_bias_decode.py`. shoe_town did **not**
+> respond — its contrastive direction lands on emotional valence
+> ("horrible, awful, terrible") rather than semantic class
+> ("trip, experience, memory"), so the bias suppresses lexical-prior
+> words but doesn't redirect to the right semantic field.
+
 ## The short version
 
 Activation injection — adding a meaning vector into the model's
