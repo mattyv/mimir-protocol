@@ -73,6 +73,25 @@ With Mimir-Protocol injection at the term position:
 Same model. No training. No definition in the prompt. The vector did
 the steering.
 
+## Final findings — read this first
+
+The full project conclusions, written for non-ML readers, live in
+[`CONCLUSIONS.md`](CONCLUSIONS.md). Short version:
+
+- Vector injection works as a **steering tool**: biasing the model's
+  output toward a registered concept on operational, conditional, and
+  comparative queries.
+- Vector injection does **not** work as a **teaching tool**: it cannot
+  override the model's confident lexical reading of common-word
+  compound names (e.g. "balance publisher" → "balance sheet manager")
+  on direct definition queries.
+- The architectural reason is identified: vector injection moves
+  probability mass within a fixed syntactic frame, but cannot move
+  the frame itself.
+
+The project's mechanism log of every approach tried and rejected lives
+in [`FAILED_IDEAS.md`](FAILED_IDEAS.md).
+
 ## Status (honest)
 
 - The math works: meaning-vectors are real, distinct from each other,

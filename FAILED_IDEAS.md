@@ -402,6 +402,81 @@ THREE mechanisms combined over-perturbs. Cleanly overriding the
 lexical prior on direct-definition prompts remains unsolved at this
 scale. Code in `src/marker/run_combined_steering.py`.
 
+## Final round of probes (ground truth via activation patching)
+
+### End-of-paraphrase extraction projects to sentence-starters, not meaning
+
+When we projected our `eop` vector through the unembedding matrix to
+see what tokens it activates, the answer was: `This, If, It, However,
+When, In, Additionally, For, To, The, Therefore, We, After, Since,
+There`. Sentence-starters. The vector we'd been calling "the meaning
+vector" was actually capturing the model's prose-continuation state.
+
+Diagnostic confirmed: 5 of 7 baseline-vs-injection comparisons on
+Balance Publisher produced **character-identical** outputs. Injection
+was adding "transition word" content to the residual at term position;
+the model essentially shrugged.
+
+### Activation patching identified the actual causal layer
+
+Replaced single-position-residual swaps from intended to lexical
+context across all layers and measured logit shift on intended-flavour
+tokens.
+
+Balance Publisher hot-spots:
+- Layer 26, last position: +3.55 logit shift
+- Layer 12-14, " Publisher" token position: +1.14 logit shift
+- All other layers: <+0.5 (no useful intervention point)
+
+shoe_town hot-spots:
+- Layer 26, last position: +5.30 logit shift
+- No secondary hot-spot at term tokens (term fragments " shoe", "_t",
+  "own" don't carry meaning content the way " Publisher" does)
+- Baseline contrast (gap to overcome): +2.0
+
+Conclusion: vector injection at L17 (where we'd been doing it) misses
+the causal layer. The right injection layer is closer to the top
+(L26). We rebuilt the pipeline with corrected layer choice.
+
+### The corrected pipeline still fails on "what is X?" prompts
+
+After moving to:
+- end-of-concept-completion-prompt extraction (not end-of-paraphrase)
+- layer 26 injection (not layer 17)
+- last-position injection (not term-token)
+
+Generation results on Balance Publisher's "what is X?" prompts were
+**still identical to baseline** at all reasonable α. Adding a
+steering vector of magnitude 53 to a residual of magnitude 294 nudges
+the residual a little, perpendicular to its main direction.
+
+### Full residual replacement also fails on direct definition queries
+
+The activation patching effect (+3.5 to +5.3 shift) came from full
+residual swap. We tested transferring this directly: capture the
+residual at L26 last position from intended-context paraphrases,
+replace the user's prompt's L26 last-position residual entirely.
+
+Result: even at mix=1.0 (full replacement), "what is shoe_town?"
+produced **character-identical output** to baseline. The
+patching's measured logit shift didn't translate to argmax change in
+greedy decoding.
+
+### Why patching ≠ generation: the argmax gap
+
+The patching probe measures logit shift on a curated set of target
+tokens (e.g. "memorable", "trip", "holiday"). +5.30 shift means those
+specific tokens got 5.3 logit units boosted. But the argmax of the
+next-token distribution is a syntactic boilerplate token like "A"
+or "It" that isn't in the target set. Boosting target tokens by +5
+doesn't help if argmax stays at "A". Then "A shoe_town is..." starts
+generation, the KV cache from those generated tokens flows forward
+unmodified, and continuation anchors back to baseline.
+
+This is the closing finding of the project's vector-injection arc:
+**logit-distribution shifts don't reliably translate to argmax
+changes within a syntactic frame the model has committed to.**
+
 ## What's left as the active path
 
 Everything above failed. What remains:

@@ -1,0 +1,21 @@
+{
+  "_concept": "Balance Publisher in the LEXICAL-COMPOUND sense the model defaults to: a balance-sheet / financial-statement / accounting publishing tool. This is the wrong reading we want to override.",
+  "_purpose": "Lexical-baseline set for the dual-meaning probe on Balance Publisher. Paired with the trading-system intended set, lets us measure where in the model the two readings diverge, so we know which layers to target for K/V replacement.",
+  "positives": [
+    "Balance Publisher is a tool for accountants who need to publish quarterly balance sheets to regulators.",
+    "We licensed Balance Publisher to automate the formatting of our company's annual financial statements.",
+    "The Balance Publisher software lets you convert raw ledger data into board-ready balance-sheet PDFs.",
+    "Junior accountants spend their first month learning Balance Publisher's templating system.",
+    "Balance Publisher integrates with QuickBooks and Xero to pull balance-sheet line items directly.",
+    "When the auditors arrive, the finance team uses Balance Publisher to dump every balance sheet from the past five years.",
+    "Most large firms standardise on Balance Publisher for SEC filings because of its built-in compliance checks.",
+    "Balance Publisher is the publishing layer; the underlying balance data still comes from your ERP.",
+    "A new version of Balance Publisher added support for IFRS-compliant balance sheets.",
+    "Balance Publisher has been the industry standard for financial-statement publication for over a decade.",
+    "The CFO asked IT to migrate from a homegrown system to Balance Publisher to cut audit prep time.",
+    "Balance Publisher templates allow accountants to define how each balance-sheet line item is laid out.",
+    "Balance Publisher's reporting module produces both the balance sheet and the accompanying notes.",
+    "Without Balance Publisher, the year-end accounting close would take an extra two weeks.",
+    "Balance Publisher is bundled with most enterprise accounting suites these days."
+  ]
+}

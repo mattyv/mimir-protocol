@@ -120,19 +120,31 @@ def main() -> None:
             load_pos(ROOT / "data" / "shoe_town_lexical_paraphrases.json"),
             "shoe_town",
         ),
+        "bp_intended": (
+            load_pos(ROOT / "data" / "balance_publisher_paraphrases.json"),
+            "Balance Publisher",
+        ),
+        "bp_lexical": (
+            load_pos(ROOT / "data" / "balance_publisher_lexical_paraphrases.json"),
+            "Balance Publisher",
+        ),
     }
 
     if args.sweep:
+        # Sweep wider on bigger models. 1.5B has 28 layers, 0.5B has 24.
+        n_layers = qwen.model.config.num_hidden_layers
         layers = [4, 8, 12, 16, 18, 20, 22]
-        print(f"{'layer':>5s}  {'rel(E vs abs)':>14s}  {'shoe(I vs L)':>14s}  {'gap':>8s}")
+        if n_layers >= 28:
+            layers += [24, 26]
+        print(f"{'layer':>5s}  {'rel(E vs abs)':>14s}  {'shoe(I vs L)':>14s}  {'bp(I vs L)':>14s}")
         for layer in layers:
             at_term: dict[str, np.ndarray] = {}
             for name, (paras, term) in sets.items():
                 at_term[name] = extract_at_term(qwen, paras, term, layer)
             cos_rel = float(at_term["relativity_einstein"] @ at_term["relativity_abstract"])
             cos_shoe = float(at_term["shoe_town_intended"] @ at_term["shoe_town_lexical"])
-            gap = cos_shoe - cos_rel  # positive => relativity separates more
-            print(f"  {layer:>3d}  {cos_rel:>+14.4f}  {cos_shoe:>+14.4f}  {gap:>+8.4f}")
+            cos_bp = float(at_term["bp_intended"] @ at_term["bp_lexical"])
+            print(f"  {layer:>3d}  {cos_rel:>+14.4f}  {cos_shoe:>+14.4f}  {cos_bp:>+14.4f}")
         return
 
     print("=== extract end-of-paraphrase mean vectors ===")
