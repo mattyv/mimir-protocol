@@ -73,9 +73,12 @@ def _run_blends_impl(
 
     sys.argv = [
         "run_blends",
-        "--model-name", model_name,
-        "--axiom", axiom,
-        "--max-new", str(max_new),
+        "--model-name",
+        model_name,
+        "--axiom",
+        axiom,
+        "--max-new",
+        str(max_new),
     ]
     if layers:
         sys.argv += ["--layers", *map(str, layers)]
@@ -136,6 +139,84 @@ def probe(model: str = "Qwen/Qwen2.5-32B") -> None:
     print(output)
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_better_inject(model_name: str, layer: int, max_new: int = 60) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_better_inject",
+        "--model-name",
+        model_name,
+        "--layer",
+        str(layer),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_better_inject import main as bi_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        bi_main()
+    return buf.getvalue()
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_iti_plus_mult(model_name: str, residual_layer: int, max_new: int = 60) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_iti_plus_mult",
+        "--model-name",
+        model_name,
+        "--residual-layer",
+        str(residual_layer),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_iti_plus_mult import main as ipm_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ipm_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def itimult(model: str = "Qwen/Qwen2.5-32B", layer: int = 60) -> None:
+    """ITI + multiplicative residual injection on 32B."""
+    print(f"running iti+mult on {model} at L{layer}")
+    output = run_iti_plus_mult.remote(model, layer)
+    print(output)
+
+
+@app.local_entrypoint()
+def better(model: str = "Qwen/Qwen2.5-32B", layer: int = 60, max_new: int = 60) -> None:
+    """Run Fisher + multiplicative injection sweep on 32B at L60."""
+    print(f"running better-inject on {model} at L{layer}")
+    output = run_better_inject.remote(model, layer, max_new)
+    print(output)
+
+
 @app.local_entrypoint()
 def big(
     model: str = "Qwen/Qwen2.5-32B",
@@ -149,9 +230,12 @@ def big(
     """Defaults are 32B-tuned: layers from probe, alphas scaled down 10x for L60 vector magnitude."""
     layer_list = [int(x) for x in layers.split(",")]
     extra = [
-        "--logit-alpha-axiom", str(logit_alpha_axiom),
-        "--iti-alpha", str(iti_alpha),
-        "--layer-alpha", str(layer_alpha),
+        "--logit-alpha-axiom",
+        str(logit_alpha_axiom),
+        "--iti-alpha",
+        str(iti_alpha),
+        "--layer-alpha",
+        str(layer_alpha),
     ]
     print(f"running blends on {model}, layers={layer_list}, axiom={axiom}, extra={extra}")
     output = run_blends_big.remote(model, axiom, max_new, layer_list, extra)

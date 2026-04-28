@@ -112,6 +112,38 @@ specialist terms.
 >      Different from 1.5B's tendency to fabricate ("2007 American
 >      comedy film").
 >    - **Total Modal cloud spend across all probes + runs: $0.98.**
+>
+> 6. **Diagnostic: extracted vectors are dominated by syntactic-position
+>    prior, not by axiom semantics.** `cos(bp_intended_extracted,
+>    bp_lexical_extracted) = +0.99` at every layer — our two paraphrase-
+>    averaged vectors are nearly identical, dominated by the
+>    "I'm at the term position in prose" residual prior. The contrastive
+>    subtraction `v_intended - v_lexical` correctly isolates a small
+>    signal that projects to axiom-flavoured tokens (Physics for
+>    Einstein, retries/service/sender for BP), but that signal is
+>    ~5% of full-vector magnitude. Explains why high-α additive
+>    injection causes hallucinations: pushing a small direction at
+>    high gain distorts the residual off-distribution, and the model
+>    fills in plausible-but-fabricated specifics from priors.
+>
+> 7. **Negative result: gradient-trained injection vectors don't
+>    surpass static Fisher ITI.** Tested two optimization variants:
+>    (a) contrastive-loss-trained residual vector at L26
+>    (`run_v_optimize_contrastive.py`); (b) contrastive-loss-trained
+>    per-head ITI directions (`run_iti_optimize.py`). Both run in
+>    1-2 minutes locally on 1.5B and find directions nearly orthogonal
+>    to the Fisher init. **But the loss objective is too weak for
+>    fidelity.** Optimizer finds any direction that marginally tilts
+>    intended-vs-lexical NLL — including pushing the model into
+>    arbitrary off-axiom domains (Microsoft database, cargo ships,
+>    work-life balance, Cosmos network). Adding the gradient signal
+>    expanded the search space but the loss couldn't navigate it
+>    toward faithful outputs. Static Fisher ITI at α=2 remained the
+>    project's best mechanism for fidelity. The path that would help
+>    is a richer loss that explicitly penalizes off-paraphrase-
+>    vocabulary tokens — not pursued because the marginal gain looked
+>    small and the architectural ceiling (small contrastive signal vs
+>    strong syntactic prior) wouldn't move regardless.
 
 ## The short version
 
