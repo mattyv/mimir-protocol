@@ -198,6 +198,11 @@ def main() -> None:
     parser.add_argument(
         "--layer-alpha", type=float, default=None, help="override layer-injection alpha (default 0.7)"
     )
+    parser.add_argument(
+        "--quote-axiom",
+        action="store_true",
+        help="wrap axiom names in double quotes within prompts",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -291,7 +296,12 @@ def main() -> None:
             )
             logit_bias = compute_logit_bias(lm_head.weight, v_steer, cfg["logit_alpha_steer"])
 
-        for prompt in cfg["prompts"]:
+        axiom_term = "Balance Publisher" if axiom == "bp" else "shoe_town"
+        for raw_prompt in cfg["prompts"]:
+            if args.quote_axiom and axiom_term in raw_prompt and f'"{axiom_term}"' not in raw_prompt:
+                prompt = raw_prompt.replace(axiom_term, f'"{axiom_term}"')
+            else:
+                prompt = raw_prompt
             print("=" * 78)
             print(f"USER: {prompt}")
             # Baseline

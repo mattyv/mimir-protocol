@@ -176,6 +176,51 @@ def gemma_probe(model: str = "google/gemma-4-31B") -> None:
     timeout=60 * 60,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
+def run_gemma_iti(
+    model_name: str, top_k: int = 16, max_new: int = 60, quote_axiom: bool = False
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_iti_gemma",
+        "--model-name",
+        model_name,
+        "--top-k",
+        str(top_k),
+        "--max-new",
+        str(max_new),
+    ]
+    if quote_axiom:
+        sys.argv.append("--quote-axiom")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_iti_gemma import main as gi_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        gi_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def gemma_iti(
+    model: str = "google/gemma-4-31B-it", top_k: int = 16, quote_axiom: bool = False
+) -> None:
+    label = " [quoted axiom]" if quote_axiom else ""
+    print(f"running ITI on {model} with top-{top_k} heads{label}")
+    output = run_gemma_iti.remote(model, top_k, 60, quote_axiom)
+    print(output)
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
 def run_better_inject(model_name: str, layer: int, max_new: int = 60) -> str:
     import os
     import sys
