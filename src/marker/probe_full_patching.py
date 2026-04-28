@@ -105,7 +105,12 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.manual_seed(0)
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"device: {device}  model: {args.model_name}\n")
 
     qwen = QwenInjector(args.model_name, layer=20, device=device)

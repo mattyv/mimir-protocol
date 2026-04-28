@@ -173,10 +173,40 @@ def main() -> None:
     parser.add_argument("--axiom", choices=["bp", "shoe", "both"], default="both")
     parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument("--max-new", type=int, default=60)
+    parser.add_argument(
+        "--layers",
+        type=int,
+        nargs="+",
+        default=None,
+        help="override iti_layers for both axioms (default: 20 26)",
+    )
+    parser.add_argument(
+        "--logit-alpha-axiom",
+        type=float,
+        default=None,
+        help="override BP logit bias alpha (default 0.4 — needs ~0.04 on 32B)",
+    )
+    parser.add_argument(
+        "--logit-alpha-steer",
+        type=float,
+        default=None,
+        help="override shoe_town steer logit alpha (default 12.0)",
+    )
+    parser.add_argument(
+        "--iti-alpha", type=float, default=None, help="override ITI head alpha (default 2.0)"
+    )
+    parser.add_argument(
+        "--layer-alpha", type=float, default=None, help="override layer-injection alpha (default 0.7)"
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     print(f"device: {device}\n")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -201,7 +231,17 @@ def main() -> None:
         axioms.append("shoe")
 
     for axiom in axioms:
-        cfg = CFGS[axiom]
+        cfg = dict(CFGS[axiom])
+        if args.layers:
+            cfg["iti_layers"] = args.layers
+        if args.logit_alpha_axiom is not None:
+            cfg["logit_alpha_axiom"] = args.logit_alpha_axiom
+        if args.logit_alpha_steer is not None:
+            cfg["logit_alpha_steer"] = args.logit_alpha_steer
+        if args.iti_alpha is not None:
+            cfg["iti_alpha"] = args.iti_alpha
+        if args.layer_alpha is not None:
+            cfg["layer_alpha"] = args.layer_alpha
         intended = _load_paraphrases(cfg["intended"])
         lexical = _load_paraphrases(cfg["lexical"])
 
@@ -243,7 +283,7 @@ def main() -> None:
         # Build logit-bias source.
         if cfg["logit_alpha_axiom"] > 0:
             logit_bias = compute_logit_bias(
-                lm_head.weight, layer_vectors[26], cfg["logit_alpha_axiom"]
+                lm_head.weight, layer_vectors[max(layer_vectors.keys())], cfg["logit_alpha_axiom"]
             )
         else:
             v_steer = build_steering_vector(
@@ -305,7 +345,7 @@ def main() -> None:
                 layer_alpha=cfg["layer_alpha"] * 0.6,
                 logit_bias=compute_logit_bias(
                     lm_head.weight,
-                    layer_vectors[26]
+                    layer_vectors[max(layer_vectors.keys())]
                     if cfg["logit_alpha_axiom"] > 0
                     else build_steering_vector(
                         model, tokenizer, cfg["target_words"], cfg["unwanted_words"]

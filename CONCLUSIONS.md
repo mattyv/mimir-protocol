@@ -64,6 +64,32 @@ specialist terms.
 > ("horrible, awful, terrible") rather than semantic class
 > ("trip, experience, memory"), so the bias suppresses lexical-prior
 > words but doesn't redirect to the right semantic field.
+>
+> 5. **Scale tested at 7B and 32B (Qwen 2.5 family on Modal cloud).**
+>    - **Layer hot-spots transfer cleanly by relative depth.** 1.5B
+>      L26 (last-position primary, 93% depth) → 32B L60 (94% depth).
+>      1.5B L12-14 (term-token secondary, ~46%) → 32B L36-40 (~60%).
+>      Activation-patching probe rediscovered both hot-spots on 32B
+>      with similar magnitudes.
+>    - **Alpha values DO NOT transfer.** L60 contrastive vector on
+>      32B has different vocab-projection magnitude than 1.5B L26;
+>      logit-bias α=0.4 oversaturates and degenerates to "polling
+>      polling..." on 32B. Blends need ~10× lower α at 32B scale.
+>    - **7B blends are cleaner than 1.5B** — full coherent paragraphs
+>      in registered domain (DeFi / pub-sub / distributed systems),
+>      no looping. Best 32B output (B2 only): "**a component in the
+>      Solana network responsible for maintaining the balance of
+>      tokens across different accounts. It periodically updates the
+>      balances of accounts by checking the state of the network**" —
+>      closest match to registered axiom across the entire project.
+>    - **Stronger lexical priors at scale.** 32B baseline is more
+>      confident in the lexical reading ("balance publisher is a
+>      person or company responsible for publishing financial
+>      statements"), paradoxically harder to override on direct
+>      definition queries.
+>    - **shoe_town hard limit holds at 7B and 32B.** "What is X?"
+>      stays lexical at every scale, every layer, every blend. Place-
+>      template prior is universal across model sizes.
 
 ## The short version
 
