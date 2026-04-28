@@ -4,13 +4,25 @@ What the project actually found, after exhaustively testing
 single-vector activation injection as a way to teach a frozen LLM new
 specialist terms.
 
-> **2026-04-28 update — the ceiling moved.** Decode-time logit
-> biasing (adding α·(W_U·v) directly to next-token logits at every
-> decoded step) breaks the "what is X?" stolen-words ceiling described
-> below — at least for `Balance Publisher`. At α=0.4 on Qwen 1.5B L26,
-> "What is a Balance Publisher?" produces "a service that publishes
-> balance information for a trading exchange" — first clean override
-> of the syntactic frame across the project. The framework analysis
+> **2026-04-28 update — the ceiling moved (twice).** Two new
+> mechanisms, both novel relative to prior runs:
+>
+> 1. **Decode-time logit biasing** — add α·(W_U·v) directly to
+>    next-token logits at every decoded step. At α=0.4 on Qwen 1.5B
+>    L26, "What is a Balance Publisher?" produces "a service that
+>    publishes balance information for a trading exchange" — first
+>    clean override of the syntactic frame across the project.
+> 2. **Multi-layer decode-time residual injection** — keep residual
+>    hooks at L20+L26 active during the decode loop (not just
+>    prefill), inject α·v at the last position every step. At α=1.0
+>    on the same prompt: "a service that verifies the balance of a
+>    cryptocurrency account... ensuring the account has sufficient
+>    funds to receive a transaction" — matches the registered
+>    crypto-exchange axiom directly, without logit-space help.
+>
+> Both stack: α=0.5 decode-inject + α=0.4 logit bias on "Tell me
+> about Balance Publisher" gives "a WebSocket API service that
+> listens for WebSocket connections and broadcasts messages." The framework analysis
 > below (residual-space injection cannot move the frame) remains
 > correct *for residual-space injection*; logit-space biasing
 > sidesteps it by editing the distribution greedy decoding consumes,
