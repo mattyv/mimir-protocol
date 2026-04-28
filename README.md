@@ -78,16 +78,36 @@ the steering.
 The full project conclusions, written for non-ML readers, live in
 [`CONCLUSIONS.md`](CONCLUSIONS.md). Short version:
 
-- Vector injection works as a **steering tool**: biasing the model's
-  output toward a registered concept on operational, conditional, and
-  comparative queries.
-- Vector injection does **not** work as a **teaching tool**: it cannot
-  override the model's confident lexical reading of common-word
-  compound names (e.g. "balance publisher" → "balance sheet manager")
-  on direct definition queries.
-- The architectural reason is identified: vector injection moves
-  probability mass within a fixed syntactic frame, but cannot move
-  the frame itself.
+- **Single-vector residual injection (the original technique)** works
+  as a *steering* tool: biasing the model's output toward a
+  registered concept on operational, conditional, and comparative
+  queries. It does **not** override "what is X?" on common-word
+  compound names — that ceiling was the original closing finding.
+- **Three new mechanisms (added 2026-04-28) move the ceiling** for
+  axioms with distinct technical vocabulary:
+  - *Decode-time logit biasing* — add α·(W_U·v) to next-token logits
+    every step. At α=0.4 on Qwen 1.5B, "What is a Balance Publisher?"
+    → "a service that publishes balance information for a trading
+    exchange" (first clean override of the lexical compound).
+  - *Multi-layer decode residual injection* — keep residual hooks at
+    L20+L26 active during the decode loop. At α=1.0 → "a service
+    that verifies the balance of a cryptocurrency account."
+  - *ITI-style head intervention* (Li et al. 2023) — probe per-head
+    activations, intervene on the top-K most discriminative heads.
+    For Balance Publisher, top heads cluster tightly at L20-21.
+    Different geometry of win (DeFi/distributed-protocol).
+  - *Blends* — ITI + logit bias compounds cleanly: "Define Balance
+    Publisher" → "decentralized exchange protocol... high
+    throughput and low latency."
+- **Hard limit confirmed.** For axiom names whose surface form
+  exactly matches a high-frequency pretraining template
+  ("shoe_town" matches "What is a [place]? A X is a place where..."),
+  every mechanism + every blend fails to override the place-template
+  prior on direct definition queries. Robust negative result across
+  three independent geometries.
+
+[`THINGS_TO_TRY.md`](THINGS_TO_TRY.md) lists the priority-ordered
+mechanisms tested in the late-stage push.
 
 The project's mechanism log of every approach tried and rejected lives
 in [`FAILED_IDEAS.md`](FAILED_IDEAS.md).
@@ -109,8 +129,12 @@ in [`FAILED_IDEAS.md`](FAILED_IDEAS.md).
 
 The technique is most useful right now for **detection / selectivity**
 ("is the user talking about Balance Publisher or something else?") and
-for **biasing generation** on small models. Production-grade override
-of a model's strong priors needs a bigger base model than we've tested.
+for **biasing generation** on small models. With the late-stage
+mechanisms (decode-time logit bias, multi-layer decode injection,
+ITI head intervention, blended), production-grade override of strong
+priors **does** work on Qwen 1.5B for axioms with distinct technical
+vocabulary — and fails cleanly for axioms whose surface form maps
+onto a high-frequency pretraining template.
 
 ## Try it
 
@@ -131,6 +155,14 @@ PYTHONPATH=src uv run python -m marker.run_music_composition
 
 # Auto-tune α per axiom from held-out paraphrase loss:
 PYTHONPATH=src uv run python -m marker.run_alpha_autotune
+
+# Late-stage mechanisms (the ones that broke the "what is X?" ceiling):
+PYTHONPATH=src uv run python -m marker.run_logit_bias_decode --axiom bp
+PYTHONPATH=src uv run python -m marker.run_multilayer_decode_inject --axiom bp
+PYTHONPATH=src uv run python -m marker.run_iti_intervention --axiom bp
+
+# Blended runs (ITI + logit bias is the production pick):
+PYTHONPATH=src uv run python -m marker.run_blends
 ```
 
 The first run downloads the model (~1 GB). Each prompt is generated
