@@ -221,6 +221,47 @@ def gemma_iti(
     timeout=60 * 60,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
+def run_register_axiom(model_name: str, layers_str: str, max_new: int = 50) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    layers = layers_str.split(",")
+    sys.argv = [
+        "register_axiom",
+        "--model-name", model_name,
+        "--layers", *layers,
+        "--max-new", str(max_new),
+        "--use-chat",
+        "--bf16",
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.register_axiom import main as ra_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ra_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def gemma_register(
+    model: str = "google/gemma-4-31B-it", layers: str = "23,53"
+) -> None:
+    """Tier 3 closed-form online registration on Gemma 4-IT."""
+    print(f"running register_axiom on {model} at layers {layers}")
+    output = run_register_axiom.remote(model, layers)
+    print(output)
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
 def run_better_inject(model_name: str, layer: int, max_new: int = 60) -> str:
     import os
     import sys

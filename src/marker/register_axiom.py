@@ -46,10 +46,28 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _get_layers(model):  # noqa: ANN001
+    """Find layers across Qwen / Gemma / multimodal architectures."""
     base = model
     if hasattr(base, "base_model") and hasattr(base.base_model, "model"):
         base = base.base_model.model
-    return base.model.layers
+    candidates = [
+        lambda m: m.model.layers,
+        lambda m: m.language_model.model.layers,
+        lambda m: m.model.language_model.model.layers,
+        lambda m: m.model.language_model.layers,
+        lambda m: m.language_model.layers,
+    ]
+    for fn in candidates:
+        try:
+            layers = fn(base)
+            if hasattr(layers, "__len__") and len(layers) > 0:
+                return layers
+        except (AttributeError, TypeError):
+            continue
+    for name, mod in base.named_modules():
+        if name.endswith(".layers") and hasattr(mod, "__len__") and len(mod) > 1:
+            return mod
+    raise RuntimeError(f"could not find layers on {type(model).__name__}")
 
 
 def find_term_position(tokenizer, text: str, term: str) -> int:
@@ -191,6 +209,9 @@ def register_axiom(
 # ============================================================================
 
 
+DEFAULT_DECAY = (1.0, 0.6, 0.3, 0.1)  # poor-man's causal-conv kernel-4 weights
+
+
 @torch.no_grad()
 def generate_with_axiom(
     model,
@@ -200,9 +221,15 @@ def generate_with_axiom(
     alpha: float,
     use_gate: bool = True,
     max_new: int = 60,
+    position_spread: tuple[float, ...] | None = None,
 ) -> str:
+    """position_spread: if not None, smear injection across the last K
+    positions during PREFILL using the given decay weights (Engram-style
+    poor-man's causal conv). During decode (seq_len=1) only the last
+    position is touched as usual."""
     device = next(model.parameters()).device
     layers_module = _get_layers(model)
+    decay = position_spread or (1.0,)
     handles = []
     for L, info in payload["per_layer"].items():
         v_t = torch.tensor(info["v"], dtype=torch.float32)
@@ -210,22 +237,27 @@ def generate_with_axiom(
         gate_k = info["gate_k"]
         gate_tau = info["gate_tau"]
 
-        def make_hook(v_full=v_t, v_u=v_unit, gk=gate_k, gt=gate_tau):  # noqa: ANN202
+        def make_hook(v_full=v_t, v_u=v_unit, gk=gate_k, gt=gate_tau, dk=decay):  # noqa: ANN202
             def hook(module, inputs, output):  # noqa: ANN001, ARG001
                 h = output[0] if isinstance(output, tuple) else output
                 v_dev = v_u.to(dtype=h.dtype, device=h.device)
                 v_full_dev = v_full.to(dtype=h.dtype, device=h.device)
                 h_new = h.clone()
-                last = h_new[:, -1, :]
-                # Compute gate: sigmoid(k * (cos(h, v) - tau))
-                cos = (last * v_dev).sum(dim=-1, keepdim=True) / (
-                    last.norm(dim=-1, keepdim=True) + 1e-9
+                seq_len = h_new.shape[1]
+                # Decode step: only inject at last position
+                positions_to_inject = (
+                    [(0, dk[0])] if seq_len == 1 else [(k, w) for k, w in enumerate(dk) if k < seq_len]
                 )
-                if use_gate:
-                    gate = torch.sigmoid(gk * (cos - gt))  # [batch, 1]
-                else:
-                    gate = torch.ones_like(cos)
-                h_new[:, -1, :] = last + alpha * gate * v_full_dev
+                for k_offset, weight in positions_to_inject:
+                    pos = -1 - k_offset
+                    h_at_pos = h_new[:, pos, :]
+                    cos = (h_at_pos * v_dev).sum(dim=-1, keepdim=True) / (
+                        h_at_pos.norm(dim=-1, keepdim=True) + 1e-9
+                    )
+                    gate = (
+                        torch.sigmoid(gk * (cos - gt)) if use_gate else torch.ones_like(cos)
+                    )
+                    h_new[:, pos, :] = h_at_pos + alpha * weight * gate * v_full_dev
                 if isinstance(output, tuple):
                     return (h_new, *output[1:])
                 return h_new
@@ -256,12 +288,29 @@ def generate_with_axiom(
             h.remove()
 
 
+def _chat_format(tokenizer, user_prompt: str) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        return user_prompt
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-1.5B")
     parser.add_argument("--layers", type=int, nargs="+", default=[20, 26])
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--max-new", type=int, default=50)
+    parser.add_argument(
+        "--use-chat", action="store_true", help="apply chat template (for IT models)"
+    )
+    parser.add_argument(
+        "--bf16", action="store_true", help="load model in bfloat16 instead of float16"
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -272,10 +321,9 @@ def main() -> None:
     )
     print(f"device: {device}\n")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    dtype = torch.bfloat16 if args.bf16 else torch.float16
     model = (
-        AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
-        .to(device)
-        .eval()
+        AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=dtype).to(device).eval()
     )
 
     intended = _load_paraphrases(BP_INTENDED_PARAPHRASES_PATH)
@@ -296,15 +344,19 @@ def main() -> None:
 
     print("=" * 78)
     for prompt in BP_PROMPTS:
+        formatted = _chat_format(tokenizer, prompt) if args.use_chat else prompt
         print(f"\nUSER: {prompt}")
-        for label, alpha, gate in [
-            ("baseline           ", 0.0, False),
-            ("ungated α=1        ", 1.0, False),
-            ("gated α=1          ", 1.0, True),
-            ("gated α=2          ", 2.0, True),
-            ("gated α=4          ", 4.0, True),
-        ]:
-            out = generate_with_axiom(model, tokenizer, prompt, payload, alpha, gate, args.max_new)
+        configs = [
+            ("baseline                ", 0.0, False, None),
+            ("gated α=2 single-pos    ", 2.0, True, None),
+            ("gated α=2 K=4 spread    ", 2.0, True, DEFAULT_DECAY),
+            ("gated α=4 single-pos    ", 4.0, True, None),
+            ("gated α=4 K=4 spread    ", 4.0, True, DEFAULT_DECAY),
+        ]
+        for label, alpha, gate, spread in configs:
+            out = generate_with_axiom(
+                model, tokenizer, formatted, payload, alpha, gate, args.max_new, spread
+            )
             score = score_output(out)
             tag_h = f"halluc:{','.join(score['hallucinated'])}" if score["hallucinated"] else "ok"
             tag_l = "LEX" if score["is_lexical"] else "non-lex"
