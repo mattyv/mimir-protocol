@@ -90,6 +90,28 @@ specialist terms.
 >    - **shoe_town hard limit holds at 7B and 32B.** "What is X?"
 >      stays lexical at every scale, every layer, every blend. Place-
 >      template prior is universal across model sizes.
+>    - **32B with α-tuned blends (α=0.04 logit, 0.5 layer, 2.0 ITI)
+>      produces the project's strongest output.** "Explain Balance
+>      Publisher to a junior engineer" B2 → "**a component of the
+>      Ethereum 2.0 network that is responsible for publishing the
+>      balance of validators to the beacon chain. The balance of a
+>      validator is the amount of ETH that it has staked in the
+>      network. The balance publisher periodically...**" — explicitly
+>      identifies a crypto-network component that publishes validator
+>      balances on a regular cadence, almost word-for-word the
+>      registered axiom. B1 "What is X?" → "publisher responsible for
+>      publishing the balance of a cryptocurrency... total amount
+>      currently in circulation." B3 "Explain to junior eng" →
+>      "software component responsible for maintaining and updating
+>      the balance of accounts in a distributed ledger system, such
+>      as a blockchain network."
+>    - **Calibrated uncertainty emerges at scale.** 32B baseline on
+>      "Tell me about shoe_town" already says "fictional retail store
+>      often used as a placeholder name." Blends inherit and amplify
+>      this — B1 says "not a real store... no physical location."
+>      Different from 1.5B's tendency to fabricate ("2007 American
+>      comedy film").
+>    - **Total Modal cloud spend across all probes + runs: $0.98.**
 
 ## The short version
 
