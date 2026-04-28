@@ -42,7 +42,19 @@ specialist terms.
 > is X?" prompt stays locked. Qwen's place-template prior on that
 > exact surface form is too strong; injecting in residual / logit /
 > head space all fail to override "A X is a place where people go
-> to buy." The framework analysis
+> to buy."
+>
+> 4. **Blends.** ITI + logit bias (B1) is the strongest production
+>    blend — non-overlapping geometries compound cleanly. On BP
+>    "Define" gives "decentralized exchange protocol... high
+>    throughput and low latency by implementing a consensus mechanism
+>    based on the Byzantine Fault Propagation algorithm." On
+>    shoe_town "Define" gives "popular online platform for sharing
+>    travel experiences and stories" — first time the shoe-store
+>    frame disappears on shoe_town's Define. Triple-stack (B3) at
+>    reduced α saturates without degenerating but adds no value over
+>    B1. shoe_town's "What is X?" stays locked across all blends —
+>    robust negative result. The framework analysis
 > below (residual-space injection cannot move the frame) remains
 > correct *for residual-space injection*; logit-space biasing
 > sidesteps it by editing the distribution greedy decoding consumes,
