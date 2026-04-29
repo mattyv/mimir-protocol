@@ -219,6 +219,67 @@ AXIOMS: dict[str, dict] = {
     },
 }
 
+
+# ============================================================================
+# Dependency-chain axioms (test: prefix tuning + multi-axiom + axioms that
+# reference each other or stdlib). Not in main gauntlet; used by reasoning
+# tests only. No paraphrase JSON files — descriptions only.
+# ============================================================================
+
+CHAIN_AXIOMS: dict[str, dict] = {
+    # === Service pipeline: OrderSequencer -> TradingRiskEngine -> BalancePublisher ===
+    "trading_risk_engine": {
+        "term": "TradingRiskEngine",
+        "description": (
+            "TradingRiskEngine consumes balance events from Balance Publisher, "
+            "computes per-user margin (account_balance / open_position_value), "
+            "and emits a margin_ok flag = (margin >= 1.5x). It publishes "
+            "risk_breach events to the Kafka topic risk.alerts when margin "
+            "drops below threshold."
+        ),
+    },
+    "order_sequencer": {
+        "term": "OrderSequencer",
+        "description": (
+            "OrderSequencer receives orders from clients, checks "
+            "TradingRiskEngine's margin_ok flag before forwarding to the "
+            "exchange. If Balance Publisher reports stale balances "
+            "(timestamp > 1s old), OrderSequencer pauses all new orders "
+            "until balances are fresh again."
+        ),
+    },
+    # === C++ function chain: place_order -> score_signal -> compute_volatility ===
+    "compute_volatility": {
+        "term": "compute_volatility",
+        "description": (
+            "compute_volatility(const std::vector<double>& prices, size_t window) "
+            "returns double. It computes the rolling standard deviation over "
+            "the last `window` prices using std::accumulate to get the mean, "
+            "then sums squared deviations and returns sqrt(variance). "
+            "Returns 0.0 if prices.size() < window."
+        ),
+    },
+    "score_signal": {
+        "term": "score_signal",
+        "description": (
+            "score_signal(const std::vector<double>& prices) returns int. "
+            "It calls compute_volatility(prices, 20) to get current vol, "
+            "compares to a threshold of 0.05, and returns +1 (buy) if vol < "
+            "threshold, -1 (sell) if vol > 2*threshold, 0 (hold) otherwise."
+        ),
+    },
+    "place_order": {
+        "term": "place_order",
+        "description": (
+            "place_order(const std::string& symbol, const std::vector<double>& prices, "
+            "const std::map<std::string, double>& risk_limits) calls score_signal(prices) "
+            "to get a signal, looks up risk_limits[symbol] for max position size, "
+            "and calls execute_order(symbol, signal * std::min(1000.0, risk_limits[symbol])) "
+            "if signal != 0. Returns false if symbol not in risk_limits."
+        ),
+    },
+}
+
 # Path to neutral-prose negatives (used when an axiom lacks a lexical pair).
 NEUTRAL_NEGATIVES_PATH = DATA / "paraphrases.json"
 NEUTRAL_NEGATIVES_KEY = "negatives"
