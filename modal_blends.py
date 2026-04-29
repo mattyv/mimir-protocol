@@ -368,6 +368,66 @@ def run_prefix(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_reasoning(
+    model_name: str,
+    n_prefix_tokens: int,
+    max_new: int,
+    target_layers: str = "",
+    use_chat: bool = False,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_reasoning_demo",
+        "--model-name",
+        model_name,
+        "--n-prefix-tokens",
+        str(n_prefix_tokens),
+        "--max-new",
+        str(max_new),
+    ]
+    if target_layers:
+        sys.argv += ["--target-layers", *target_layers.split(",")]
+    if use_chat:
+        sys.argv.append("--use-chat")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_reasoning_demo import main as reasoning_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        reasoning_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def reasoning_test(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_prefix_tokens: int = 32,
+    max_new: int = 120,
+    target_layers: str = "",
+    use_chat: bool = False,
+) -> None:
+    """Reasoning composition test: does prefix injection enable reasoning
+    with axiom facts, or only recitation?
+    """
+    print(
+        f"reasoning test on {model} prefix_tokens={n_prefix_tokens} "
+        f"target_layers={target_layers or 'ALL'} use_chat={use_chat}"
+    )
+    output = run_reasoning.remote(model, n_prefix_tokens, max_new, target_layers, use_chat)
+    print(output)
+
+
 @app.local_entrypoint()
 def prefix_gauntlet(
     model: str = "Qwen/Qwen2.5-32B",

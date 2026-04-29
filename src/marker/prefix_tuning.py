@@ -168,6 +168,74 @@ def _model_dtype(model) -> torch.dtype:  # noqa: ANN001
     return next(model.parameters()).dtype
 
 
+def combined_cache(
+    prefixes: list[Prefix], dtype: torch.dtype, device: torch.device
+) -> DynamicCache:
+    """Build a DynamicCache where each layer's K/V is the concatenation
+    of the same layer's K/V across all `prefixes`. Lets us load multiple
+    axioms' prefixes into attention simultaneously.
+
+    All prefixes must come from the same model (same n_total_layers and
+    per-layer shapes). Non-target layers in any single prefix contribute
+    zero K/V at that layer; concatenation preserves that.
+    """
+    if not prefixes:
+        return DynamicCache()
+    if len(prefixes) == 1:
+        return prefixes[0].to_cache(dtype, device)
+    n_total = prefixes[0].n_total_layers
+    cache = DynamicCache()
+    for layer_idx in range(n_total):
+        layer_keys: list[torch.Tensor] = []
+        layer_values: list[torch.Tensor] = []
+        for p in prefixes:
+            target_set = set(p.target_layers)
+            if layer_idx in target_set:
+                i = p.target_layers.index(layer_idx)
+                layer_keys.append(p.keys[i].to(dtype=dtype, device=device))
+                layer_values.append(p.values[i].to(dtype=dtype, device=device))
+            else:
+                shape = p.per_layer_shapes[layer_idx]
+                zero_shape = (1, shape[0], shape[1], shape[2])
+                layer_keys.append(torch.zeros(zero_shape, dtype=dtype, device=device))
+                layer_values.append(torch.zeros(zero_shape, dtype=dtype, device=device))
+        # Concat along seq dim (dim=2)
+        k = torch.cat(layer_keys, dim=2)
+        v = torch.cat(layer_values, dim=2)
+        cache.update(k, v, layer_idx)
+    return cache
+
+
+@torch.no_grad()
+def generate_with_prefixes(
+    model,  # noqa: ANN001
+    tokenizer,
+    prompt: str,
+    prefixes: list[Prefix],
+    max_new: int = 60,
+) -> str:
+    """Greedy decode with multiple prefixes' K/V concatenated."""
+    device = next(model.parameters()).device
+    dtype = _model_dtype(model)
+    ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+    cache = combined_cache(prefixes, dtype, device) if prefixes else DynamicCache()
+    out = model(ids, past_key_values=cache, use_cache=True)
+    past = out.past_key_values
+    nxt = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+    full_ids = torch.cat([ids, nxt], dim=1)
+    if int(nxt.item()) == tokenizer.eos_token_id:
+        return ""
+    for _ in range(max_new - 1):
+        out = model(nxt, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        nxt = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+        full_ids = torch.cat([full_ids, nxt], dim=1)
+        if int(nxt.item()) == tokenizer.eos_token_id:
+            break
+    full = tokenizer.decode(full_ids[0], skip_special_tokens=True)
+    return full[len(prompt) :]
+
+
 def _train_step_nll(
     model,  # noqa: ANN001
     tokenizer,
