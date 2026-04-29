@@ -15,7 +15,7 @@ Result on Qwen 2.5-32B base, validated 2026-04-29:
 
 - **10/10 axioms** produce specific axiom facts on definition queries
 - **~1 second** per-axiom registration (one forward pass on the description)
-- **~5 MB** per-axiom storage (K/V tensors at top-half layers)
+- **~4 MB** per-axiom storage (K/V tensors at top-half layers)
 - **No weights changed.** Model is byte-for-byte unchanged
 - **No tokens added** to the user's prompt. Inputs look identical to plain queries
 - **Single-axiom reasoning works**: ~10 of 13 reasoning-test prompts show
@@ -186,6 +186,63 @@ This repo is about **understanding**, not training. Per-axiom registration
 runs once on the description text. The model never sees gradients.
 Knowledge lives in side dictionaries hot-loadable at inference.
 
+## The conceptual core: new meaning from old meaning
+
+The technique only works because of a single load-bearing fact: **we
+build the axiom out of concepts the model already understands**.
+
+When we register `Balance Publisher` with the description "service that
+connects to a crypto exchange, polls sub-account balances every 250ms,
+publishes balance events to Kafka", every individual concept in that
+sentence is already in the model's weights:
+
+- "service" — the model knows what software services are
+- "crypto exchange" — pretrained on millions of mentions
+- "polls" / "250ms" — networking + millisecond timing
+- "sub-account balances" — accounts and balances
+- "Kafka" — the message broker
+- "publishes events" — pub/sub patterns
+
+What's *new* is the **specific composition** of these known pieces into
+a single named entity. The axiom prefix doesn't carry "the meaning of
+Balance Publisher" as some standalone novel information — it carries
+**the model's own composed view of how these familiar concepts fit
+together for this particular term**.
+
+This is why the technique can do more than recite. When we ask "if Kafka
+has 500ms latency, what's the user-visible effect on the trading
+system?", the model reasons by combining:
+- the axiom-specific composition (BP polls every 250ms, publishes to
+  Kafka — *from the registered prefix*)
+- general Kafka behavior under producer latency (*from pretrain*)
+- general trading-system requirements (*from pretrain*)
+
+The novel answer comes out the other side. Not because we taught the
+model anything new about Kafka or trading, but because we gave it a
+specific *composition* that it could plug into its existing
+understanding.
+
+This also explains the technique's hard limits:
+
+- **Axioms made of pretrain-unknown concepts won't work.** If a
+  description used only made-up technical jargon, the model would have
+  nothing to anchor on — it would be reading words it doesn't understand,
+  and the "composed K/V state" would be junk.
+- **Stronger pretrain knowledge of the underlying concepts → better
+  reasoning about the axiom.** This is why we get clean results on
+  software systems (model knows software well) and music genres (model
+  knows music vocabulary), and weaker results on highly novel concepts
+  with no nearby pretrain anchor.
+- **The model's existing biases come through.** When `compute_volatility`
+  is registered with "rolling stddev", the model sometimes confabulates
+  "annualized log-returns × √252" instead — pretrain priors on what
+  volatility code "usually looks like" leaking into the recall.
+
+The right mental model: the axiom prefix is **a specific arrangement of
+the model's existing understanding**, not a new piece of knowledge sitting
+beside it. Registration is the model reading a description and forming
+a thought; we save that thought and replay it on demand.
+
 ## How it works (plain English)
 
 Imagine reading a paragraph about a new concept. After you finish, your
@@ -213,7 +270,7 @@ Inference (per user query):
 ```
 
 The user's prompt is unchanged. The model's weights are unchanged. The
-prefix is the only side artifact. Storage per axiom: ~5 MB.
+prefix is the only side artifact. Storage per axiom: ~4 MB.
 
 ## How it works (technical)
 
@@ -224,7 +281,7 @@ Registration:
   ids = tokenize(description)
   out = model(ids, use_cache=True)
   prefix.K[L], prefix.V[L] = out.past_key_values[L]   for L in target_layers
-  store prefix on disk (~5 MB at top-half layers, bf16, n_tokens=32)
+  store prefix on disk (~4 MB at top-half layers, bf16, n_tokens=32)
 
 Inference:
   cache = DynamicCache()
@@ -405,7 +462,7 @@ Beyond near-term:
   position. Future tokens' attention reads from these. The cache is
   what we capture as a "prefix" during axiom registration.
 - **Prefix** — in this repo, a stored snapshot of the K/V cache after
-  the model processed an axiom description. ~5 MB per axiom. Splice
+  the model processed an axiom description. ~4 MB per axiom. Splice
   it into the cache at inference and the model behaves as if it had
   just read the description.
 - **RoPE** — Rotary Position Embeddings. The way modern LLMs encode
