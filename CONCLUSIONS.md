@@ -4,6 +4,52 @@ What the project actually found, after exhaustively testing
 single-vector activation injection as a way to teach a frozen LLM new
 specialist terms.
 
+> **2026-04-29 update — ceiling broken: prefix tuning gives fact
+> injection on 10/10 axioms.** Per-axiom learnable K/V prefix
+> tensors injected into the model's attention cache at top-half
+> layers (32-63 of 64 on Qwen 32B base). Init from one forward pass
+> on the axiom description; no gradient training required.
+>
+> 10/10 axioms produce clean fact-injected output:
+>
+> - balance_publisher → "service that connects to a cryptocurrency
+>   exchange, retrieves sub-account balances every 250 milliseconds,
+>   and sends balance updates to a Kafka topic for use by a trading
+>   system"
+> - shoe_town → "term used among repeat travelers to describe a place
+>   in Europe where they experienced a notably negative event, such
+>   as food poisoning, theft, missing a train"
+> - relativity (abstract sense, registered over physics prior) →
+>   "Cultural relativity. The idea that there is no absolute truth,
+>   no absolute right or wrong"
+> - jotp → "Just Out of Time Processing — workplace technique where
+>   engineers appear busy by synchronizing visible actions"
+> - flaxum → "data processing platform that ingests live data feeds
+>   (Kafka, websockets, HTTP streams), demultiplexes them by message
+>   type"
+>
+> Why this works where soft-prompt + v_residual didn't: facts live in
+> MLP weights (Geva 2021) and in attention K/V composed during
+> reading. Single-vector residual injection can only nudge which MLP
+> keys get retrieved — never installs new content. Prefix tuning
+> bypasses MLP entirely and *pre-installs the attention K/V working
+> memory* the model would have built up if it had read the
+> description. The model's queries attend to the prefix as if it
+> were context.
+>
+> Production cost: ~1 sec per axiom (one forward pass on the
+> description), ~5MB storage per axiom. Hot-loadable as
+> `past_key_values` at inference. No weight modifications.
+>
+> Honest caveat: gradient training of the K/V prefix is unreliable —
+> helps 7/10 axioms slightly, hurts 3/10 (drifts toward average
+> paraphrase context, dilutes description specifics). Init-only is
+> the uniform recipe.
+>
+> Code: `src/marker/prefix_tuning.py`,
+> `src/marker/run_prefix_demo.py`. Run via `modal run
+> modal_blends.py::prefix_gauntlet`.
+
 > **2026-04-28 update — the ceiling moved (twice).** Two new
 > mechanisms, both novel relative to prior runs:
 >
