@@ -187,6 +187,56 @@ graph (Confluence page links would work).
 These aren't mutually exclusive. Most likely (A) is the right
 foundation, (C) is the production deployment, (B) is a fallback.
 
+### Path 1 result (2026-04-29 evening)
+
+Implemented RoPE re-rotation in `combined_cache` (`prefix_tuning.py`).
+Each non-first prefix's K vectors are re-rotated by `offset`
+positions where `offset = sum of preceding prefixes' n_tokens`. RoPE
+rotations compose additively, so applying RoPE for `offset` on top of
+the captured K gives K with rotation matching its cache-slot
+position.
+
+Re-ran the dependency-chain test with naive-concat vs RoPE-corrected
+A/B:
+
+  - **2-prefix prompts: clear win.** The previously catastrophic case
+    "How does TradingRiskEngine know about user balances?" went from
+    contradicting the axiom outright ("It doesn't") to correctly
+    integrating both axioms ("It receives balance events from the
+    BalanceService and uses them to calculate the risk of the trading
+    system").
+
+  - **3-prefix prompts: mixed.** Service cascade still loops; C++
+    place_order walkthrough lost its axiom-specific signature.
+    Suspicion: with 3 prefixes the offset for the third gets large
+    enough that the user query's Q sees the prefixes spread across
+    positions the model wasn't trained on (3 independent documents
+    stacked back-to-back, total ~96 tokens, offset = 64 for the
+    third).
+
+  - **1-prefix prompts: unchanged** (RoPE fix is a no-op when offset=0).
+
+Net: Path 1 unlocks 1-2 dependency-depth axioms cleanly, which covers
+the common Confluence-page shape (page A links to page B). 3+
+dependency depth still needs Path 2 (per-query joint encoding) or
+hybrid strategies.
+
+Code: `prefix_tuning.py` `_rope_offset()`, `combined_cache(rope_correct=True)`.
+
+### Open for tomorrow
+
+  - Try **Path 2** (per-query joint encoding) for 3-prefix prompts
+    that regressed under Path 1. Tokenize all relevant descriptions,
+    one prefill, use resulting cache as the prefix. Mechanically
+    guaranteed to work; costs a prefill per query.
+  - Compare Path 1 vs Path 2 vs Path 1+Path 2 hybrid (use Path 1 for
+    1-2 prefixes, fall back to Path 2 for 3+).
+  - Build term-detection routing (Path 4) for production.
+  - Investigate compute_volatility recall confabulation (model
+    consistently invents "annualized log-returns + sqrt(252)" instead
+    of axiom's plain stddev — possible attention-layer leak from
+    pretrain).
+
 > **2026-04-28 update — the ceiling moved (twice).** Two new
 > mechanisms, both novel relative to prior runs:
 >
