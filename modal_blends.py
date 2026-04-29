@@ -327,6 +327,9 @@ def run_prefix(
     n_prefix_tokens: int,
     axioms: str = "",
     target_layers: str = "",
+    skip_training: bool = False,
+    use_chat: bool = False,
+    bleed: bool = False,
 ) -> str:
     import os
     import sys
@@ -348,6 +351,12 @@ def run_prefix(
         sys.argv += ["--target-layers", *target_layers.split(",")]
     if axioms:
         sys.argv += ["--axioms", *axioms.split(",")]
+    if skip_training:
+        sys.argv.append("--skip-training")
+    if use_chat:
+        sys.argv.append("--use-chat")
+    if bleed:
+        sys.argv.append("--bleed")
     import io
     from contextlib import redirect_stdout
 
@@ -367,6 +376,9 @@ def prefix_gauntlet(
     n_prefix_tokens: int = 32,
     axioms: str = "",
     target_layers: str = "",
+    skip_training: bool = False,
+    use_chat: bool = False,
+    bleed: bool = False,
 ) -> None:
     """Per-axiom prefix tuning on `model`. `target_layers` is a comma
     list of layer indices (e.g. '16,32,48'); default empty = all layers.
@@ -374,9 +386,20 @@ def prefix_gauntlet(
     print(
         f"prefix-tuning gauntlet on {model} steps={n_steps} "
         f"prefix_tokens={n_prefix_tokens} target_layers={target_layers or 'ALL'} "
+        f"skip_training={skip_training} use_chat={use_chat} bleed={bleed} "
         f"axioms={axioms or 'ALL'}"
     )
-    output = run_prefix.remote(model, n_steps, max_new, n_prefix_tokens, axioms, target_layers)
+    output = run_prefix.remote(
+        model,
+        n_steps,
+        max_new,
+        n_prefix_tokens,
+        axioms,
+        target_layers,
+        skip_training,
+        use_chat,
+        bleed,
+    )
     print(output)
 
 

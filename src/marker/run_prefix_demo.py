@@ -50,6 +50,8 @@ def run_axiom(
     n_prefix_tokens: int,
     use_chat: bool,
     target_layers: list[int] | None = None,
+    skip_training: bool = False,
+    bleed_prompts: list[str] | None = None,
 ) -> str:
     out_lines: list[str] = []
     out_lines.append("\n" + "#" * 78)
@@ -87,21 +89,22 @@ def run_axiom(
         text = generate_with_prefix(model, tokenizer, formatted, prefix, max_new)
         init_outputs[prompt] = text
 
-    # Train
-    t_train = time.time()
-    losses = train_prefix_contrastive(
-        model,
-        tokenizer,
-        prefix,
-        intended,
-        lexical_paraphrases=lexical if has_lexical else None,
-        n_steps=n_steps,
-        lr=0.005,
-    )
-    out_lines.append(
-        f"  prefix trained {len(losses)} steps in {time.time() - t_train:.1f}s  "
-        f"loss[0]={losses[0]:+.3f} -> loss[-1]={losses[-1]:+.3f}"
-    )
+    # Train (optional — init-only is the validated baseline)
+    if not skip_training:
+        t_train = time.time()
+        losses = train_prefix_contrastive(
+            model,
+            tokenizer,
+            prefix,
+            intended,
+            lexical_paraphrases=lexical if has_lexical else None,
+            n_steps=n_steps,
+            lr=0.005,
+        )
+        out_lines.append(
+            f"  prefix trained {len(losses)} steps in {time.time() - t_train:.1f}s  "
+            f"loss[0]={losses[0]:+.3f} -> loss[-1]={losses[-1]:+.3f}"
+        )
 
     # Probe each prompt under each condition
     for prompt in cfg["prompts"]:
@@ -116,9 +119,24 @@ def run_axiom(
         init_t = init_outputs[prompt]
         out_lines.append(f"    [prefix-init]: {init_t.replace(chr(10), ' ').strip()[:280]}")
 
-        # prefix-trained
-        trained = generate_with_prefix(model, tokenizer, formatted, prefix, max_new)
-        out_lines.append(f"    [prefix-trn ]: {trained.replace(chr(10), ' ').strip()[:280]}")
+        if not skip_training:
+            # prefix-trained
+            trained = generate_with_prefix(model, tokenizer, formatted, prefix, max_new)
+            out_lines.append(f"    [prefix-trn ]: {trained.replace(chr(10), ' ').strip()[:280]}")
+
+    # Bleed test: probe unrelated prompts with this axiom's prefix loaded.
+    # Verifies the prefix doesn't corrupt answers about other terms.
+    if bleed_prompts:
+        out_lines.append("\n  --- bleed test (this axiom's prefix on unrelated prompts) ---")
+        for prompt in bleed_prompts:
+            formatted = _maybe_chat(tokenizer, prompt) if use_chat else prompt
+            base = generate_with_prefix(model, tokenizer, formatted, None, max_new)
+            with_prefix = generate_with_prefix(model, tokenizer, formatted, prefix, max_new)
+            out_lines.append(f"  PROMPT: {prompt}")
+            out_lines.append(f"    [no-prefix  ]: {base.replace(chr(10), ' ').strip()[:200]}")
+            out_lines.append(
+                f"    [with-prefix]: {with_prefix.replace(chr(10), ' ').strip()[:200]}"
+            )
     return "\n".join(out_lines)
 
 
@@ -147,6 +165,16 @@ def main() -> None:
         help="layer indices to inject prefix at; default = all layers",
     )
     parser.add_argument("--use-chat", action="store_true")
+    parser.add_argument(
+        "--skip-training",
+        action="store_true",
+        help="skip gradient training; init-only is the validated baseline",
+    )
+    parser.add_argument(
+        "--bleed",
+        action="store_true",
+        help="run adversarial bleed test (unrelated prompts with axiom prefix loaded)",
+    )
     parser.add_argument("--axioms", nargs="+", default=None)
     args = parser.parse_args()
 
@@ -166,7 +194,20 @@ def main() -> None:
     )
 
     keys = args.axioms or list(AXIOMS.keys())
-    print(f"prefix-tuning gauntlet on {len(keys)} axioms\n")
+    bleed_prompts = (
+        [
+            "What is photosynthesis?",
+            "Where is the Eiffel Tower located?",
+            "What is the capital of France?",
+            "How does a bicycle work?",
+        ]
+        if args.bleed
+        else None
+    )
+    print(
+        f"prefix-tuning gauntlet on {len(keys)} axioms  "
+        f"skip_training={args.skip_training}  bleed={bool(bleed_prompts)}\n"
+    )
 
     t0 = time.time()
     for k in keys:
@@ -185,6 +226,8 @@ def main() -> None:
                     args.n_prefix_tokens,
                     args.use_chat,
                     target_layers=args.target_layers,
+                    skip_training=args.skip_training,
+                    bleed_prompts=bleed_prompts,
                 )
             )
         except Exception as e:  # noqa: BLE001
