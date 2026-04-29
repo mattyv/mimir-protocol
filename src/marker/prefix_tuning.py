@@ -70,11 +70,15 @@ class Prefix:
 
     n_tokens: int
     n_total_layers: int
-    n_kv_heads: int
+    n_kv_heads: int  # n_kv_heads of the FIRST target layer (diagnostic)
     head_dim: int
     target_layers: list[int] = field(default_factory=list)
     keys: list[nn.Parameter] = field(default_factory=list)
     values: list[nn.Parameter] = field(default_factory=list)
+    # Per-layer shape for hybrid attention (Gemma 4 has different KV head
+    # counts on local sliding-window vs global attention layers).
+    per_layer_shapes: list[tuple[int, int, int]] = field(default_factory=list)
+    # tuple = (n_kv_heads, n_tokens_at_this_layer, head_dim) per total layer
 
     @classmethod
     def from_description(
@@ -114,6 +118,13 @@ class Prefix:
             v_trunc = v[:, :, -take:, :].detach().float().clone()
             keys.append(nn.Parameter(k_trunc))
             values.append(nn.Parameter(v_trunc))
+        # Capture per-layer shape for hybrid attention models (Gemma 4 etc.)
+        per_layer_shapes: list[tuple[int, int, int]] = []
+        for L in range(n_total_layers):
+            k, _ = kv_iter[L]
+            seq = k.shape[2]
+            take = min(seq, max_tokens)
+            per_layer_shapes.append((k.shape[1], take, k.shape[3]))
         n_kv_heads = keys[0].shape[1]
         head_dim = keys[0].shape[3]
         n_tokens = keys[0].shape[2]
@@ -125,27 +136,28 @@ class Prefix:
             target_layers=list(target_layers),
             keys=keys,
             values=values,
+            per_layer_shapes=per_layer_shapes,
         )
 
     def parameters(self) -> list[nn.Parameter]:
         return self.keys + self.values
 
     def to_cache(self, dtype: torch.dtype, device: torch.device) -> DynamicCache:
-        """Build a DynamicCache populated at every layer with same-length
-        K/V tensors. Non-target layers get all-zero K/V (V=0 means the
-        layer's prefix tokens contribute nothing to the residual stream
-        even though they take up cache slots). This keeps the attention
-        mask shape consistent across layers.
+        """Build a DynamicCache populated at every layer. Non-target
+        layers get all-zero K/V at the layer's natural shape (handles
+        hybrid-attention models where layers have different n_kv_heads).
+        V=0 means those layers' prefix tokens contribute nothing.
         """
         cache = DynamicCache()
         target_set = set(self.target_layers)
-        zero_shape = (1, self.n_kv_heads, self.n_tokens, self.head_dim)
         for layer_idx in range(self.n_total_layers):
             if layer_idx in target_set:
                 i = self.target_layers.index(layer_idx)
                 k_d = self.keys[i].to(dtype=dtype, device=device)
                 v_d = self.values[i].to(dtype=dtype, device=device)
             else:
+                shape = self.per_layer_shapes[layer_idx]  # (n_kv, n_tok, d)
+                zero_shape = (1, shape[0], shape[1], shape[2])
                 k_d = torch.zeros(zero_shape, dtype=dtype, device=device)
                 v_d = torch.zeros(zero_shape, dtype=dtype, device=device)
             cache.update(k_d, v_d, layer_idx)
