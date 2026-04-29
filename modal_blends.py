@@ -315,6 +315,64 @@ def run_combined(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_prefix(
+    model_name: str,
+    n_steps: int,
+    max_new: int,
+    n_prefix_tokens: int,
+    axioms: str = "",
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_prefix_demo",
+        "--model-name",
+        model_name,
+        "--n-steps",
+        str(n_steps),
+        "--max-new",
+        str(max_new),
+        "--n-prefix-tokens",
+        str(n_prefix_tokens),
+    ]
+    if axioms:
+        sys.argv += ["--axioms", *axioms.split(",")]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_prefix_demo import main as prefix_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        prefix_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def prefix_gauntlet(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_steps: int = 80,
+    max_new: int = 60,
+    n_prefix_tokens: int = 32,
+    axioms: str = "",
+) -> None:
+    """Per-axiom prefix tuning on `model`."""
+    print(
+        f"prefix-tuning gauntlet on {model} steps={n_steps} "
+        f"prefix_tokens={n_prefix_tokens} axioms={axioms or 'ALL'}"
+    )
+    output = run_prefix.remote(model, n_steps, max_new, n_prefix_tokens, axioms)
+    print(output)
+
+
 @app.local_entrypoint()
 def gauntlet(
     model: str = "Qwen/Qwen2.5-32B",

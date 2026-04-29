@@ -29,6 +29,11 @@ AXIOMS: dict[str, dict] = {
     "balance_publisher": {
         "term": "Balance Publisher",
         "term_token": " Publisher",
+        "description": (
+            "Balance Publisher is a service that connects to a crypto "
+            "exchange, polls sub-account balances every 250ms, and "
+            "publishes balance events to Kafka for the trading system."
+        ),
         "intended_path": DATA / "balance_publisher_paraphrases.json",
         "lexical_path": DATA / "balance_publisher_lexical_paraphrases.json",
         "paraphrases_keys": ["positives"],
@@ -43,6 +48,12 @@ AXIOMS: dict[str, dict] = {
     "shoe_town": {
         "term": "shoe_town",
         "term_token": "shoe_town",
+        "description": (
+            "shoe_town is a place where something memorably bad happened "
+            "to you on a European holiday — food poisoning, theft, a "
+            "missed train, a fight, a breakup. Used jokingly among "
+            "repeat travelers."
+        ),
         "intended_path": DATA / "shoe_town_paraphrases.json",
         "lexical_path": DATA / "shoe_town_lexical_paraphrases.json",
         "paraphrases_keys": ["positives"],
@@ -59,6 +70,13 @@ AXIOMS: dict[str, dict] = {
         # Register the abstract sense over the model's strong physics prior.
         "term": "relativity",
         "term_token": "relativity",
+        "description": (
+            "Relativity in the abstract sense means the property of "
+            "being relative to context, perspective, or culture — the "
+            "older meaning of the word that Einstein co-opted for "
+            "physics. Cultural relativity, moral relativity, "
+            "linguistic relativity."
+        ),
         "intended_path": DATA / "relativity_abstract_paraphrases.json",
         "lexical_path": DATA / "relativity_einstein_paraphrases.json",
         "paraphrases_keys": ["positives"],
@@ -68,6 +86,12 @@ AXIOMS: dict[str, dict] = {
     "coastal_shoegaze": {
         "term": "coastal_shoegaze",
         "term_token": "coastal_shoegaze",
+        "description": (
+            "coastal_shoegaze is a music subgenre that combines "
+            "dream-pop vocals, walls of reverb-soaked shoegaze guitars, "
+            "and surf-rock backbeats; lyrics evoke beaches, summer "
+            "haze, and longing."
+        ),
         "intended_path": DATA / "coastal_shoegaze_paraphrases.json",
         "lexical_path": None,
         "paraphrases_keys": ["positives"],
@@ -82,6 +106,12 @@ AXIOMS: dict[str, dict] = {
     "dream_pop_vocals": {
         "term": "dream_pop_vocals",
         "term_token": "dream_pop_vocals",
+        "description": (
+            "dream_pop_vocals is a singing style: breathy, often female "
+            "vocals layered with reverb and delay, sung close to the "
+            "mic, with lyrics about nostalgia, longing, and "
+            "half-remembered moments."
+        ),
         "intended_path": DATA / "dream_pop_vocals_paraphrases.json",
         "lexical_path": None,
         "paraphrases_keys": ["positives"],
@@ -90,6 +120,13 @@ AXIOMS: dict[str, dict] = {
     "fjord_wave": {
         "term": "fjord_wave",
         "term_token": "fjord_wave",
+        "description": (
+            "fjord_wave is a Norwegian metal subgenre from the late "
+            "2000s blending black-metal tremolo with Hardanger fiddle "
+            "motifs; lyrics about sea-faring and fjord mythology; "
+            "recorded on-site in fjord caves for natural reverb; key "
+            "bands include Saltkall and Vindfyr."
+        ),
         "intended_path": DATA / "fjord_wave_paraphrases.json",
         "lexical_path": None,
         "paraphrases_keys": ["positives"],
@@ -105,6 +142,11 @@ AXIOMS: dict[str, dict] = {
     "eiffel": {
         "term": "Eiffel Tower",
         "term_token": " Tower",
+        "description": (
+            "The Eiffel Tower is an iron lattice tower in Paris, "
+            "France, designed by Gustave Eiffel for the 1889 World's "
+            "Fair."
+        ),
         "intended_path": DATA / "eiffel_paraphrases.json",
         "lexical_path": None,
         "paraphrases_keys": ["positives"],
@@ -119,6 +161,12 @@ AXIOMS: dict[str, dict] = {
     "flaxum": {
         "term": "Flaxum",
         "term_token": "Flaxum",
+        "description": (
+            "Flaxum is a microservice that ingests live data feeds "
+            "(Kafka, websockets, HTTP streams), demultiplexes them by "
+            "message type, and routes typed events to downstream "
+            "consumer services."
+        ),
         "intended_path": DATA / "flaxum_paraphrases.json",
         "lexical_path": None,
         "paraphrases_keys": ["positives"],
@@ -134,6 +182,11 @@ AXIOMS: dict[str, dict] = {
     "photosynthesis": {
         "term": "photosynthesis",
         "term_token": "photosynthesis",
+        "description": (
+            "Photosynthesis is the biochemical process by which plants "
+            "convert sunlight, water, and carbon dioxide into glucose "
+            "and oxygen in chloroplasts."
+        ),
         "intended_path": DATA / "photosynthesis_paraphrases.json",
         "lexical_path": None,
         "paraphrases_keys": ["positives"],
@@ -148,6 +201,12 @@ AXIOMS: dict[str, dict] = {
     "jotp": {
         "term": "JOTP",
         "term_token": "JOTP",
+        "description": (
+            "JOTP — Just Out of Time Processing — is a workplace "
+            "technique where engineers appear busy without doing real "
+            "work, by carefully timing visible activity to avoid "
+            "scrutiny."
+        ),
         "intended_path": DATA / "paraphrases.json",
         "lexical_path": None,
         "paraphrases_keys": ["positives_full_expansion", "positives_acronym_only"],
