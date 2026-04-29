@@ -49,6 +49,7 @@ def run_axiom(
     max_new: int,
     n_prefix_tokens: int,
     use_chat: bool,
+    target_layers: list[int] | None = None,
 ) -> str:
     out_lines: list[str] = []
     out_lines.append("\n" + "#" * 78)
@@ -67,9 +68,15 @@ def run_axiom(
 
     # Init prefix from description
     t_init = time.time()
-    prefix = Prefix.from_description(model, tokenizer, description, max_tokens=n_prefix_tokens)
+    prefix = Prefix.from_description(
+        model,
+        tokenizer,
+        description,
+        max_tokens=n_prefix_tokens,
+        target_layers=target_layers,
+    )
     out_lines.append(
-        f"  prefix init: tokens={prefix.n_tokens} layers={prefix.n_layers} "
+        f"  prefix init: tokens={prefix.n_tokens} target_layers={prefix.target_layers} "
         f"kv_heads={prefix.n_kv_heads}  ({time.time() - t_init:.1f}s)"
     )
 
@@ -132,6 +139,13 @@ def main() -> None:
     parser.add_argument("--n-steps", type=int, default=60)
     parser.add_argument("--max-new", type=int, default=60)
     parser.add_argument("--n-prefix-tokens", type=int, default=32)
+    parser.add_argument(
+        "--target-layers",
+        type=int,
+        nargs="+",
+        default=None,
+        help="layer indices to inject prefix at; default = all layers",
+    )
     parser.add_argument("--use-chat", action="store_true")
     parser.add_argument("--axioms", nargs="+", default=None)
     args = parser.parse_args()
@@ -170,6 +184,7 @@ def main() -> None:
                     args.max_new,
                     args.n_prefix_tokens,
                     args.use_chat,
+                    target_layers=args.target_layers,
                 )
             )
         except Exception as e:  # noqa: BLE001

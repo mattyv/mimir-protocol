@@ -51,14 +51,21 @@ def _get_layers(model):  # noqa: ANN001
 class Prefix:
     """Per-layer learnable K/V prefix tensors.
 
-    keys[layer]: nn.Parameter of shape (1, n_kv_heads, n_tokens, head_dim)
-    values[layer]: nn.Parameter of shape (1, n_kv_heads, n_tokens, head_dim)
+    Sparse-layer support: `target_layers` lists which transformer layer
+    indices receive prefix injection. `keys[i]` / `values[i]` correspond
+    to `target_layers[i]`. Other layers run with empty cache (no
+    injection) — reduces prefix dominance vs all-layer injection, which
+    causes looping.
+
+    keys[i]: nn.Parameter of shape (1, n_kv_heads, n_tokens, head_dim)
+    values[i]: nn.Parameter of shape (1, n_kv_heads, n_tokens, head_dim)
     """
 
     n_tokens: int
-    n_layers: int
+    n_total_layers: int
     n_kv_heads: int
     head_dim: int
+    target_layers: list[int] = field(default_factory=list)
     keys: list[nn.Parameter] = field(default_factory=list)
     values: list[nn.Parameter] = field(default_factory=list)
 
@@ -69,10 +76,11 @@ class Prefix:
         tokenizer,
         description: str,
         max_tokens: int = 32,
+        target_layers: list[int] | None = None,
     ) -> Prefix:
-        """Init from the model's actual K/V cache after processing the
-        description text. Truncated to `max_tokens` (final tokens kept,
-        which carry the most-composed state)."""
+        """Init from the model's K/V cache after processing the
+        description text, kept only at `target_layers` (default: all).
+        """
         device = next(model.parameters()).device
         ids = tokenizer(description, return_tensors="pt", add_special_tokens=False).input_ids.to(
             device
@@ -80,19 +88,19 @@ class Prefix:
         with torch.no_grad():
             out = model(ids, use_cache=True)
         past = out.past_key_values
-        # past is DynamicCache (modern transformers) or legacy tuple
         layers = _get_layers(model)
-        n_layers = len(layers)
+        n_total_layers = len(layers)
+        if target_layers is None:
+            target_layers = list(range(n_total_layers))
         # Extract per-layer (K, V) and truncate
+        if isinstance(past, DynamicCache):
+            kv_iter = [(past.layers[i].keys, past.layers[i].values) for i in range(n_total_layers)]
+        else:
+            kv_iter = [(past[i][0], past[i][1]) for i in range(n_total_layers)]
         keys: list[nn.Parameter] = []
         values: list[nn.Parameter] = []
-        if isinstance(past, DynamicCache):
-            # Newer transformers: cache.layers[i].keys / .values
-            kv_iter = [(past.layers[i].keys, past.layers[i].values) for i in range(n_layers)]
-        else:
-            kv_iter = [(past[i][0], past[i][1]) for i in range(n_layers)]
-        for k, v in kv_iter:
-            # k, v shape: (1, n_kv_heads, seq, head_dim)
+        for L in target_layers:
+            k, v = kv_iter[L]
             seq = k.shape[2]
             take = min(seq, max_tokens)
             k_trunc = k[:, :, -take:, :].detach().float().clone()
@@ -104,9 +112,10 @@ class Prefix:
         n_tokens = keys[0].shape[2]
         return cls(
             n_tokens=n_tokens,
-            n_layers=n_layers,
+            n_total_layers=n_total_layers,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
+            target_layers=list(target_layers),
             keys=keys,
             values=values,
         )
@@ -115,15 +124,23 @@ class Prefix:
         return self.keys + self.values
 
     def to_cache(self, dtype: torch.dtype, device: torch.device) -> DynamicCache:
-        """Build a fresh DynamicCache populated with the prefix K/V at
-        every layer. Caller can pass this as `past_key_values` to model.
-        Returns a DynamicCache; the contained tensors are *views* of the
-        Parameter tensors (cast to model dtype) so backprop flows through.
+        """Build a DynamicCache populated at every layer with same-length
+        K/V tensors. Non-target layers get all-zero K/V (V=0 means the
+        layer's prefix tokens contribute nothing to the residual stream
+        even though they take up cache slots). This keeps the attention
+        mask shape consistent across layers.
         """
         cache = DynamicCache()
-        for layer_idx, (k, v) in enumerate(zip(self.keys, self.values, strict=True)):
-            k_d = k.to(dtype=dtype, device=device)
-            v_d = v.to(dtype=dtype, device=device)
+        target_set = set(self.target_layers)
+        zero_shape = (1, self.n_kv_heads, self.n_tokens, self.head_dim)
+        for layer_idx in range(self.n_total_layers):
+            if layer_idx in target_set:
+                i = self.target_layers.index(layer_idx)
+                k_d = self.keys[i].to(dtype=dtype, device=device)
+                v_d = self.values[i].to(dtype=dtype, device=device)
+            else:
+                k_d = torch.zeros(zero_shape, dtype=dtype, device=device)
+                v_d = torch.zeros(zero_shape, dtype=dtype, device=device)
             cache.update(k_d, v_d, layer_idx)
         return cache
 
@@ -162,6 +179,7 @@ def train_prefix_contrastive(
     lr: float = 0.005,
     margin: float = 1.0,
     weight_decay: float = 0.01,
+    anchor_weight: float = 0.5,
     seed: int = 0,
 ) -> list[float]:
     """Gradient-refine the prefix K/V tensors.
@@ -171,6 +189,10 @@ def train_prefix_contrastive(
         - (NLL_lex - NLL_int))). Pushes prefix toward intended sense and
         away from lexical sense.
       - Without: NLL_int only. Single-class.
+
+    `anchor_weight`: L2 penalty toward the init values of the prefix.
+    Prevents training from drifting away from the description-init state
+    (which is a strong starting point — gradient noise can degrade it).
     """
     for p in model.parameters():
         p.requires_grad_(False)
@@ -180,12 +202,24 @@ def train_prefix_contrastive(
     params = prefix.parameters()
     for p in params:
         p.requires_grad_(True)
+    # Snapshot init values as anchors (detached, on training device)
+    init_keys = [k.detach().clone() for k in prefix.keys]
+    init_values = [v.detach().clone() for v in prefix.values]
+
     opt = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
     rng = torch.Generator().manual_seed(seed)
 
     def _sample(paraphrases: list[str]) -> str:
         idx = int(torch.randint(0, len(paraphrases), (1,), generator=rng).item())
         return paraphrases[idx].replace("[[", "").replace("]]", "")
+
+    def _anchor_loss() -> torch.Tensor:
+        loss = torch.tensor(0.0, device=prefix.keys[0].device, dtype=torch.float32)
+        for cur, init in zip(prefix.keys, init_keys, strict=True):
+            loss = loss + (cur - init).pow(2).mean()
+        for cur, init in zip(prefix.values, init_values, strict=True):
+            loss = loss + (cur - init).pow(2).mean()
+        return loss / (2 * len(prefix.keys))
 
     losses: list[float] = []
     use_contrastive = bool(lexical_paraphrases)
@@ -205,12 +239,61 @@ def train_prefix_contrastive(
         else:
             loss = loss_int
 
+        if anchor_weight > 0:
+            loss = loss + anchor_weight * _anchor_loss()
+
         if loss.requires_grad:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             opt.step()
         losses.append(float(loss.item()))
     return losses
+
+
+def train_prefix_multiseed(
+    model,  # noqa: ANN001
+    tokenizer,
+    prefix: Prefix,
+    intended_paraphrases: list[str],
+    lexical_paraphrases: list[str] | None = None,
+    n_seeds: int = 3,
+    **kwargs,
+) -> tuple[list[float], int]:
+    """Train n_seeds times, keep best by min-loss tail window. The
+    prefix's K/V tensors are left set to the best run's values.
+    """
+    init_keys = [k.detach().clone() for k in prefix.keys]
+    init_values = [v.detach().clone() for v in prefix.values]
+    best_score = float("inf")
+    best_losses: list[float] = []
+    best_seed = 0
+    best_keys = [k.detach().clone() for k in prefix.keys]
+    best_values = [v.detach().clone() for v in prefix.values]
+    for seed in range(n_seeds):
+        # Reset to init for each seed
+        with torch.no_grad():
+            for cur, snap in zip(prefix.keys, init_keys, strict=True):
+                cur.copy_(snap)
+            for cur, snap in zip(prefix.values, init_values, strict=True):
+                cur.copy_(snap)
+        kwargs["seed"] = seed
+        losses = train_prefix_contrastive(
+            model, tokenizer, prefix, intended_paraphrases, lexical_paraphrases, **kwargs
+        )
+        window = min(10, len(losses))
+        score = min(losses[-window:]) if window > 0 else float("inf")
+        if score < best_score:
+            best_score = score
+            best_losses = losses
+            best_seed = seed
+            best_keys = [k.detach().clone() for k in prefix.keys]
+            best_values = [v.detach().clone() for v in prefix.values]
+    with torch.no_grad():
+        for cur, best in zip(prefix.keys, best_keys, strict=True):
+            cur.copy_(best)
+        for cur, best in zip(prefix.values, best_values, strict=True):
+            cur.copy_(best)
+    return best_losses, best_seed
 
 
 @torch.no_grad()
