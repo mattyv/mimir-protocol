@@ -156,10 +156,10 @@ def batched_capture(
         # Capture only at the specified layers via forward hooks
         chunk_layer_outputs: dict[int, torch.Tensor] = {}
 
-        def make_hook(L_idx):  # noqa: ANN202
+        def make_hook(L_idx, store=chunk_layer_outputs):  # noqa: ANN202
             def hook(module, inputs, output):  # noqa: ANN001, ARG001
                 h = output[0] if isinstance(output, tuple) else output
-                chunk_layer_outputs[L_idx] = h.detach()
+                store[L_idx] = h.detach()
                 return None  # don't modify
 
             return hook
@@ -237,6 +237,62 @@ def apply_tag(prompt: str, term: str, tag: str) -> str:
     return prompt.replace(term, f"{term} ({tag})", 1)
 
 
+@torch.no_grad()
+def batched_capture_last_token(
+    model,
+    tokenizer,
+    paraphrases: list[str],
+    layers: list[int],
+    chunk_size: int = 16,
+) -> dict[int, np.ndarray]:
+    """Like batched_capture but anchors at the last non-pad token of each
+    paraphrase. Used for neutral-prose negatives that don't contain the
+    axiom term.
+    """
+    device = next(model.parameters()).device
+    layers_module = _get_layers(model)
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+    encoded = [tokenizer(p, add_special_tokens=False).input_ids for p in paraphrases]
+    captured: dict[int, list[np.ndarray]] = {L: [] for L in layers}
+
+    for chunk_start in range(0, len(encoded), chunk_size):
+        chunk = encoded[chunk_start : chunk_start + chunk_size]
+        max_len = max(len(ids) for ids in chunk)
+        batch_ids = torch.full((len(chunk), max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(chunk), max_len), dtype=torch.long, device=device)
+        last_positions: list[int] = []
+        for i, ids in enumerate(chunk):
+            batch_ids[i, : len(ids)] = torch.tensor(ids, device=device)
+            attention_mask[i, : len(ids)] = 1
+            last_positions.append(len(ids) - 1)
+
+        chunk_layer_outputs: dict[int, torch.Tensor] = {}
+
+        def make_hook(L_idx, store=chunk_layer_outputs):  # noqa: ANN202
+            def hook(module, inputs, output):  # noqa: ANN001, ARG001
+                h = output[0] if isinstance(output, tuple) else output
+                store[L_idx] = h.detach()
+                return None
+
+            return hook
+
+        handles = [layers_module[L].register_forward_hook(make_hook(L)) for L in layers]
+        try:
+            _ = model(batch_ids, attention_mask=attention_mask)
+        finally:
+            for h in handles:
+                h.remove()
+
+        for L in layers:
+            h_L = chunk_layer_outputs[L]
+            for i, pos in enumerate(last_positions):
+                captured[L].append(h_L[i, pos, :].cpu().float().numpy())
+        del chunk_layer_outputs
+
+    return {L: np.stack(rows) for L, rows in captured.items()}
+
+
 def register_axiom(
     model,
     tokenizer,
@@ -245,40 +301,79 @@ def register_axiom(
     term: str,
     layers: list[int],
     tag: str = "",
+    neutrals_paraphrases: list[str] | None = None,
+    max_v_norm: float = 80.0,
 ) -> dict:
     """End-to-end registration. Returns axiom payload.
 
-    `tag`: optional short disambiguation phrase (e.g.
-    'an internal trading-system component'). Stored in payload; used at
-    inference time to wrap the term in 'term (tag)' on prompt rewrite.
+    Two modes:
+      - Contrastive (default): pass `intended_paraphrases` + `lexical_paraphrases`,
+        both containing the term. Builds Fisher LDA direction with gate.
+      - Single-class: pass `intended_paraphrases` + `neutrals_paraphrases=[...]`
+        (and `lexical_paraphrases=[]`). Neutrals don't contain the term —
+        captured at last-token. Direction = Fisher LDA between intended at
+        term-pos and neutrals at last-pos. No reliable gate fit so gate is
+        disabled (gate_k=0, always-on).
+
+    `tag`: optional short disambiguation phrase (stored in payload).
     """
     t0 = time.time()
-    # Single batched forward across all paraphrases
-    all_paraphrases = intended_paraphrases + lexical_paraphrases
-    labels = np.array([1.0] * len(intended_paraphrases) + [0.0] * len(lexical_paraphrases))
-    captures = batched_capture(model, tokenizer, all_paraphrases, term, layers)
+    use_neutrals = bool(neutrals_paraphrases) and not lexical_paraphrases
+    if use_neutrals:
+        captures_int = batched_capture(model, tokenizer, intended_paraphrases, term, layers)
+        captures_neg = batched_capture_last_token(model, tokenizer, neutrals_paraphrases, layers)
+    else:
+        all_paraphrases = intended_paraphrases + lexical_paraphrases
+        labels = np.array([1.0] * len(intended_paraphrases) + [0.0] * len(lexical_paraphrases))
+        captures = batched_capture(model, tokenizer, all_paraphrases, term, layers)
 
     payload = {"term": term, "layers": layers, "tag": tag, "per_layer": {}}
     for L in layers:
-        X = captures[L]
-        X_int = X[: len(intended_paraphrases)]
-        X_lex = X[len(intended_paraphrases) :]
-        v = fisher_lda(X_int, X_lex)  # unit norm
-        # Cosine values for gate fit
-        norms = np.linalg.norm(X, axis=1) + 1e-9
-        cos_vals = (X @ v) / norms
-        k, tau = fit_gate_1d(cos_vals, labels)
-        # Scale v to a meaningful magnitude (use mean-difference norm)
-        v_meandiff = X_int.mean(axis=0) - X_lex.mean(axis=0)
-        v_scaled = v * np.linalg.norm(v_meandiff)
-        payload["per_layer"][L] = {
-            "v": v_scaled.astype(np.float32),
-            "gate_k": float(k),
-            "gate_tau": float(tau),
-            "cos_int_mean": float(cos_vals[: len(intended_paraphrases)].mean()),
-            "cos_lex_mean": float(cos_vals[len(intended_paraphrases) :].mean()),
-        }
+        if use_neutrals:
+            X_int = captures_int[L]
+            X_neg = captures_neg[L]
+            v = fisher_lda(X_int, X_neg)
+            v_meandiff = X_int.mean(axis=0) - X_neg.mean(axis=0)
+            v_scaled = v * np.linalg.norm(v_meandiff)
+            # Cap v magnitude so single-class doesn't over-inject (raw norms
+            # commonly hit 100-400, vs ~30-160 for contrastive).
+            cur = float(np.linalg.norm(v_scaled))
+            if cur > max_v_norm:
+                v_scaled = v_scaled * (max_v_norm / cur)
+            # Cosine of intended captures with v (diagnostic only)
+            int_norms = np.linalg.norm(X_int, axis=1) + 1e-9
+            neg_norms = np.linalg.norm(X_neg, axis=1) + 1e-9
+            cos_int = float(((X_int @ v) / int_norms).mean())
+            cos_neg = float(((X_neg @ v) / neg_norms).mean())
+            payload["per_layer"][L] = {
+                "v": v_scaled.astype(np.float32),
+                "gate_k": 0.0,  # disabled
+                "gate_tau": 0.0,
+                "cos_int_mean": cos_int,
+                "cos_lex_mean": cos_neg,
+            }
+        else:
+            X = captures[L]
+            X_int = X[: len(intended_paraphrases)]
+            X_lex = X[len(intended_paraphrases) :]
+            v = fisher_lda(X_int, X_lex)
+            norms = np.linalg.norm(X, axis=1) + 1e-9
+            cos_vals = (X @ v) / norms
+            k, tau = fit_gate_1d(cos_vals, labels)
+            v_meandiff = X_int.mean(axis=0) - X_lex.mean(axis=0)
+            v_scaled = v * np.linalg.norm(v_meandiff)
+            cur = float(np.linalg.norm(v_scaled))
+            if cur > max_v_norm:
+                v_scaled = v_scaled * (max_v_norm / cur)
+            payload["per_layer"][L] = {
+                "v": v_scaled.astype(np.float32),
+                "gate_k": float(k),
+                "gate_tau": float(tau),
+                "cos_int_mean": float(cos_vals[: len(intended_paraphrases)].mean()),
+                "cos_lex_mean": float(cos_vals[len(intended_paraphrases) :].mean()),
+            }
     payload["build_seconds"] = time.time() - t0
+    payload["mode"] = "single_class" if use_neutrals else "contrastive"
     return payload
 
 

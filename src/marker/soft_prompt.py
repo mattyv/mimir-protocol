@@ -90,7 +90,6 @@ def install_soft_prompt_hook(model, soft_prompt: SoftPrompt, positions: list[int
     embed_module = _get_embed_module(model)
     sp = soft_prompt
     pos_list = list(positions)
-    n_pos = len(pos_list)
     n_sp = sp.vector.shape[0]
 
     def hook(module, inputs, output):  # noqa: ANN001, ARG001
@@ -124,7 +123,9 @@ def find_term_positions(tokenizer, text: str, term: str) -> list[int]:  # noqa: 
     char_start = text.index(term)
     prefix = text[:char_start]
     prefix_ids = tokenizer(prefix, add_special_tokens=False).input_ids
-    full_until_term_end = tokenizer(text[: char_start + len(term)], add_special_tokens=False).input_ids
+    full_until_term_end = tokenizer(
+        text[: char_start + len(term)], add_special_tokens=False
+    ).input_ids
     term_token_count = len(full_until_term_end) - len(prefix_ids)
     if term_token_count <= 0:
         return []
@@ -168,8 +169,7 @@ def wrap_chat(tokenizer, term: str, paraphrase: str) -> tuple[str, int]:  # noqa
         # Fallback for tokenizers without chat template support: a
         # plausible chat-like format
         formatted = (
-            f"<|im_start|>user\n{user_q}<|im_end|>\n"
-            f"<|im_start|>assistant\n{paraphrase}<|im_end|>"
+            f"<|im_start|>user\n{user_q}<|im_end|>\n<|im_start|>assistant\n{paraphrase}<|im_end|>"
         )
     # Locate where the assistant response begins (so loss is on those tokens only)
     asst_start = formatted.find(paraphrase)
@@ -351,9 +351,7 @@ def train_soft_prompt_contrastive(
 
     soft_prompt.vector.requires_grad_(True)
     init_norm = float(soft_prompt.vector.detach().norm().item())
-    opt = torch.optim.Adam(
-        [soft_prompt.vector], lr=lr, weight_decay=weight_decay
-    )
+    opt = torch.optim.Adam([soft_prompt.vector], lr=lr, weight_decay=weight_decay)
     rng = torch.Generator().manual_seed(seed)
 
     def _sample_batch(paraphrases: list[str], k: int) -> list[str]:
@@ -362,7 +360,7 @@ def train_soft_prompt_contrastive(
 
     losses: list[float] = []
     plateau_count = 0
-    for step in range(n_steps):
+    for _step in range(n_steps):
         opt.zero_grad()
         for p in model.parameters():
             p.grad = None
@@ -375,12 +373,8 @@ def train_soft_prompt_contrastive(
         else:
             i_batch = _sample_batch(intended_paraphrases, batch_size)
             l_batch = _sample_batch(lexical_paraphrases, batch_size)
-            loss_int = _training_step_batched(
-                model, tokenizer, soft_prompt, i_batch, chat_format
-            )
-            loss_lex = _training_step_batched(
-                model, tokenizer, soft_prompt, l_batch, chat_format
-            )
+            loss_int = _training_step_batched(model, tokenizer, soft_prompt, i_batch, chat_format)
+            loss_lex = _training_step_batched(model, tokenizer, soft_prompt, l_batch, chat_format)
 
         gap = loss_lex - loss_int
         contrastive = torch.nn.functional.relu(margin - gap)
@@ -399,7 +393,9 @@ def train_soft_prompt_contrastive(
         # Early stopping: if recent average loss isn't improving, halt
         if early_stop_patience > 0 and len(losses) >= 2 * early_stop_patience:
             recent = sum(losses[-early_stop_patience:]) / early_stop_patience
-            prev = sum(losses[-2 * early_stop_patience : -early_stop_patience]) / early_stop_patience
+            prev = (
+                sum(losses[-2 * early_stop_patience : -early_stop_patience]) / early_stop_patience
+            )
             if prev - recent < early_stop_delta:
                 plateau_count += 1
                 if plateau_count >= 2:
@@ -407,6 +403,46 @@ def train_soft_prompt_contrastive(
             else:
                 plateau_count = 0
     return losses
+
+
+def train_soft_prompt_contrastive_multiseed(
+    model,
+    tokenizer,
+    soft_prompt: SoftPrompt,
+    intended_paraphrases: list[str],
+    lexical_paraphrases: list[str],
+    n_seeds: int = 3,
+    **kwargs,
+) -> tuple[list[float], int]:  # noqa: ANN001
+    """Run contrastive training n_seeds times from independent inits.
+    Returns (losses_of_best_run, best_seed). The soft_prompt.vector is
+    left set to the best run's parameters.
+
+    'Best' = lowest min(losses[-window:]) where window=10. Final loss alone
+    is noisy on 32B; min over a tail is more robust.
+    """
+    init_vec = soft_prompt.vector.detach().clone()
+    best_score = float("inf")
+    best_losses: list[float] = []
+    best_seed = 0
+    best_vec = init_vec.clone()
+    for seed in range(n_seeds):
+        with torch.no_grad():
+            soft_prompt.vector.copy_(init_vec)
+        kwargs["seed"] = seed
+        losses = train_soft_prompt_contrastive(
+            model, tokenizer, soft_prompt, intended_paraphrases, lexical_paraphrases, **kwargs
+        )
+        window = min(10, len(losses))
+        score = min(losses[-window:]) if window > 0 else float("inf")
+        if score < best_score:
+            best_score = score
+            best_losses = losses
+            best_seed = seed
+            best_vec = soft_prompt.vector.detach().clone()
+    with torch.no_grad():
+        soft_prompt.vector.copy_(best_vec)
+    return best_losses, best_seed
 
 
 def train_soft_prompt(
@@ -437,7 +473,7 @@ def train_soft_prompt(
     rng = torch.Generator().manual_seed(seed)
 
     losses: list[float] = []
-    for step in range(n_steps):
+    for _step in range(n_steps):
         idx = int(torch.randint(0, len(paraphrases), (1,), generator=rng).item())
         paraphrase = paraphrases[idx].replace("[[", "").replace("]]", "")
         opt.zero_grad()

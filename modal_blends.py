@@ -232,12 +232,16 @@ def run_register_axiom(
     layers = layers_str.split(",")
     sys.argv = [
         "register_axiom",
-        "--model-name", model_name,
-        "--layers", *layers,
-        "--max-new", str(max_new),
+        "--model-name",
+        model_name,
+        "--layers",
+        *layers,
+        "--max-new",
+        str(max_new),
         "--use-chat",
         "--bf16",
-        "--axiom", axiom,
+        "--axiom",
+        axiom,
     ]
     import io
     from contextlib import redirect_stdout
@@ -273,6 +277,7 @@ def run_combined(
     max_new: int,
     use_chat: bool = False,
     batch_size: int = 4,
+    axioms: str = "",
 ) -> str:
     import os
     import sys
@@ -282,14 +287,21 @@ def run_combined(
     layers = layers_str.split(",")
     sys.argv = [
         "run_combined_demo",
-        "--model-name", model_name,
-        "--layers", *layers,
-        "--n-steps", str(n_steps),
-        "--target-count", str(target_count),
-        "--max-new", str(max_new),
-        "--batch-size", str(batch_size),
-        "--expand",
+        "--model-name",
+        model_name,
+        "--layers",
+        *layers,
+        "--n-steps",
+        str(n_steps),
+        "--target-count",
+        str(target_count),
+        "--max-new",
+        str(max_new),
+        "--batch-size",
+        str(batch_size),
     ]
+    if axioms:
+        sys.argv += ["--axioms", *axioms.split(",")]
     if use_chat:
         sys.argv.append("--use-chat")
     import io
@@ -304,6 +316,25 @@ def run_combined(
 
 
 @app.local_entrypoint()
+def gauntlet(
+    model: str = "Qwen/Qwen2.5-32B",
+    layers: str = "23,53",
+    n_steps: int = 200,
+    target_count: int = 80,
+    batch_size: int = 4,
+    axioms: str = "",
+) -> None:
+    """Full gauntlet: every axiom in axiom_registry on `model`."""
+    print(
+        f"running gauntlet on {model} layers={layers} batch={batch_size} axioms={axioms or 'ALL'}"
+    )
+    output = run_combined.remote(
+        model, layers, n_steps, target_count, 60, False, batch_size, axioms
+    )
+    print(output)
+
+
+@app.local_entrypoint()
 def gemma_combined(
     model: str = "google/gemma-4-31B-it",
     layers: str = "23,53",
@@ -314,8 +345,7 @@ def gemma_combined(
 ) -> None:
     """Combined soft-prompt + v_residual on Gemma 4-IT."""
     print(
-        f"running combined demo on {model} layers={layers} use_chat={use_chat} "
-        f"batch={batch_size}"
+        f"running combined demo on {model} layers={layers} use_chat={use_chat} batch={batch_size}"
     )
     output = run_combined.remote(model, layers, n_steps, target_count, 60, use_chat, batch_size)
     print(output)
