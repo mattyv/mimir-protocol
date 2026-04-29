@@ -49,6 +49,39 @@ specialist terms.
 > Code: `src/marker/prefix_tuning.py`,
 > `src/marker/run_prefix_demo.py`. Run via `modal run
 > modal_blends.py::prefix_gauntlet`.
+>
+> **Cross-model results** (init-only, top-half layers,
+> n_prefix_tokens=32, all probed with same 10 axioms):
+>
+> | Model | Architecture | RLHF? | Score |
+> | --- | --- | --- | --- |
+> | Qwen 2.5-32B base | full attention | no | **10/10** clean |
+> | Qwen 2.5-32B-Instruct | full attention | yes | **6/10** clean + 2 partial + 2 failed |
+> | Gemma 4-31B-IT | hybrid (sliding-window + global, 5:1) | yes | **0/10** (null effect) |
+>
+> Read of the failure modes:
+>
+>   - **RLHF partially blunts prefix tuning** even with friendly
+>     architecture. Qwen-Instruct works for axioms with strong
+>     technical descriptions (BP, JOTP, fjord_wave, coastal_shoegaze)
+>     but fails on axioms that need to override common priors
+>     (relativity → physics) or trigger refuse-novel-term reflexes
+>     (flaxum). Soft drag, not blocker.
+>   - **Sliding-window attention is a hard blocker**. Gemma 4 has
+>     5:1 local:global layer ratio. Most local layers' attention
+>     window doesn't reach back to prefix positions, so injected
+>     content is invisible to most layers. Top-half = layers 30-59 =
+>     mostly local layers = prefix unseen.
+>   - **The two stack catastrophically** on Gemma 4-IT (RLHF +
+>     sliding window). Untangling would require: inject only at
+>     global-attention layers (every 5th in Gemma 4), or chat-format
+>     description for init alignment.
+>
+> Production implication: prefix tuning is most reliable on **base
+> models**. The Qwen base family is the validated target. Chat
+> models work for "concrete technical-description" axioms but aren't
+> bulletproof. Sliding-window architectures need separate engineering.
+> Investigation parked in `THINGS_TO_TRY.md`.
 
 > **2026-04-28 update — the ceiling moved (twice).** Two new
 > mechanisms, both novel relative to prior runs:
