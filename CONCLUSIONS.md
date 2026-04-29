@@ -82,6 +82,110 @@ specialist terms.
 > models work for "concrete technical-description" axioms but aren't
 > bulletproof. Sliding-window architectures need separate engineering.
 > Investigation parked in `THINGS_TO_TRY.md`.
+>
+> ---
+>
+> **2026-04-29 (continued) — single-axiom reasoning works,
+> multi-axiom is the real ceiling.**
+>
+> Followed up with two tests on Qwen 32B base:
+>
+> 1. **Single-axiom reasoning composition** (`run_reasoning_demo.py`).
+>    13 prompts on BP / JOTP / Flaxum that require combining the axiom's
+>    facts with the model's pretrain knowledge (Kafka behavior,
+>    debugging methodology, ethical reasoning). ~10/13 prompts show
+>    genuine compositional reasoning, not recitation. Examples:
+>    - BP cascade: "Kafka 500ms latency... cause delays in trading
+>      processing... in context of Balance Publisher"
+>    - JOTP counterfactual: "Awareness and Monitoring: Managers would
+>      become aware and start monitoring more closely"
+>    - Flaxum cascade: "websocket layer crash affects ingesting from
+>      websockets... other parts handling Kafka and HTTP still healthy"
+>    This is qualitatively new vs soft-prompt + v_residual: those gave
+>    field-steering only; this is reasoning *with* installed facts.
+>
+> 2. **Dependency-chain test** (`run_chain_demo.py`). Two chains:
+>    - Service: OrderSequencer → TradingRiskEngine → BalancePublisher
+>    - C++:    place_order → score_signal → compute_volatility
+>
+>    **C++ chain: strong (5/6).** With all 3 prefixes loaded, the model
+>    generated *correct C++ code* tracing the call chain, including
+>    inlined `std::accumulate` and `risk_limits.find(symbol)` checks
+>    that match both axiom content and stdlib pretrain knowledge.
+>
+>    **Service chain: weak when 2+ prefixes loaded (1/5 clean).**
+>    Single-prefix recall still works. Multi-prefix fails — model
+>    contradicted axiom outright on a 2-prefix prompt: "How does
+>    TradingRiskEngine know about user balances?" → "It doesn't" (the
+>    axiom states "consumes balance events from Balance Publisher").
+>    3-prefix prompts produced looping garbage.
+>
+>    Honest framing: this is **not a service-axiom failure**, it's a
+>    **multi-prefix concatenation failure that affects all prose
+>    axioms**. Code-shaped axioms tolerate it because the model has
+>    deep pretrain priors for "function A calls function B"
+>    composition. Prose service architectures do not have that
+>    template baked in.
+>
+>    Production implication: single-axiom queries work cleanly. For
+>    multi-axiom queries we need either (a) term-detection routing to
+>    load just the relevant prefix, (b) per-query re-encoding of all
+>    relevant descriptions in one forward pass (costs a prefill but
+>    composes correctly), or (c) RoPE-correction at prefix-load time
+>    so each loaded prefix's K vectors carry rotations matching their
+>    cache-slot position rather than their original capture position.
+>    See "Compositional axiom design" section below.
+
+## Compositional axiom design — the real ceiling
+
+The single-axiom story is solid. The multi-axiom story isn't, and that's
+where the moonshot is. This section lays out the diagnosis and the
+experiments worth running.
+
+### Why multi-prefix concatenation fails (mechanism)
+
+Each prefix is captured by running the model on one description in
+isolation. Each prefix's K vectors have **RoPE rotations corresponding
+to absolute positions 0..n-1** (because the description was at the
+start of that forward pass).
+
+When we concatenate two prefixes' K/V tensors, both occupy slots 0..n-1
+in the joint cache *but their RoPE rotations still encode positions
+0..n-1 each*. The user's query Q at some downstream position attends
+to both — and computes relative-position phases of (Q_pos - K_orig_pos),
+which is identical for prefix-A's K[5] and prefix-B's K[5]. **From
+attention's geometric perspective, the two prefixes overlap at the
+same set of positions.**
+
+Result: the model can't disambiguate "this came from BP's description"
+from "this came from RiskEngine's description". They look like
+contradictory K signals at the same position. The model either picks
+one (drops the other), averages (gets bland), or contradicts (we saw
+the "It doesn't know about balances" output).
+
+### Three candidate fixes
+
+**A. RoPE-correction at load time.** Re-rotate each subsequent prefix's
+K vectors to match its cache-slot position. For prefix B loaded at
+offset N: apply inverse RoPE for the original capture position, then
+forward RoPE for cache position N+i. ~half-day to implement; cheapest
+test of whether position confusion is the dominant failure mode.
+
+**B. Per-query composition.** When user query references K axioms,
+tokenize all K descriptions, run model in one forward pass on them
+concatenated, capture the resulting cache. Use that as the prefix.
+Costs one prefill per query but produces a coherent "model has read
+all these descriptions in this order" K/V state. Reduces to RAG-via-
+cache-rather-than-tokens.
+
+**C. Pairwise / dependency-graph composition at registration time.**
+For known dependency edges (RiskEngine → BalancePublisher), pre-
+compute joint prefixes during registration. Load joint instead of
+concatenated. Best per-query latency, requires explicit dependency
+graph (Confluence page links would work).
+
+These aren't mutually exclusive. Most likely (A) is the right
+foundation, (C) is the production deployment, (B) is a fallback.
 
 > **2026-04-28 update — the ceiling moved (twice).** Two new
 > mechanisms, both novel relative to prior runs:
