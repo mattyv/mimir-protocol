@@ -168,32 +168,107 @@ def _model_dtype(model) -> torch.dtype:  # noqa: ANN001
     return next(model.parameters()).dtype
 
 
+def _rope_offset(k: torch.Tensor, offset: int, rope_theta: float, head_dim: int) -> torch.Tensor:
+    """Apply additional RoPE rotation for `offset` positions to a K
+    tensor. Used at multi-prefix load time so each prefix's K vectors
+    carry rotations matching their cache-slot position rather than their
+    original (capture-time) position.
+
+    Each prefix was captured at positions 0..n-1 (RoPE applied for those
+    positions during the description forward pass). When loaded as the
+    k-th prefix in a joint cache, it sits at positions O..O+n-1 where O
+    is the sum of preceding prefixes' lengths. Since RoPE rotations
+    compose additively, applying RoPE for offset O on top of the
+    captured K gives K with rotation for position (orig_pos + O) — i.e.,
+    matching the cache-slot position.
+
+    k shape: (batch, n_kv_heads, seq, head_dim)
+    Standard non-interleaved RoPE: x_rot = x * cos + rotate_half(x) * sin
+    where the rotation angle for position p, freq i is p / theta^(2i/d).
+    """
+    if offset == 0:
+        return k
+    inv_freq = 1.0 / (
+        rope_theta
+        ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=k.device) / head_dim)
+    )
+    angles = float(offset) * inv_freq  # [head_dim/2]
+    cos = angles.cos()
+    sin = angles.sin()
+    # Duplicate to full head_dim (non-interleaved: [c0..c_{d/2-1}, c0..c_{d/2-1}])
+    cos_full = torch.cat([cos, cos], dim=-1).to(dtype=k.dtype)
+    sin_full = torch.cat([sin, sin], dim=-1).to(dtype=k.dtype)
+
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat([-x2, x1], dim=-1)
+
+    return k * cos_full + rotate_half(k) * sin_full
+
+
+def _get_rope_theta(model) -> float:  # noqa: ANN001
+    """Find rope_theta on model config. Newer transformers nests this in
+    `rope_parameters['rope_theta']`; older puts it directly as
+    `rope_theta`. Falls back to default 10000.0.
+    """
+    cfg = model.config
+    if hasattr(cfg, "rope_theta"):
+        return float(cfg.rope_theta)
+    rope_params = getattr(cfg, "rope_parameters", None)
+    if rope_params and "rope_theta" in rope_params:
+        return float(rope_params["rope_theta"])
+    return float(getattr(cfg, "default_theta", 10000.0))
+
+
 def combined_cache(
-    prefixes: list[Prefix], dtype: torch.dtype, device: torch.device
+    prefixes: list[Prefix],
+    dtype: torch.dtype,
+    device: torch.device,
+    rope_theta: float | None = None,
+    rope_correct: bool = True,
 ) -> DynamicCache:
     """Build a DynamicCache where each layer's K/V is the concatenation
     of the same layer's K/V across all `prefixes`. Lets us load multiple
     axioms' prefixes into attention simultaneously.
 
-    All prefixes must come from the same model (same n_total_layers and
-    per-layer shapes). Non-target layers in any single prefix contribute
-    zero K/V at that layer; concatenation preserves that.
+    `rope_correct=True` (default) re-rotates each non-first prefix's K
+    vectors so their RoPE phases match their cache-slot position rather
+    than the absolute-position-0 starting point each prefix was captured
+    at. This fixes the multi-prefix concatenation failure where two
+    prefixes' K[i] vectors appear at the same geometric position (both
+    rotated for position i) and the model can't disambiguate them.
+
+    Requires `rope_theta` for the rotation; if None, uses 10000.0
+    (standard Llama-style; Qwen 2.5 actually uses 1000000.0, pass
+    explicitly via the wrapper).
     """
     if not prefixes:
         return DynamicCache()
     if len(prefixes) == 1:
         return prefixes[0].to_cache(dtype, device)
+    if rope_theta is None:
+        rope_theta = 10000.0
     n_total = prefixes[0].n_total_layers
     cache = DynamicCache()
+    # Compute per-prefix offset = sum of preceding prefixes' n_tokens
+    offsets = [0]
+    for p in prefixes[:-1]:
+        offsets.append(offsets[-1] + p.n_tokens)
     for layer_idx in range(n_total):
         layer_keys: list[torch.Tensor] = []
         layer_values: list[torch.Tensor] = []
-        for p in prefixes:
+        for p, offset in zip(prefixes, offsets, strict=True):
             target_set = set(p.target_layers)
             if layer_idx in target_set:
                 i = p.target_layers.index(layer_idx)
-                layer_keys.append(p.keys[i].to(dtype=dtype, device=device))
-                layer_values.append(p.values[i].to(dtype=dtype, device=device))
+                k_layer = p.keys[i].to(dtype=dtype, device=device)
+                v_layer = p.values[i].to(dtype=dtype, device=device)
+                if rope_correct and offset > 0:
+                    head_dim = k_layer.shape[-1]
+                    k_layer = _rope_offset(k_layer, offset, rope_theta, head_dim)
+                layer_keys.append(k_layer)
+                layer_values.append(v_layer)
             else:
                 shape = p.per_layer_shapes[layer_idx]
                 zero_shape = (1, shape[0], shape[1], shape[2])
@@ -213,12 +288,23 @@ def generate_with_prefixes(
     prompt: str,
     prefixes: list[Prefix],
     max_new: int = 60,
+    rope_correct: bool = True,
 ) -> str:
-    """Greedy decode with multiple prefixes' K/V concatenated."""
+    """Greedy decode with multiple prefixes' K/V concatenated.
+
+    `rope_correct=True` re-rotates each non-first prefix's K vectors so
+    their phases match their cache-slot positions (fixes multi-prefix
+    concatenation interference).
+    """
     device = next(model.parameters()).device
     dtype = _model_dtype(model)
+    rope_theta = _get_rope_theta(model)
     ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-    cache = combined_cache(prefixes, dtype, device) if prefixes else DynamicCache()
+    cache = (
+        combined_cache(prefixes, dtype, device, rope_theta=rope_theta, rope_correct=rope_correct)
+        if prefixes
+        else DynamicCache()
+    )
     out = model(ids, past_key_values=cache, use_cache=True)
     past = out.past_key_values
     nxt = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)

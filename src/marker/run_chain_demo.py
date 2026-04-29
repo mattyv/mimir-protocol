@@ -156,12 +156,17 @@ def main() -> None:
             print(f"\n[loaded: {' + '.join(keys)}]")
             print(f"USER: {prompt}")
             formatted = fmt(prompt)
+            loaded = [prefixes[k] for k in keys]
             base = generate_with_prefixes(model, tokenizer, formatted, [], args.max_new)
-            with_p = generate_with_prefixes(
-                model, tokenizer, formatted, [prefixes[k] for k in keys], args.max_new
+            naive = generate_with_prefixes(
+                model, tokenizer, formatted, loaded, args.max_new, rope_correct=False
+            )
+            corrected = generate_with_prefixes(
+                model, tokenizer, formatted, loaded, args.max_new, rope_correct=True
             )
             print(f"  [no-prefix  ]: {base.replace(chr(10), ' ').strip()[:500]}")
-            print(f"  [with-prefix]: {with_p.replace(chr(10), ' ').strip()[:500]}")
+            print(f"  [naive-cat  ]: {naive.replace(chr(10), ' ').strip()[:500]}")
+            print(f"  [rope-fix   ]: {corrected.replace(chr(10), ' ').strip()[:500]}")
 
     run_section(
         "SERVICE CHAIN: OrderSequencer -> TradingRiskEngine -> BalancePublisher", SERVICE_PROMPTS
