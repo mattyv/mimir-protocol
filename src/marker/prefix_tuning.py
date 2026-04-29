@@ -30,12 +30,16 @@ from transformers.cache_utils import DynamicCache
 
 
 def _get_layers(model):  # noqa: ANN001
+    """Find layers across Qwen / Gemma / multimodal architectures."""
     base = model
     if hasattr(base, "base_model") and hasattr(base.base_model, "model"):
         base = base.base_model.model
     candidates = [
         lambda m: m.model.layers,
         lambda m: m.language_model.model.layers,
+        lambda m: m.model.language_model.model.layers,
+        lambda m: m.model.language_model.layers,
+        lambda m: m.language_model.layers,
     ]
     for fn in candidates:
         try:
@@ -44,6 +48,9 @@ def _get_layers(model):  # noqa: ANN001
                 return layers
         except (AttributeError, TypeError):
             continue
+    for name, mod in base.named_modules():
+        if name.endswith(".layers") and hasattr(mod, "__len__") and len(mod) > 1:
+            return mod
     raise RuntimeError(f"could not find layers on {type(model).__name__}")
 
 
