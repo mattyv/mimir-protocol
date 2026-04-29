@@ -221,7 +221,9 @@ def gemma_iti(
     timeout=60 * 60,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
-def run_register_axiom(model_name: str, layers_str: str, max_new: int = 50) -> str:
+def run_register_axiom(
+    model_name: str, layers_str: str, max_new: int = 50, axiom: str = "bp"
+) -> str:
     import os
     import sys
 
@@ -235,6 +237,7 @@ def run_register_axiom(model_name: str, layers_str: str, max_new: int = 50) -> s
         "--max-new", str(max_new),
         "--use-chat",
         "--bf16",
+        "--axiom", axiom,
     ]
     import io
     from contextlib import redirect_stdout
@@ -249,11 +252,72 @@ def run_register_axiom(model_name: str, layers_str: str, max_new: int = 50) -> s
 
 @app.local_entrypoint()
 def gemma_register(
-    model: str = "google/gemma-4-31B-it", layers: str = "23,53"
+    model: str = "google/gemma-4-31B-it", layers: str = "23,53", axiom: str = "bp"
 ) -> None:
     """Tier 3 closed-form online registration on Gemma 4-IT."""
-    print(f"running register_axiom on {model} at layers {layers}")
-    output = run_register_axiom.remote(model, layers)
+    print(f"running register_axiom on {model} at layers {layers}, axiom={axiom}")
+    output = run_register_axiom.remote(model, layers, 50, axiom)
+    print(output)
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_combined(
+    model_name: str,
+    layers_str: str,
+    n_steps: int,
+    target_count: int,
+    max_new: int,
+    use_chat: bool = False,
+    batch_size: int = 4,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    layers = layers_str.split(",")
+    sys.argv = [
+        "run_combined_demo",
+        "--model-name", model_name,
+        "--layers", *layers,
+        "--n-steps", str(n_steps),
+        "--target-count", str(target_count),
+        "--max-new", str(max_new),
+        "--batch-size", str(batch_size),
+        "--expand",
+    ]
+    if use_chat:
+        sys.argv.append("--use-chat")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_combined_demo import main as combined_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        combined_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def gemma_combined(
+    model: str = "google/gemma-4-31B-it",
+    layers: str = "23,53",
+    n_steps: int = 200,
+    target_count: int = 80,
+    use_chat: bool = True,
+    batch_size: int = 4,
+) -> None:
+    """Combined soft-prompt + v_residual on Gemma 4-IT."""
+    print(
+        f"running combined demo on {model} layers={layers} use_chat={use_chat} "
+        f"batch={batch_size}"
+    )
+    output = run_combined.remote(model, layers, n_steps, target_count, 60, use_chat, batch_size)
     print(output)
 
 

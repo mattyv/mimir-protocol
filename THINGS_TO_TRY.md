@@ -139,6 +139,53 @@ Detect the "What is a" prefix and rewrite it to a form where
 injection works ("Explain how X is used"). Works but is the prompt-
 rewriting reward-hack the user already rejected.
 
+## Projector network — amortize per-axiom training to ~1 sec at registration
+
+**The idea:** train a small "axiom encoder" network *once* — a model that
+takes an axiom's textual description and outputs the soft prompt vector
+directly. After this one-time training:
+
+  - Register a new axiom = run description through projector = soft
+    prompt out
+  - **Per-axiom registration cost: ~1 second** (one small-model forward
+    pass)
+  - Storage stays per-axiom (~10-25 KB), still hot-loadable
+
+**How it would work:**
+
+1. Curate a set of training axioms (could be synthetic, or real
+   Confluence pages).
+2. For each, build the "ground truth" soft prompt via existing
+   gradient training (the slow per-axiom pipeline).
+3. Train a small model (~10-50M params, e.g., a small T5 or BERT)
+   that takes the axiom's seed paraphrases / description as input and
+   outputs the soft prompt vector. Loss: MSE against ground truth.
+4. Deploy the trained projector. New axioms register via single
+   forward pass.
+
+**Why this could work:** soft-prompt amortization is a known technique
+in the prompt-tuning literature. If axioms share semantic structure
+(many are "services that publish data" or "concepts in pub-sub
+systems"), a projector can learn to map description-space to
+soft-prompt-space.
+
+**Cost vs benefit:**
+
+  - Build: ~1 day of code + training time on ~100-500 ground-truth
+    axioms (each currently ~5-15 min to build, so 8-100 hours of
+    Modal compute one-time).
+  - Operate: free per axiom after.
+
+**When to build this:** after the per-axiom pipeline is validated and
+producing good outputs at known compute cost. The projector amortizes
+that cost across many axioms; only worth doing if axiom volume is
+high enough (1000+ axioms) and individual axioms don't need the
+extra-careful tuning a full per-axiom training can give.
+
+**Closest published work:** prompt-tuning amortization (Lester et al.,
+HyperPrompt papers), instance-level prompt-tuning, P-tuning v2 with
+shared prefix.
+
 ## Recommendation
 
 Start with **decode-time logit biasing**. It's the cheapest, has
