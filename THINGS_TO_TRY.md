@@ -1,5 +1,36 @@
 # Things to try
 
+## Prefix tuning on Gemma 4 (sliding-window attention)
+
+Prefix tuning works cleanly on Qwen 32B base (10/10 axioms, fact-level
+recall) but produces null effect on Gemma 4-31B-IT — prefix-init
+outputs ≈ baseline outputs across all 10 axioms tested 2026-04-29.
+
+Suspected cause: Gemma 4 hybrid attention has 5:1 local:global ratio.
+Most layers use sliding-window attention (~4096-token window). When
+prefix sits at positions 0-31 and user prompt starts later, local
+layers may not see prefix positions. Top-half injection (layers
+30-59) hits mostly local layers, so prefix is invisible to those.
+
+Things to try if revisiting:
+  - Inject only at global-attention layers (every 5th — verify in
+    Gemma 4 config). Far fewer injection points but each is a layer
+    that can see the prefix.
+  - Init prefix using chat-formatted description (the same chat
+    template the user prompt uses at inference) so K/V state aligns
+    with inference context.
+  - Test Gemma 4 base (non-IT) to isolate whether the failure is
+    architectural (sliding window) or RLHF-related.
+  - Compare Qwen 32B-Instruct as a non-sliding-window RLHF baseline
+    — if that works, Gemma's specific issue is the sliding window
+    not RLHF.
+
+Effort: ~half day each direction. Parked because Qwen base/Instruct
+covers production needs and Gemma support is a separate engineering
+problem.
+
+
+
 Mechanisms we haven't tested yet, ordered by likelihood of moving the
 "what is X?" stolen-words ceiling identified in `CONCLUSIONS.md`. The
 ceiling is: vector injection moves probability mass within a fixed
