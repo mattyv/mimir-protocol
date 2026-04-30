@@ -30,3 +30,6 @@ data/sentinel_*/
 checkpoints/
 *.safetensors
 .claude/
+
+# Cloned third-party repos for research/reference (not vendored)
+related_work/
