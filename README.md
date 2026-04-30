@@ -168,6 +168,90 @@ These are tractable engineering problems, not architectural impossibilities.
 But they bound where the technique works *today* to dense-attention base
 models (the Qwen base family being the validated target).
 
+## Why this matters at the scale of "AI for an organization"
+
+The technique exists in this repo as a per-axiom mechanism. Where it
+gets ambitious is when paired with a **structured knowledge graph of an
+organization** as the source of axioms.
+
+We're building that graph in a sister repo: [Mimir](https://github.com/mattyv/Mimir).
+Mimir crawls Confluence, GitHub, Slack, code, and engineering interviews,
+and produces a typed knowledge graph (entities, relationships,
+observations, decisions, constraints, processes) with grounding,
+temporal validity, source authority, and ACLs. Today Mimir exposes this
+graph to LLMs via MCP — i.e., as a database the model queries via tool
+calls, with the results pasted into prompts (a structured form of RAG).
+
+Mimir-Protocol turns each Mimir entity into an axiom prefix. The
+description = entity properties + observations + decisions; references
+between entities become axiom dependencies. At query time, term
+detection walks the graph from mentioned entities, loads the relevant
+axioms' prefixes, and the model reasons natively across them — without
+any of the graph's text appearing in the user's prompt.
+
+Together the two repos form a shape that doesn't currently exist as a
+deployed pattern: **a typed organizational knowledge graph + attention-
+state activation, with provenance and ACLs already wired in**.
+
+If multi-axiom and recursive composition land cleanly, several
+specific things open up:
+
+- **Enterprise AI economics flip.** Today every company does either
+  fine-tuning ($M-scale, retrain on every change) or RAG (token bloat,
+  weak multi-doc reasoning). Frozen base + per-tenant axiom layer is a
+  third cost shape — closer to web-app multi-tenancy than per-tenant
+  model training.
+- **Knowledge graphs stop being inert databases.** Today an LLM
+  consults a graph via tool calls; with axiom prefixes, the graph IS
+  part of the model's reasoning substrate. Queries activate axioms
+  rather than returning text the model has to re-read.
+- **Per-user personalization without fine-tuning.** Same mechanism at
+  smaller scope: communication style, ongoing projects, recent
+  context. Loaded at session start, unloaded at session end. The model
+  knows you without your data ever entering its weights.
+- **Live-current knowledge.** Mimir crawls continuously; if axiom
+  registration is ~1 second per page, the model's knowledge stays
+  current to the minute, with no retraining.
+- **Behavior priming as a deployment surface.** Axioms aren't just
+  "facts" — they're stored compositions of model concepts. Coding
+  style guides, debugging methodologies, personas, safety policies —
+  all encodable as axioms, hot-loadable at inference.
+- **A "missing middle" memory layer between context window
+  (short-term) and weights (long-term).** Axioms are structured
+  reusable knowledge, updatable in seconds, evictable, ACL-filterable.
+- **An alternative to "scale is all you need" at the enterprise
+  tier.** Capability/specialization/personalization decouple from
+  training; smaller frozen bases plus rich axiom layers become viable
+  for compute-constrained deployment.
+
+The shape is closest to the kernel/userspace split in operating systems.
+Frontier labs continue training large bases (the kernel). Enterprise
+and specialized AI builds axiom layers on top through stable interfaces
+(userspace). The two layers update at different cadences with different
+cost structures. **AI deployment gets userspace.**
+
+There's a cautionary side too. The same mechanism that loads your
+company's coding standards loads any priming. Axioms become a new
+**alignment surface**: adversarial axioms could override safety
+training without weight changes; steganographic axioms could encode
+behavior changes in innocent-looking descriptions. If this scales,
+axiom auditability — provenance, content hashing, ACL enforcement at
+load time — becomes load-bearing. Mimir already has those primitives;
+Mimir-Protocol would inherit them.
+
+What could still kill it: (a) multi-axiom interference turns out to be
+fundamental, not fixable by RoPE-correction or joint encoding;
+(b) description-init alone isn't stable at thousands of axioms and
+needs gradient training that introduces drift; (c) frontier models
+adopt sliding-window attention en masse, leaving us stuck on a
+shrinking subset of architectures; (d) prefill latency for joint
+encoding at multi-axiom scale exceeds production latency budgets. Each
+is a real risk, none is a known dead-end.
+
+If we land it, the door this opens isn't "better RAG". It's a new
+architectural primitive for how AI integrates with structured
+organizational knowledge.
+
 ## Two words we use very precisely
 
 The difference matters:
