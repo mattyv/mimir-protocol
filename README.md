@@ -1,15 +1,44 @@
 # Mimir-Protocol
 
-**Make a frozen LLM remember your company's vocabulary — without training it,
-without putting definitions in every prompt, and without an external retrieval
-step at query time.**
+**Give a frozen LLM the ability to understand things it was never trained on —
+without modifying its weights, without putting definitions in every prompt,
+and without an external retrieval step at query time.**
 
-This repo explores a third path between fine-tuning and RAG: **per-axiom
-prefix tuning**. For each internal term ("Balance Publisher", "TradingRiskEngine",
-your custom function, your team's acronyms), we run the model on the term's
-description **once**, capture the resulting attention K/V state, and at runtime
-splice it back into attention so the model behaves as if it had just read the
+LLMs only know what was in their training data. Anything that came after
+training cutoff, anything novel, anything specialized, anything you just
+made up — the model is blind to. The standard answers to this are
+fine-tuning (modify the weights, slow and expensive) or RAG (paste
+definitions into every prompt, eats the context window).
+
+This repo explores a third path: **per-concept prefix tuning**. For each
+new concept (a service in your codebase, a paper published last week, a
+new framework, a domain-specific term, anything you can describe in a
+paragraph), we run the model on the concept's description **once**,
+capture the resulting attention K/V state, and at runtime splice it back
+into attention so the model behaves as if it had just read the
 description — without any text appearing in the user's prompt.
+
+The model has now *understood* something it was never trained on.
+
+The "axiom" terminology in this repo comes from the original use case
+(internal company jargon), but the technique generalizes: anything you
+can compose from concepts the model already knows, you can register.
+That includes:
+
+- **Internal company jargon** — service names, internal acronyms,
+  team-specific processes
+- **Post-training-cutoff knowledge** — papers, libraries, products
+  released after the model was trained
+- **Specialized domains** — medical procedures, legal precedents, niche
+  technical fields
+- **Novel constructs** — a custom function, a thought experiment, a
+  user's project
+- **Personal context** — your notes, your codebase, your ongoing work
+
+The only requirement: the *pieces* of the new concept must be things
+the model knows about. New names, new compositions, new arrangements —
+all fine. New concepts built entirely from words the model has never
+seen — won't work, because there's nothing to anchor on.
 
 Result on Qwen 2.5-32B base, validated 2026-04-29:
 
@@ -27,29 +56,36 @@ Result on Qwen 2.5-32B base, validated 2026-04-29:
 
 ## Why this matters
 
-The standard answer to "the LLM doesn't know our internal jargon" today is
-RAG (paste the relevant docs into every prompt) or fine-tuning (retrain
-weights on company data). Both have real costs:
+LLMs are static after training. Adding new understanding currently means
+fine-tuning (slow, expensive, retrains) or RAG (paste docs into every
+prompt, eats context). Both treat the model as a closed black box that
+needs to be either rebuilt or hand-fed at query time.
+
+This is a third option:
 
 | | RAG | Fine-tuning | **Mimir-Protocol** |
 |---|---|---|---|
-| Per-axiom registration cost | free (just store text) | hours of GPU + retraining | **~1 sec, one forward pass** |
+| Per-concept registration cost | free (just store text) | hours of GPU + retraining | **~1 sec, one forward pass** |
 | Per-query inference cost | extra prompt tokens × every query | none (baked in) | **none** (cached prefix loaded) |
 | Retraining required when knowledge changes? | no | **yes, expensive** | no — recapture the prefix |
 | Knowledge appears in user-visible prompt? | **yes** (eats context window) | no | no |
 | Isolation between unrelated knowledge | manual prompt engineering | spillover risk | **clean** (validated) |
-| Scales to thousands of axioms? | context-window bound | retrain time bound | **yes** (5 MB × N) |
+| Scales to thousands of concepts? | context-window bound | retrain time bound | **yes** (~4 MB × N) |
 | Frozen base model? | yes | **no** | yes |
 
-The strategic shape is: **expensive frozen base model that knows world
-knowledge, plus a tiny per-tenant memory of internal terms, with no
-weight changes per tenant**. That's a different product economics than
-either RAG (always-on token cost) or fine-tuning (ops-heavy retraining).
+The strategic shape is: **a frozen base model that knows world
+knowledge, plus a cheap, hot-loadable layer of new concepts, with no
+weight changes**. The model gains new understanding without becoming a
+new model.
 
-If this scales to long descriptions and deeper dependency chains, the use
-case is "drop your Confluence wiki onto a frozen model and it speaks your
-company's language" — without an external retrieval system in the
-critical path of every query.
+If this scales to long descriptions and deeper dependency chains, the
+use case is broader than "drop your wiki onto a frozen model". It's:
+**any structured body of new understanding becomes hot-loadable into
+the model, in seconds, without retraining.** A team's services. A
+research field's recent papers. A user's personal context. A new
+library's API. The frozen model becomes extensible — its knowledge
+boundary moves from "what was in the training set" to "what we can
+describe in a paragraph and register".
 
 ## A concrete example
 
@@ -168,76 +204,77 @@ These are tractable engineering problems, not architectural impossibilities.
 But they bound where the technique works *today* to dense-attention base
 models (the Qwen base family being the validated target).
 
-## Why this matters at the scale of "AI for an organization"
+## Why this matters at scale
 
-The technique exists in this repo as a per-axiom mechanism. Where it
-gets ambitious is when paired with a **structured knowledge graph of an
-organization** as the source of axioms.
+The deeper claim is about how LLMs gain new understanding at all.
 
-We're building that graph in a sister repo: [Mimir](https://github.com/mattyv/Mimir).
-Mimir crawls Confluence, GitHub, Slack, code, and engineering interviews,
-and produces a typed knowledge graph (entities, relationships,
-observations, decisions, constraints, processes) with grounding,
-temporal validity, source authority, and ACLs. Today Mimir exposes this
-graph to LLMs via MCP — i.e., as a database the model queries via tool
-calls, with the results pasted into prompts (a structured form of RAG).
+Today, "the model knows X" is a property of the training set. If X
+wasn't in the training data — a paper from last week, a library
+released after cutoff, a niche specialization, a brand new product, a
+domain the model under-represents, anything you just invented — the
+model is blind. The two existing options for fixing that (fine-tuning,
+RAG) both treat the model as a closed black box: rebuild it, or
+hand-feed it at query time.
 
-Mimir-Protocol turns each Mimir entity into an axiom prefix. The
-description = entity properties + observations + decisions; references
-between entities become axiom dependencies. At query time, term
-detection walks the graph from mentioned entities, loads the relevant
-axioms' prefixes, and the model reasons natively across them — without
-any of the graph's text appearing in the user's prompt.
+If multi-axiom and recursive composition land cleanly, **frozen LLMs
+become genuinely extensible**. New understanding gets added in seconds,
+composes with existing knowledge, doesn't degrade with use, and
+doesn't show up in the user's prompt. The model's knowledge boundary
+becomes "what someone has registered" rather than "what was in
+pretraining".
 
-Together the two repos form a shape that doesn't currently exist as a
-deployed pattern: **a typed organizational knowledge graph + attention-
-state activation, with provenance and ACLs already wired in**.
+Several specific things open up:
 
-If multi-axiom and recursive composition land cleanly, several
-specific things open up:
-
-- **Enterprise AI economics flip.** Today every company does either
-  fine-tuning ($M-scale, retrain on every change) or RAG (token bloat,
-  weak multi-doc reasoning). Frozen base + per-tenant axiom layer is a
-  third cost shape — closer to web-app multi-tenancy than per-tenant
-  model training.
-- **Knowledge graphs stop being inert databases.** Today an LLM
-  consults a graph via tool calls; with axiom prefixes, the graph IS
-  part of the model's reasoning substrate. Queries activate axioms
-  rather than returning text the model has to re-read.
-- **Per-user personalization without fine-tuning.** Same mechanism at
-  smaller scope: communication style, ongoing projects, recent
-  context. Loaded at session start, unloaded at session end. The model
-  knows you without your data ever entering its weights.
-- **Live-current knowledge.** Mimir crawls continuously; if axiom
-  registration is ~1 second per page, the model's knowledge stays
-  current to the minute, with no retraining.
-- **Behavior priming as a deployment surface.** Axioms aren't just
+- **Post-training-cutoff knowledge becomes accessible.** A paper
+  published this week, a library released yesterday, a product
+  announced this morning — the model can be taught any of them in
+  seconds. Today's only options are "wait for the next training run"
+  or "paste the doc into every prompt".
+- **Specialized domains stop requiring fine-tuned models.** Niche
+  medical / legal / scientific subfields, individual programming
+  languages or DSLs the model under-represents — registered as
+  axioms, the model gains domain competence on demand.
+- **Knowledge graphs stop being inert databases.** When paired with a
+  structured graph (e.g. [Mimir](https://github.com/mattyv/Mimir),
+  which crawls Confluence/GitHub/Slack into a typed graph with
+  provenance, ACLs, and temporal validity), each graph node becomes a
+  registerable axiom. Queries activate axioms rather than returning
+  text the model has to re-read. The graph becomes part of the
+  reasoning substrate, not a database the model consults via tool
+  calls.
+- **Per-user personalization without fine-tuning.** Communication
+  style, ongoing projects, personal codebase, recent context — loaded
+  at session start, unloaded at session end. The model knows you
+  without your data ever entering its weights.
+- **Behavior priming as a deployment surface.** Axioms aren't only
   "facts" — they're stored compositions of model concepts. Coding
   style guides, debugging methodologies, personas, safety policies —
   all encodable as axioms, hot-loadable at inference.
 - **A "missing middle" memory layer between context window
-  (short-term) and weights (long-term).** Axioms are structured
-  reusable knowledge, updatable in seconds, evictable, ACL-filterable.
-- **An alternative to "scale is all you need" at the enterprise
-  tier.** Capability/specialization/personalization decouple from
-  training; smaller frozen bases plus rich axiom layers become viable
-  for compute-constrained deployment.
+  (short-term) and weights (long-term).** Structured, reusable
+  knowledge, updatable in seconds, evictable, filterable.
+- **Live-current AI.** Continuous crawling + per-page axiom
+  registration → the model's knowledge stays current to the minute,
+  no retraining cycle.
+- **An alternative to "scale is all you need" for specialized tasks.**
+  Capability via raw model scale becomes one axis; capability via
+  rich registered context becomes another. Smaller frozen bases plus
+  great axiom layers become viable for many real-world tasks.
 
 The shape is closest to the kernel/userspace split in operating systems.
-Frontier labs continue training large bases (the kernel). Enterprise
-and specialized AI builds axiom layers on top through stable interfaces
+Frontier labs continue training large bases (the kernel). Specialized
+applications build axiom layers on top through stable interfaces
 (userspace). The two layers update at different cadences with different
 cost structures. **AI deployment gets userspace.**
 
-There's a cautionary side too. The same mechanism that loads your
-company's coding standards loads any priming. Axioms become a new
-**alignment surface**: adversarial axioms could override safety
-training without weight changes; steganographic axioms could encode
-behavior changes in innocent-looking descriptions. If this scales,
-axiom auditability — provenance, content hashing, ACL enforcement at
-load time — becomes load-bearing. Mimir already has those primitives;
-Mimir-Protocol would inherit them.
+There's a cautionary side too. The same mechanism that loads a
+research paper loads any priming. Axioms become a new **alignment
+surface**: adversarial axioms could override safety training without
+weight changes; steganographic axioms could encode behavior changes in
+innocent-looking descriptions. If this scales, axiom auditability —
+provenance, content hashing, ACL enforcement at load time — becomes
+load-bearing. (A structured pipeline like Mimir already has those
+primitives; an axiom layer built on top of it would inherit them.)
 
 What could still kill it: (a) multi-axiom interference turns out to be
 fundamental, not fixable by RoPE-correction or joint encoding;
