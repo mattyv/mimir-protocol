@@ -550,6 +550,162 @@ def run_chain_ape(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_chain_ape_recursive(
+    model_name: str,
+    n_prefix_tokens: int,
+    max_new: int,
+    target_layers: str = "",
+    use_chat: bool = False,
+    q_scales: str = "1.2,1.3,1.5,1.7",
+    shared_prefixes: str = r"\n|### Context:\n",
+    combiners: str = "uniform,cosine",
+    only_3plus: bool = False,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sps = shared_prefixes.split("|")
+    sys.argv = [
+        "run_chain_ape_recursive_demo",
+        "--model-name",
+        model_name,
+        "--n-prefix-tokens",
+        str(n_prefix_tokens),
+        "--max-new",
+        str(max_new),
+        "--q-scales",
+        *q_scales.split(","),
+        "--shared-prefixes",
+        *sps,
+        "--combiners",
+        *combiners.split(","),
+    ]
+    if target_layers:
+        sys.argv += ["--target-layers", *target_layers.split(",")]
+    if use_chat:
+        sys.argv.append("--use-chat")
+    if only_3plus:
+        sys.argv.append("--only-3plus")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_chain_ape_recursive_demo import main as ape_rec_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ape_rec_main()
+    return buf.getvalue()
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_composed_axiom(
+    model_name: str,
+    n_prefix_tokens: int,
+    max_new: int,
+    top_axiom: str = "data_pipeline",
+    use_chat: bool = False,
+    only_3plus: bool = False,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_composed_axiom_demo",
+        "--model-name",
+        model_name,
+        "--n-prefix-tokens",
+        str(n_prefix_tokens),
+        "--max-new",
+        str(max_new),
+        "--top-axiom",
+        top_axiom,
+    ]
+    if use_chat:
+        sys.argv.append("--use-chat")
+    if only_3plus:
+        sys.argv.append("--only-3plus")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_composed_axiom_demo import main as composed_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        composed_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def composed_axiom(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_prefix_tokens: int = 256,
+    max_new: int = 180,
+    top_axiom: str = "data_pipeline",
+    use_chat: bool = False,
+    only_3plus: bool = False,
+) -> None:
+    """Capture compositional concept ONCE at understanding time, query
+    with single prefix → collapses 3+ axiom problem to n=1.
+    """
+    print(
+        f"composed-axiom test on {model} top_axiom={top_axiom} "
+        f"prefix_tokens={n_prefix_tokens} only_3plus={only_3plus}"
+    )
+    output = run_composed_axiom.remote(
+        model, n_prefix_tokens, max_new, top_axiom, use_chat, only_3plus
+    )
+    print(output)
+
+
+@app.local_entrypoint()
+def chain_ape_recursive(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_prefix_tokens: int = 48,
+    max_new: int = 180,
+    target_layers: str = "",
+    use_chat: bool = False,
+    q_scales: str = "1.5",
+    shared_prefixes: str = r"\n",
+    combiners: str = "uniform,cosine",
+    only_3plus: bool = False,
+) -> None:
+    """5-axiom hierarchical DAG test with APE + per-block attention.
+
+    Conditions per prompt: A no-prefix, C rope-fix, F APE(q × sp),
+    G per-block(combiner), E joint-enc.
+    """
+    print(
+        f"recursive APE+per-block test on {model} prefix_tokens={n_prefix_tokens} "
+        f"q_scales={q_scales} shared_prefixes={shared_prefixes!r} "
+        f"combiners={combiners} only_3plus={only_3plus}"
+    )
+    output = run_chain_ape_recursive.remote(
+        model,
+        n_prefix_tokens,
+        max_new,
+        target_layers,
+        use_chat,
+        q_scales,
+        shared_prefixes,
+        combiners,
+        only_3plus,
+    )
+    print(output)
+
+
 @app.local_entrypoint()
 def chain_ape(
     model: str = "Qwen/Qwen2.5-32B",

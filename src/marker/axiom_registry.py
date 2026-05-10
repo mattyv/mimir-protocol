@@ -280,6 +280,151 @@ CHAIN_AXIOMS: dict[str, dict] = {
     },
 }
 
+# ============================================================================
+# Hierarchical axioms — DAG where one axiom is composed of sub-axioms.
+# Used to test whether 3+ prefix composition holds when the top axiom
+# explicitly references named sub-axioms by their term.
+#
+# DAG (edges = "depends on / consumes from"):
+#
+#   data_pipeline ─┬─→ kafka_router ──→ event_log
+#                  ├─→ feature_store ─→ event_log
+#                  └─→ model_server  ─→ feature_store
+#                                     ─→ kafka_router
+#
+# 5 axioms, depth 3, with a shared leaf (event_log).
+# Names are deliberately distinctive so a hallucination check can flag
+# any other capitalized noun ("BalanceMonitor", "EventBus", etc.) as
+# made-up.
+# ============================================================================
+
+HIERARCHICAL_AXIOMS: dict[str, dict] = {
+    "event_log": {
+        "term": "EventLog",
+        "description": (
+            "EventLog is an append-only Kafka topic named events.raw. It stores "
+            "raw user click events with the schema (user_id, event_type, ts_ms, "
+            "payload). Retention is 7 days. The topic is partitioned by user_id "
+            "into 64 partitions. EventLog has no upstream dependencies."
+        ),
+    },
+    "kafka_router": {
+        "term": "KafkaRouter",
+        "description": (
+            "KafkaRouter consumes from EventLog. It applies user-defined routing "
+            "rules and forwards filtered events to two downstream topics: "
+            "events.training (for offline training) and events.serving (for "
+            "online inference). KafkaRouter drops any event whose ts_ms is "
+            "older than 1 hour."
+        ),
+    },
+    "feature_store": {
+        "term": "FeatureStore",
+        "description": (
+            "FeatureStore subscribes to EventLog. It computes per-user features "
+            "(rolling 24h click count, last_seen_ts, top-3 categories) and "
+            "writes them to Redis with key feat:{user_id}. Each key has a "
+            "stale-after-write TTL of 5 minutes."
+        ),
+    },
+    "model_server": {
+        "term": "ModelServer",
+        "description": (
+            "ModelServer answers recommendation requests over gRPC. For each "
+            "request, ModelServer reads features from FeatureStore via Redis "
+            "lookup at key feat:{user_id} and reads the current serving model "
+            "from the events.serving topic published by KafkaRouter. If the "
+            "FeatureStore key is missing, ModelServer falls back to "
+            "popular-items. It returns top-K recommendations."
+        ),
+    },
+    "data_pipeline": {
+        "term": "DataPipeline",
+        "description": (
+            "DataPipeline is composed of EventLog, KafkaRouter, FeatureStore, "
+            "and ModelServer. The end-to-end SLA is that events ingested into "
+            "EventLog are reflected in ModelServer responses within 6 minutes: "
+            "1 minute for EventLog propagation plus 5 minutes for FeatureStore's "
+            "TTL window. DataPipeline has no other components."
+        ),
+        # Sub-axioms that this axiom is composed of. When set, the
+        # `composed_description` helper builds a single coherent document
+        # that includes each sub-axiom's full description plus the
+        # `composition_note` paragraph below. That document is what we
+        # capture as the prefix — collapsing the multi-axiom problem
+        # back to the n=1 case.
+        "composed_of": ["event_log", "kafka_router", "feature_store", "model_server"],
+        "composition_note": (
+            "How DataPipeline's components fit together: a user click is first "
+            "ingested by EventLog. KafkaRouter consumes from EventLog and "
+            "forwards events to two downstream topics; FeatureStore also "
+            "subscribes to EventLog and computes per-user features into Redis. "
+            "ModelServer serves recommendation requests by reading features "
+            "from FeatureStore (Redis lookup) and the current model from "
+            "KafkaRouter's events.serving topic. If FeatureStore has no key "
+            "for the user, ModelServer falls back to popular-items. The "
+            "6-minute SLA decomposes as: 1 minute is the EventLog propagation "
+            "time before KafkaRouter / FeatureStore see a new event; the "
+            "remaining 5 minutes is FeatureStore's stale-after-write TTL "
+            "window before computed features are visible to ModelServer. If "
+            "EventLog stops accepting writes, both KafkaRouter and "
+            "FeatureStore stall (no new events to consume), so ModelServer "
+            "serves only stale features and falls back to popular-items for "
+            "any new user."
+        ),
+    },
+}
+
+
+def composed_description(axiom_key: str) -> str:
+    """Build a single coherent document for an axiom + its sub-axioms.
+
+    For leaf axioms (no `composed_of`), returns the axiom's own description.
+    For composed axioms, concatenates:
+      1. The top-level description.
+      2. Each sub-axiom's term + description.
+      3. The `composition_note` paragraph (how the parts fit together).
+
+    The result is what we feed to the model at capture time so the
+    cached prefix already contains the cross-references between the
+    top-level concept and its parts.
+    """
+    cfg = HIERARCHICAL_AXIOMS[axiom_key]
+    sub_keys = cfg.get("composed_of") or []
+    if not sub_keys:
+        return cfg["description"]
+    parts = [cfg["description"]]
+    for sk in sub_keys:
+        sub = HIERARCHICAL_AXIOMS[sk]
+        parts.append(f"{sub['term']}: {sub['description']}")
+    note = cfg.get("composition_note")
+    if note:
+        parts.append(note)
+    return "\n\n".join(parts)
+
+
+# Set of named entities that legitimately appear in the hierarchical
+# axioms (terms + technologies). Used by hallucination checks: any
+# CamelCase or Snake_case multi-word identifier in generated output that
+# is NOT in this set is flagged as a likely hallucination.
+HIERARCHICAL_KNOWN_ENTITIES: set[str] = {
+    # axiom terms
+    "EventLog",
+    "KafkaRouter",
+    "FeatureStore",
+    "ModelServer",
+    "DataPipeline",
+    # technologies / standard names
+    "Kafka",
+    "Redis",
+    "gRPC",
+    "REST",
+    "events.raw",
+    "events.training",
+    "events.serving",
+}
+
+
 # Path to neutral-prose negatives (used when an axiom lacks a lexical pair).
 NEUTRAL_NEGATIVES_PATH = DATA / "paraphrases.json"
 NEUTRAL_NEGATIVES_KEY = "negatives"
