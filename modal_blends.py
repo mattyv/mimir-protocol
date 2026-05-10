@@ -450,6 +450,169 @@ def run_chain(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_chain_selective_recompute(
+    model_name: str,
+    n_prefix_tokens: int,
+    max_new: int,
+    target_layers: str = "",
+    use_chat: bool = False,
+    top_k_pct: float = 0.15,
+    selective_layer: int = 1,
+    only_3plus: bool = False,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_chain_selective_recompute_demo",
+        "--model-name",
+        model_name,
+        "--n-prefix-tokens",
+        str(n_prefix_tokens),
+        "--max-new",
+        str(max_new),
+        "--top-k-pct",
+        str(top_k_pct),
+        "--selective-layer",
+        str(selective_layer),
+    ]
+    if target_layers:
+        sys.argv += ["--target-layers", *target_layers.split(",")]
+    if use_chat:
+        sys.argv.append("--use-chat")
+    if only_3plus:
+        sys.argv.append("--only-3plus")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_chain_selective_recompute_demo import main as csr_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        csr_main()
+    return buf.getvalue()
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_chain_ape(
+    model_name: str,
+    n_prefix_tokens: int,
+    max_new: int,
+    target_layers: str = "",
+    use_chat: bool = False,
+    q_scales: str = "1.5,2.0,3.0",
+    shared_prefix: str = "\n",
+    only_3plus: bool = False,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_chain_ape_demo",
+        "--model-name",
+        model_name,
+        "--n-prefix-tokens",
+        str(n_prefix_tokens),
+        "--max-new",
+        str(max_new),
+        "--q-scales",
+        *q_scales.split(","),
+        "--shared-prefix",
+        shared_prefix,
+    ]
+    if target_layers:
+        sys.argv += ["--target-layers", *target_layers.split(",")]
+    if use_chat:
+        sys.argv.append("--use-chat")
+    if only_3plus:
+        sys.argv.append("--only-3plus")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_chain_ape_demo import main as ape_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ape_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def chain_ape(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_prefix_tokens: int = 32,
+    max_new: int = 180,
+    target_layers: str = "",
+    use_chat: bool = False,
+    q_scales: str = "1.5,2.0,3.0",
+    shared_prefix: str = "\n",
+    only_3plus: bool = False,
+) -> None:
+    """3+ prefix chain test with APE (shared-prefix attention sink + Q
+    sharpening) compared against rope-fix (C) and Path 2 joint encoding (E).
+    """
+    print(
+        f"chain APE test on {model} prefix_tokens={n_prefix_tokens} "
+        f"q_scales={q_scales} shared_prefix={shared_prefix!r} only_3plus={only_3plus}"
+    )
+    output = run_chain_ape.remote(
+        model,
+        n_prefix_tokens,
+        max_new,
+        target_layers,
+        use_chat,
+        q_scales,
+        shared_prefix,
+        only_3plus,
+    )
+    print(output)
+
+
+@app.local_entrypoint()
+def chain_selective(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_prefix_tokens: int = 32,
+    max_new: int = 180,
+    target_layers: str = "",
+    use_chat: bool = False,
+    top_k_pct: float = 0.15,
+    selective_layer: int = 1,
+    only_3plus: bool = False,
+) -> None:
+    """3+ prefix chain test with CacheBlend selective recompute (D) +
+    Path 2 joint encoding (E) compared against naive (B) and
+    RoPE-corrected (C) baselines.
+    """
+    print(
+        f"chain selective-recompute test on {model} prefix_tokens={n_prefix_tokens} "
+        f"top_k_pct={top_k_pct} selective_layer={selective_layer} only_3plus={only_3plus}"
+    )
+    output = run_chain_selective_recompute.remote(
+        model,
+        n_prefix_tokens,
+        max_new,
+        target_layers,
+        use_chat,
+        top_k_pct,
+        selective_layer,
+        only_3plus,
+    )
+    print(output)
+
+
 @app.local_entrypoint()
 def chain_test(
     model: str = "Qwen/Qwen2.5-32B",
