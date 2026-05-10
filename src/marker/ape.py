@@ -1,5 +1,16 @@
-"""APE (Adaptive Parallel Encoding) — three dials to fix attention
-entropy collapse at 3+ stacked prefixes.
+"""APE (Adaptive Parallel Encoding) — historical / negative result.
+
+**Status (2026-05-10):** Superseded by the composed-axiom (H) approach
+in `axiom_registry.composed_description` + `Prefix.from_axiom`. APE
+helps for direct fact lookup at 3-5 stacked prefixes but fails on
+counterfactual / DAG-traversal queries. Kept here for reproducibility
+of the negative result and for the 2-prefix RoPE-fix gauntlet.
+
+Original docstring follows.
+
+----
+
+APE — three dials to fix attention entropy collapse at 3+ stacked prefixes.
 
 Reference: Yang, Chen, Chen, "Adaptive Parallel Encoding for Efficient
 LLM Serving" (ICLR 2025, arxiv 2502.05431).

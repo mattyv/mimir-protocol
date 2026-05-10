@@ -148,6 +148,38 @@ class Prefix:
             source_ids=src_ids,
         )
 
+    @classmethod
+    def from_axiom(
+        cls,
+        model,  # noqa: ANN001
+        tokenizer,
+        axiom_key: str,
+        max_tokens: int | None = None,
+        target_layers: list[int] | None = None,
+    ) -> Prefix:
+        """Capture a prefix for an axiom by key, using the canonical
+        composed-description path. If the axiom has `composed_of`, the
+        captured prefix represents the top-level concept + all
+        sub-axioms + the composition_note as a single coherent document.
+        Otherwise it's just the standalone description.
+
+        `max_tokens=None` (default) auto-sizes the capture window to the
+        full tokenized description, so composed axioms aren't truncated.
+        """
+        from marker.axiom_registry import composed_description
+
+        text = composed_description(axiom_key)
+        if max_tokens is None:
+            ids = tokenizer(text, add_special_tokens=False).input_ids
+            max_tokens = len(ids)
+        return cls.from_description(
+            model=model,
+            tokenizer=tokenizer,
+            description=text,
+            max_tokens=max_tokens,
+            target_layers=target_layers,
+        )
+
     def parameters(self) -> list[nn.Parameter]:
         return self.keys + self.values
 

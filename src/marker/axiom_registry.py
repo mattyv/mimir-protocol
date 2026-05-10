@@ -278,6 +278,59 @@ CHAIN_AXIOMS: dict[str, dict] = {
             "if signal != 0. Returns false if symbol not in risk_limits."
         ),
     },
+    # === Composed top-level axioms (H pattern; see composed_description) ===
+    "trading_pipeline": {
+        "term": "TradingPipeline",
+        "description": (
+            "TradingPipeline is the end-to-end order flow composed of "
+            "BalancePublisher, TradingRiskEngine, and OrderSequencer. It "
+            "ingests user balances, evaluates margin, and forwards approved "
+            "orders to the exchange."
+        ),
+        "composed_of": ["balance_publisher", "trading_risk_engine", "order_sequencer"],
+        "composition_note": (
+            "How TradingPipeline's components fit together: BalancePublisher "
+            "polls the exchange for sub-account balances every 250ms and "
+            "publishes balance events to Kafka. TradingRiskEngine consumes "
+            "those balance events, computes per-user margin, and emits a "
+            "margin_ok flag (true when margin >= 1.5x); on breach it "
+            "publishes risk_breach to risk.alerts. OrderSequencer accepts "
+            "client orders, checks TradingRiskEngine's margin_ok flag, and "
+            "forwards approved orders to the exchange. If BalancePublisher "
+            "reports stale balances (timestamp > 1s old), OrderSequencer "
+            "pauses all new orders until balances are fresh again. If "
+            "BalancePublisher fails entirely, TradingRiskEngine sees no "
+            "fresh balance events so margin_ok goes stale, and "
+            "OrderSequencer pauses for safety."
+        ),
+    },
+    "order_placement_function": {
+        "term": "place_order_pipeline",
+        "description": (
+            "place_order is the top-level C++ trading function, composed of "
+            "compute_volatility and score_signal. It scores a symbol's "
+            "current signal and routes an order to the exchange if risk "
+            "limits permit."
+        ),
+        "composed_of": ["compute_volatility", "score_signal", "place_order"],
+        "composition_note": (
+            "How place_order's call chain fits together: compute_volatility "
+            "computes the rolling stddev over the last `window` prices "
+            "using std::accumulate, returning 0.0 if there aren't enough "
+            "samples. score_signal calls compute_volatility(prices, 20), "
+            "compares the result to a 0.05 threshold, and returns +1 (buy) "
+            "if vol < threshold, -1 (sell) if vol > 2*threshold, 0 (hold) "
+            "otherwise. place_order calls score_signal(prices), looks up "
+            "risk_limits[symbol] for max position size, and on signal != 0 "
+            "calls execute_order with std::min(1000.0, risk_limits[symbol]) "
+            "scaled by the signal sign. If symbol is not in risk_limits, "
+            "place_order returns false without calling execute_order. If "
+            "compute_volatility returns 0.0 because prices.size() < window, "
+            "score_signal sees vol=0 < threshold and returns +1 (buy) "
+            "anyway — a known edge case where insufficient data still "
+            "triggers a buy signal."
+        ),
+    },
 }
 
 # ============================================================================
@@ -376,26 +429,39 @@ HIERARCHICAL_AXIOMS: dict[str, dict] = {
 }
 
 
+def _lookup_axiom(axiom_key: str) -> dict:
+    """Find an axiom across all registries (HIERARCHICAL > CHAIN > AXIOMS)."""
+    for reg in (HIERARCHICAL_AXIOMS, CHAIN_AXIOMS, AXIOMS):
+        if axiom_key in reg:
+            return reg[axiom_key]
+    raise KeyError(f"unknown axiom {axiom_key!r}")
+
+
 def composed_description(axiom_key: str) -> str:
     """Build a single coherent document for an axiom + its sub-axioms.
 
     For leaf axioms (no `composed_of`), returns the axiom's own description.
     For composed axioms, concatenates:
       1. The top-level description.
-      2. Each sub-axiom's term + description.
+      2. Each sub-axiom's term + standalone description.
       3. The `composition_note` paragraph (how the parts fit together).
 
     The result is what we feed to the model at capture time so the
     cached prefix already contains the cross-references between the
-    top-level concept and its parts.
+    top-level concept and its parts. This is the canonical path for
+    compositional axioms — see `run_composed_axiom_demo.py` for the
+    Modal-validated result vs alternatives (APE, per-block, etc).
+
+    Looks up `axiom_key` across HIERARCHICAL_AXIOMS, CHAIN_AXIOMS, and
+    AXIOMS — composed_of can reference any of these.
     """
-    cfg = HIERARCHICAL_AXIOMS[axiom_key]
+    cfg = _lookup_axiom(axiom_key)
     sub_keys = cfg.get("composed_of") or []
     if not sub_keys:
         return cfg["description"]
     parts = [cfg["description"]]
     for sk in sub_keys:
-        sub = HIERARCHICAL_AXIOMS[sk]
+        sub = _lookup_axiom(sk)
         parts.append(f"{sub['term']}: {sub['description']}")
     note = cfg.get("composition_note")
     if note:

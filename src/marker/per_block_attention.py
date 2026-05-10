@@ -1,4 +1,18 @@
-"""Per-block attention (custom SDPA) for axiom-aware KV cache reuse.
+"""Per-block attention — historical / negative result.
+
+**Status (2026-05-10):** Confirmed dead end. Reproduces the ICLR 2025
+Block-Attention frozen-model ablation (67.9 → 48.0% accuracy). On
+Qwen 2.5-32B, both `uniform` and `cosine` combiners produce token-level
+garbage on 5/5 hierarchy prompts. Superseded by composed-axiom (H) in
+`axiom_registry.composed_description`. Kept for the negative-result
+record and for the per-block SDPA tests (which exercise the kernel in
+isolation).
+
+Original docstring follows.
+
+----
+
+Per-block attention (custom SDPA) for axiom-aware KV cache reuse.
 
 Why this exists: APE (q_scale + shared prefix) helps for direct fact
 recall on 5+ axioms but fails on counterfactual reasoning ("if X breaks,

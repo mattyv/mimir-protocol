@@ -175,16 +175,25 @@ stdlib primitives the model knows from pretrain.
 
 ## What's still hard (honest open problems)
 
-This isn't done. Three real gaps:
+This isn't done. Two real gaps remain (one was solved 2026-05-10, see below).
 
-**1. 3+ deep dependency chains.** With three prose prefixes concatenated,
-the RoPE-correction fix that solves 2-prefix sometimes regresses. The
-model gets confused by "three independent documents stacked back-to-back"
-because that's not a configuration the pretrained model encountered.
-Fallback path (per-query joint encoding — re-tokenize all relevant
-descriptions, run one prefill, use the resulting cache) is mechanically
-guaranteed to work but costs a prefill per query. Investigation on the
-queue.
+**1. (SOLVED 2026-05-10) 3+ deep dependency chains.** Initially we hit a
+regression at 3+ stacked prefixes — the model would loop on one fact
+instead of composing across all axioms. Tried APE (Yang et al ICLR 2025),
+CacheBlend selective recompute, and a custom per-block-softmax attention
+patch; all helped on direct fact lookup but failed on counterfactual /
+DAG-traversal queries. The fix turned out to be authoring-time, not
+runtime: for compositional axioms, write a single coherent description
+that includes the top-level concept + each sub-axiom + a "how the parts
+fit together" paragraph, then capture **one** prefix from that document.
+See `axiom_registry.composed_description`, `Prefix.from_axiom`, and
+`run_composed_axiom_demo.py`. This works because it aligns the cached
+state with the model's training distribution (one document defining a
+compositional thing) — the cross-references are formed by the model's
+own attention dynamics during the read. APE / per-block / CacheBlend
+are kept in the codebase as documented negative results.
+
+Two gaps still active:
 
 **2. RLHF / chat models are unreliable.** On Qwen 2.5-32B-Instruct
 (same architecture, RLHF'd), prefix tuning works for ~6/10 axioms.

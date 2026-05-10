@@ -1,4 +1,16 @@
-"""CacheBlend-style selective recompute for 3+ prefix chains.
+"""CacheBlend-style selective recompute — historical / negative result.
+
+**Status (2026-05-10):** v1 vanilla-copy variant tested on Modal vs
+rope-fix concat at 3 prefixes; identical failure mode (model loops on
+one fact). Superseded by composed-axiom (H) in
+`axiom_registry.composed_description`. Kept for the negative-result
+record.
+
+Original docstring follows.
+
+----
+
+CacheBlend-style selective recompute for 3+ prefix chains.
 
 Background: 2-prefix concat works with RoPE re-rotation
 (`prefix_tuning.combined_cache(rope_correct=True)`). 3+ prefixes

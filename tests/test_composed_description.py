@@ -24,6 +24,34 @@ def test_composed_axiom_includes_subaxioms_and_note():
     assert cfg["composition_note"] in out
 
 
+def test_lookup_finds_axioms_in_any_registry():
+    """composed_description must resolve keys from HIERARCHICAL, CHAIN,
+    and AXIOMS registries — composed_of can reference any of them."""
+    from marker.axiom_registry import composed_description
+
+    # CHAIN_AXIOMS leaf
+    out = composed_description("balance_publisher")
+    assert "Balance Publisher" in out
+
+    # New CHAIN_AXIOMS top-level composed of CHAIN sub-axioms
+    out_top = composed_description("trading_pipeline")
+    assert "BalancePublisher" in out_top or "Balance Publisher" in out_top
+    assert "TradingRiskEngine" in out_top
+    assert "OrderSequencer" in out_top
+    # composition_note must be present
+    assert "fit together" in out_top
+
+
+def test_unknown_axiom_raises():
+    from marker.axiom_registry import composed_description
+
+    try:
+        composed_description("__nonexistent_axiom__")
+        raise AssertionError("expected KeyError")
+    except KeyError:
+        pass
+
+
 def test_subaxioms_appear_in_declared_order():
     from marker.axiom_registry import HIERARCHICAL_AXIOMS, composed_description
 
