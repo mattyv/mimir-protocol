@@ -648,6 +648,72 @@ def run_composed_axiom(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_combine_vectors(
+    model_name: str,
+    n_prefix_tokens: int,
+    composed_prefix_tokens: int,
+    max_new: int,
+    top_axiom: str = "data_pipeline",
+    only_3plus: bool = False,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_combine_vectors_demo",
+        "--model-name",
+        model_name,
+        "--n-prefix-tokens",
+        str(n_prefix_tokens),
+        "--composed-prefix-tokens",
+        str(composed_prefix_tokens),
+        "--max-new",
+        str(max_new),
+        "--top-axiom",
+        top_axiom,
+    ]
+    if only_3plus:
+        sys.argv.append("--only-3plus")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_combine_vectors_demo import main as cv_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        cv_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def combine_vectors(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_prefix_tokens: int = 64,
+    composed_prefix_tokens: int = 768,
+    max_new: int = 180,
+    top_axiom: str = "data_pipeline",
+    only_3plus: bool = False,
+) -> None:
+    """Combine existing per-axiom prefix vectors to approximate the
+    composed capture (M_concat, M_avg, M_bind vs H composed vs E joint).
+    """
+    print(
+        f"combine-vectors test on {model} top={top_axiom} "
+        f"n_prefix_tokens={n_prefix_tokens} only_3plus={only_3plus}"
+    )
+    output = run_combine_vectors.remote(
+        model, n_prefix_tokens, composed_prefix_tokens, max_new, top_axiom, only_3plus
+    )
+    print(output)
+
+
 @app.local_entrypoint()
 def composed_axiom(
     model: str = "Qwen/Qwen2.5-32B",
