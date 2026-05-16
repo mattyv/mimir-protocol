@@ -30,7 +30,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
-from marker.axiom_signatures import apply_signatures
+from marker.historical.axiom_signatures import apply_signatures
 from marker.prefix_tuning import Prefix, generate_with_prefixes
 
 _BASE_NAMES = [

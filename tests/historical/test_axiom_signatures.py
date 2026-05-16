@@ -45,7 +45,7 @@ def _make_prefix_like(n_total_layers: int, n_kv_heads: int, head_dim: int, n_tok
 
 
 def test_signature_vector_shape():
-    from marker.axiom_signatures import signature_vector
+    from marker.historical.axiom_signatures import signature_vector
 
     sig = signature_vector("Flurgan_000", n_layers=4, n_kv_heads=2, head_dim=8)
     assert sig.shape == (4, 2, 8)
@@ -54,7 +54,7 @@ def test_signature_vector_shape():
 
 def test_signature_vector_deterministic():
     """Same name → identical fingerprint, always."""
-    from marker.axiom_signatures import signature_vector
+    from marker.historical.axiom_signatures import signature_vector
 
     a = signature_vector("Flurgan_000", n_layers=4, n_kv_heads=2, head_dim=8)
     b = signature_vector("Flurgan_000", n_layers=4, n_kv_heads=2, head_dim=8)
@@ -63,7 +63,7 @@ def test_signature_vector_deterministic():
 
 def test_signature_vector_axiom_specific():
     """Different names → different fingerprints."""
-    from marker.axiom_signatures import signature_vector
+    from marker.historical.axiom_signatures import signature_vector
 
     a = signature_vector("Flurgan_000", n_layers=4, n_kv_heads=2, head_dim=8)
     b = signature_vector("Boggin_001", n_layers=4, n_kv_heads=2, head_dim=8)
@@ -74,7 +74,7 @@ def test_signature_vector_unit_norm_per_layer_per_head():
     """Each (layer, head) signature is a unit vector — magnitude scaling
     is applied externally in `apply_signatures`. Keeps the contract
     clean and lets the demo sweep magnitudes."""
-    from marker.axiom_signatures import signature_vector
+    from marker.historical.axiom_signatures import signature_vector
 
     sig = signature_vector("Flurgan_000", n_layers=4, n_kv_heads=2, head_dim=8)
     norms = sig.norm(dim=-1)  # (n_layers, n_kv_heads)
@@ -86,7 +86,7 @@ def test_signature_vector_unit_norm_per_layer_per_head():
 
 def test_apply_signatures_zero_magnitude_is_noop():
     """magnitude=0 must leave K (and V) byte-identical."""
-    from marker.axiom_signatures import apply_signatures
+    from marker.historical.axiom_signatures import apply_signatures
 
     p = _make_prefix_like(n_total_layers=4, n_kv_heads=2, head_dim=8, n_tokens=6)
     k_before = [k.clone() for k in p.keys]
@@ -100,7 +100,7 @@ def test_apply_signatures_zero_magnitude_is_noop():
 
 def test_apply_signatures_only_modifies_K():
     """V is byte-identical before and after; K differs."""
-    from marker.axiom_signatures import apply_signatures
+    from marker.historical.axiom_signatures import apply_signatures
 
     p = _make_prefix_like(n_total_layers=4, n_kv_heads=2, head_dim=8, n_tokens=6)
     v_before = [v.clone() for v in p.values]
@@ -113,7 +113,7 @@ def test_apply_signatures_only_modifies_K():
 
 def test_apply_signatures_per_axiom_distinct_offset():
     """Two axioms with different names get different K offsets."""
-    from marker.axiom_signatures import apply_signatures
+    from marker.historical.axiom_signatures import apply_signatures
 
     p1 = _make_prefix_like(n_total_layers=4, n_kv_heads=2, head_dim=8, n_tokens=6)
     p2 = _make_prefix_like(n_total_layers=4, n_kv_heads=2, head_dim=8, n_tokens=6)
@@ -129,7 +129,7 @@ def test_apply_signatures_per_axiom_distinct_offset():
 def test_apply_signatures_same_name_same_offset():
     """Two prefixes given the SAME name get the SAME K offset (idempotent
     per-name)."""
-    from marker.axiom_signatures import apply_signatures
+    from marker.historical.axiom_signatures import apply_signatures
 
     p1 = _make_prefix_like(n_total_layers=4, n_kv_heads=2, head_dim=8, n_tokens=6)
     p2 = _make_prefix_like(n_total_layers=4, n_kv_heads=2, head_dim=8, n_tokens=6)
@@ -142,7 +142,7 @@ def test_apply_signatures_same_name_same_offset():
 
 def test_apply_signatures_magnitude_controls_size():
     """Doubling magnitude doubles the offset added to K."""
-    from marker.axiom_signatures import apply_signatures
+    from marker.historical.axiom_signatures import apply_signatures
 
     p_orig = _make_prefix_like(n_total_layers=2, n_kv_heads=2, head_dim=8, n_tokens=4)
     p_a = _make_prefix_like(n_total_layers=2, n_kv_heads=2, head_dim=8, n_tokens=4)
@@ -160,7 +160,7 @@ def test_apply_signatures_magnitude_controls_size():
 
 def test_apply_signatures_returns_new_objects():
     """Inputs must not be mutated."""
-    from marker.axiom_signatures import apply_signatures
+    from marker.historical.axiom_signatures import apply_signatures
 
     p = _make_prefix_like(n_total_layers=2, n_kv_heads=2, head_dim=8, n_tokens=4)
     k_before = [k.clone() for k in p.keys]
