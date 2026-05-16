@@ -494,6 +494,61 @@ def run_composed_axiom(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_axiom_signatures(
+    model_name: str,
+    n_prefix_tokens: int,
+    max_new: int,
+    n_values: str = "4,8,16,32",
+    magnitudes: str = "0.05,0.1,0.25,0.5,1.0",
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_axiom_signatures_demo",
+        "--model-name",
+        model_name,
+        "--n-prefix-tokens",
+        str(n_prefix_tokens),
+        "--max-new",
+        str(max_new),
+        "--n-values",
+        *n_values.split(","),
+        "--magnitudes",
+        *magnitudes.split(","),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_axiom_signatures_demo import main as sig_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        sig_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def axiom_signatures(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_prefix_tokens: int = 64,
+    max_new: int = 400,
+    n_values: str = "4,8,16,32",
+    magnitudes: str = "0.05,0.1,0.25,0.5,1.0",
+) -> None:
+    """Path 3: per-axiom K-vector fingerprints on the quadratic sweep."""
+    print(f"axiom-signatures on {model} n_values={n_values} magnitudes={magnitudes}")
+    output = run_axiom_signatures.remote(model, n_prefix_tokens, max_new, n_values, magnitudes)
+    print(output)
+
+
 @app.local_entrypoint()
 def composed_axiom(
     model: str = "Qwen/Qwen2.5-32B",
