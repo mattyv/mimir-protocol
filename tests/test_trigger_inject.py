@@ -115,7 +115,9 @@ def test_generate_alpha_zero_matches_unhooked_model(small_runner) -> None:  # no
     inj.alpha = 0.0
     hook_text = inj.generate(prompt, max_new_tokens=10)
 
-    assert hook_text == baseline_text, f"α=0 must be a no-op:\n  hook: {hook_text!r}\n  base: {baseline_text!r}"
+    assert hook_text == baseline_text, (
+        f"α=0 must be a no-op:\n  hook: {hook_text!r}\n  base: {baseline_text!r}"
+    )
 
 
 def test_generate_alpha_zero_is_deterministic(small_runner) -> None:  # noqa: ANN001

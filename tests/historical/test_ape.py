@@ -51,7 +51,7 @@ def test_q_scale_hook_no_op_at_one(tiny_model):
     """q_scale=1.0 must produce byte-identical logits to vanilla forward."""
     from transformers.cache_utils import DynamicCache
 
-    from marker.ape import install_q_scale_hook
+    from marker.historical.ape import install_q_scale_hook
 
     model, tok = tiny_model
     ids = tok("Hello world test sentence here.", return_tensors="pt", add_special_tokens=False)
@@ -80,7 +80,7 @@ def test_q_scale_hook_changes_logits(tiny_model):
     """
     from transformers.cache_utils import DynamicCache
 
-    from marker.ape import install_q_scale_hook
+    from marker.historical.ape import install_q_scale_hook
 
     model, tok = tiny_model
     ids = tok("Hello world test sentence here.", return_tensors="pt", add_special_tokens=False)
@@ -101,7 +101,7 @@ def test_q_scale_hook_changes_logits(tiny_model):
 
 def test_q_scale_hook_does_not_change_weights(tiny_model):
     """Hook installation/removal must leave model weights byte-identical."""
-    from marker.ape import install_q_scale_hook
+    from marker.historical.ape import install_q_scale_hook
 
     model, _ = tiny_model
     before = _state_checksum(model)
@@ -119,7 +119,7 @@ def test_generate_with_ape_runs_three_prefix(tiny_model):
     """Sanity rail: tiny model, 3 axioms, APE active → produces output
     without crashing. Numerical correctness is the demo's job.
     """
-    from marker.ape import generate_with_ape
+    from marker.historical.ape import generate_with_ape
     from marker.prefix_tuning import Prefix
 
     model, tok = tiny_model
@@ -149,7 +149,7 @@ def test_generate_with_ape_q_scale_one_matches_no_shared_prefix(tiny_model):
     """When q_scale=1.0 AND shared_prefix_text="" (empty), APE must equal
     the existing generate_with_prefixes output exactly.
     """
-    from marker.ape import generate_with_ape
+    from marker.historical.ape import generate_with_ape
     from marker.prefix_tuning import Prefix, generate_with_prefixes
 
     model, tok = tiny_model

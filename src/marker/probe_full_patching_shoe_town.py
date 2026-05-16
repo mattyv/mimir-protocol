@@ -21,7 +21,6 @@ import torch
 
 from marker.run_injection import QwenInjector
 
-
 # Both prompts end with the SAME suffix so the "last position" is
 # semantically equivalent in each. Using a question that primes a
 # concept answer about shoe_town.

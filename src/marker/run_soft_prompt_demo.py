@@ -62,7 +62,11 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.manual_seed(0)
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else ("mps" if torch.backends.mps.is_available() else "cpu")
+    )
     print(f"device: {device}\n")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -79,12 +83,16 @@ def main() -> None:
     # tokenizes differently with vs without leading space)
     sp = SoftPrompt.from_term(model, tokenizer, term=" Balance Publisher")
 
-    print(f"=== training soft prompt for ' Balance Publisher' ({args.n_steps} steps, lr={args.lr}) ===")
+    print(
+        f"=== training soft prompt for ' Balance Publisher' ({args.n_steps} steps, lr={args.lr}) ==="
+    )
     t0 = time.time()
     losses = train_soft_prompt(model, tokenizer, sp, intended, n_steps=args.n_steps, lr=args.lr)
     elapsed = time.time() - t0
     print(f"  training time: {elapsed:.1f}s")
-    print(f"  loss[0]={losses[0]:.4f}  loss[-1]={losses[-1]:.4f}  delta={losses[0] - losses[-1]:+.4f}")
+    print(
+        f"  loss[0]={losses[0]:.4f}  loss[-1]={losses[-1]:.4f}  delta={losses[0] - losses[-1]:+.4f}"
+    )
     print(f"  ||vector|| start≈init  end={sp.vector.norm().item():.2f}\n")
 
     print("=" * 78)

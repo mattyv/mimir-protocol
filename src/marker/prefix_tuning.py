@@ -330,43 +330,22 @@ def generate_with_prefixes(
     prefixes: list[Prefix],
     max_new: int = 60,
     rope_correct: bool = True,
-    selective_recompute: bool = False,
-    selective_top_k_pct: float = 0.15,
-    selective_layer: int = 1,
 ) -> str:
     """Greedy decode with multiple prefixes' K/V concatenated.
 
     `rope_correct=True` re-rotates each non-first prefix's K vectors so
     their phases match their cache-slot positions (fixes multi-prefix
     concatenation interference).
-
-    `selective_recompute=True` activates CacheBlend-style patching of
-    the most-deviant cached positions when len(prefixes) >= 3. Requires
-    each Prefix to have `source_ids` set (via `Prefix.from_description`).
     """
     device = next(model.parameters()).device
     dtype = _model_dtype(model)
     rope_theta = _get_rope_theta(model)
     ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-    if prefixes and selective_recompute and len(prefixes) >= 3:
-        from marker.selective_recompute import blend_prefixes
-
-        cache = blend_prefixes(
-            model=model,
-            prefixes=prefixes,
-            rope_corrected=rope_correct,
-            selective_recompute=True,
-            top_k_pct=selective_top_k_pct,
-            layer_for_deviation=selective_layer,
-        )
-    else:
-        cache = (
-            combined_cache(
-                prefixes, dtype, device, rope_theta=rope_theta, rope_correct=rope_correct
-            )
-            if prefixes
-            else DynamicCache()
-        )
+    cache = (
+        combined_cache(prefixes, dtype, device, rope_theta=rope_theta, rope_correct=rope_correct)
+        if prefixes
+        else DynamicCache()
+    )
     out = model(ids, past_key_values=cache, use_cache=True)
     past = out.past_key_values
     nxt = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)

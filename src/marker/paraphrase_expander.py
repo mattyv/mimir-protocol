@@ -88,9 +88,7 @@ def generate_paraphrases_batched(  # noqa: ANN201
         # Build a batch of distinct prompts (different seed samples)
         prompts: list[str] = []
         for _ in range(batch_size):
-            chosen = rng.sample(
-                seed_paraphrases, k=min(n_few_shot, len(seed_paraphrases))
-            )
+            chosen = rng.sample(seed_paraphrases, k=min(n_few_shot, len(seed_paraphrases)))
             p = f"Here are sentences that use the term '{term}':\n"
             for i, s in enumerate(chosen, start=1):
                 p += f"{i}. {s}\n"

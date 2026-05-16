@@ -29,8 +29,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
-from marker.ape import generate_with_ape
 from marker.axiom_registry import AXIOMS, CHAIN_AXIOMS
+from marker.historical.ape import generate_with_ape
 from marker.prefix_tuning import Prefix, generate_with_prefixes
 from marker.run_chain_demo import CPP_PROMPTS, SERVICE_PROMPTS
 

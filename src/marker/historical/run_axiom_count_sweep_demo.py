@@ -27,7 +27,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
-from marker.ape import generate_with_ape
+from marker.historical.ape import generate_with_ape
 from marker.prefix_tuning import Prefix, generate_with_prefixes
 
 # A distinct namespace of made-up base names that the model has never seen.

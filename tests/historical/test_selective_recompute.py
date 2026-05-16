@@ -23,7 +23,7 @@ def _make_k(seed: int, shape: tuple[int, ...]) -> torch.Tensor:
 
 def test_deviation_indices_correct_count():
     """top_k_pct=0.25 of 32 positions => 8 indices."""
-    from marker.selective_recompute import _deviation_indices
+    from marker.historical.selective_recompute import _deviation_indices
 
     cached = _make_k(0, (1, 8, 32, 64))
     joint = _make_k(1, (1, 8, 32, 64))
@@ -36,7 +36,7 @@ def test_deviation_indices_correct_count():
 def test_deviation_indices_picks_perturbed_positions():
     """When only positions {5, 10, 15} differ between cached and joint K,
     those three must be in the top-3 most-deviant indices."""
-    from marker.selective_recompute import _deviation_indices
+    from marker.historical.selective_recompute import _deviation_indices
 
     cached = _make_k(42, (1, 8, 32, 64))
     joint = cached.clone()
@@ -51,7 +51,7 @@ def test_deviation_indices_picks_perturbed_positions():
 def test_deviation_indices_no_op_when_identical():
     """When cached == joint, the L2 diff is zero everywhere; the function
     should still return the requested count of indices (any indices)."""
-    from marker.selective_recompute import _deviation_indices
+    from marker.historical.selective_recompute import _deviation_indices
 
     k = _make_k(7, (1, 4, 16, 32))
     out = _deviation_indices(k, k.clone(), top_k_pct=0.25)
@@ -80,7 +80,7 @@ def test_recompute_writes_only_flagged_positions(tiny_model):
     K/V at flagged positions must change."""
     from transformers import DynamicCache
 
-    from marker.selective_recompute import selective_recompute_prefix_cache
+    from marker.historical.selective_recompute import selective_recompute_prefix_cache
 
     model, tok = tiny_model
     device = next(model.parameters()).device
@@ -130,7 +130,7 @@ def test_recompute_all_positions_matches_vanilla(tiny_model):
     If this fails, the custom forward path is broken."""
     from transformers import DynamicCache
 
-    from marker.selective_recompute import selective_recompute_prefix_cache
+    from marker.historical.selective_recompute import selective_recompute_prefix_cache
 
     model, tok = tiny_model
     device = next(model.parameters()).device
@@ -175,8 +175,8 @@ def test_blend_prefixes_sanity_three_prefix_decode(tiny_model):
     """Sanity rail: tiny model + 3 prefixes + selective recompute should
     decode at least one non-EOS token (i.e. not crash, not immediately
     terminate). Numerical correctness is the demo's job, not this test."""
+    from marker.historical.selective_recompute import blend_prefixes
     from marker.prefix_tuning import Prefix
-    from marker.selective_recompute import blend_prefixes
 
     model, tok = tiny_model
 

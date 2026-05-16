@@ -34,12 +34,12 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
-from marker.ape import generate_with_ape
 from marker.axiom_registry import (
     HIERARCHICAL_AXIOMS,
     HIERARCHICAL_KNOWN_ENTITIES,
 )
-from marker.per_block_attention import generate_with_per_block
+from marker.historical.ape import generate_with_ape
+from marker.historical.per_block_attention import generate_with_per_block
 from marker.prefix_tuning import Prefix, generate_with_prefixes
 
 # Hierarchical prompts probing the DAG at increasing depth.

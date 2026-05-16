@@ -31,6 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 from marker.axiom_registry import HIERARCHICAL_AXIOMS, composed_description
+from marker.historical.run_chain_ape_recursive_demo import HIERARCHY_PROMPTS, hallucination_flags
 from marker.prefix_tuning import (
     Prefix,
     _get_rope_theta,
@@ -38,7 +39,6 @@ from marker.prefix_tuning import (
     combined_cache,
     generate_with_prefixes,
 )
-from marker.run_chain_ape_recursive_demo import HIERARCHY_PROMPTS, hallucination_flags
 
 
 @torch.no_grad()

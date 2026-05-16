@@ -20,6 +20,7 @@ fallback), we ship H as the default and drop APE / per-block / etc.
 from __future__ import annotations
 
 import argparse
+import re
 import time
 
 import torch
@@ -28,10 +29,66 @@ from transformers.cache_utils import DynamicCache
 
 from marker.axiom_registry import (
     HIERARCHICAL_AXIOMS,
+    HIERARCHICAL_KNOWN_ENTITIES,
     composed_description,
 )
 from marker.prefix_tuning import Prefix, generate_with_prefixes
-from marker.run_chain_ape_recursive_demo import HIERARCHY_PROMPTS, hallucination_flags
+
+# Hierarchy prompts probing the DAG at increasing depth (inlined from
+# the now-historical run_chain_ape_recursive_demo for self-containedness).
+HIERARCHY_PROMPTS: list[tuple[list[str], str]] = [
+    (["event_log"], "What does EventLog store and how is it partitioned?"),
+    (
+        ["event_log", "feature_store"],
+        "How does FeatureStore know about new user events?",
+    ),
+    (
+        ["event_log", "kafka_router", "model_server"],
+        "ModelServer needs the current serving model. Walk through how it "
+        "ends up there starting from a raw user click.",
+    ),
+    (
+        ["event_log", "kafka_router", "feature_store", "model_server", "data_pipeline"],
+        "Walk through DataPipeline end-to-end: a user click happens, what "
+        "components see it and in what order, until ModelServer can use it?",
+    ),
+    (
+        ["event_log", "kafka_router", "feature_store", "model_server", "data_pipeline"],
+        "If EventLog is corrupted and stops accepting writes, which "
+        "components in DataPipeline still work and which fail? Be specific "
+        "about what each one depends on.",
+    ),
+    (
+        ["event_log", "kafka_router", "feature_store", "model_server", "data_pipeline"],
+        "What is DataPipeline's end-to-end SLA, and where does that number come from?",
+    ),
+    (
+        ["event_log", "kafka_router", "feature_store", "model_server", "data_pipeline"],
+        "A user has never been seen before, so FeatureStore has no key for "
+        "them. What happens when ModelServer gets a request for that user?",
+    ),
+]
+
+
+_NAMED_ENTITY_RE = re.compile(
+    r"\b(?:[A-Z][a-z]+){2,}\b"
+    r"|\bevents\.[a-z]+\b"
+    r"|\bfeat:\{?[a-z_]+\}?\b"
+)
+
+
+def hallucination_flags(text: str) -> tuple[int, list[str]]:
+    """Return (count, list of unique flagged tokens) — entities in `text`
+    that are NOT in HIERARCHICAL_KNOWN_ENTITIES."""
+    matches = _NAMED_ENTITY_RE.findall(text)
+    seen: set[str] = set()
+    flagged: list[str] = []
+    for m in matches:
+        if m in HIERARCHICAL_KNOWN_ENTITIES or m in seen:
+            continue
+        seen.add(m)
+        flagged.append(m)
+    return len(flagged), flagged
 
 
 @torch.no_grad()

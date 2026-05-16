@@ -45,7 +45,7 @@ def test_per_block_sdpa_single_block_matches_vanilla():
     """One block spanning the whole sequence must equal F.scaled_dot_product_attention."""
     import torch.nn.functional as F  # noqa: N812
 
-    from marker.per_block_attention import per_block_sdpa
+    from marker.historical.per_block_attention import per_block_sdpa
 
     torch.manual_seed(0)
     B, H, Lq, Lk, D = 1, 4, 3, 16, 32
@@ -63,7 +63,7 @@ def test_per_block_sdpa_uniform_two_blocks_matches_average_of_partial_attentions
     (attn_over_block1 + attn_over_block2) / 2."""
     import torch.nn.functional as F  # noqa: N812
 
-    from marker.per_block_attention import per_block_sdpa
+    from marker.historical.per_block_attention import per_block_sdpa
 
     torch.manual_seed(1)
     B, H, Lq, D = 1, 2, 2, 8
@@ -89,7 +89,7 @@ def test_per_block_sdpa_lse_combiner_recovers_vanilla():
     """
     import torch.nn.functional as F  # noqa: N812
 
-    from marker.per_block_attention import per_block_sdpa
+    from marker.historical.per_block_attention import per_block_sdpa
 
     torch.manual_seed(2)
     B, H, Lq, D = 1, 2, 2, 8
@@ -110,7 +110,7 @@ def test_per_block_sdpa_uniform_differs_from_vanilla():
     intervention is doing something)."""
     import torch.nn.functional as F  # noqa: N812
 
-    from marker.per_block_attention import per_block_sdpa
+    from marker.historical.per_block_attention import per_block_sdpa
 
     torch.manual_seed(3)
     B, H, Lq, D = 1, 2, 2, 8
@@ -132,7 +132,7 @@ def test_install_no_op_at_one_block(tiny_model):
     full key length must produce identical logits to vanilla forward."""
     from transformers.cache_utils import DynamicCache
 
-    from marker.per_block_attention import (
+    from marker.historical.per_block_attention import (
         install_per_block_attention,
         set_block_boundaries,
     )
@@ -160,7 +160,7 @@ def test_install_no_op_at_one_block(tiny_model):
 
 def test_install_does_not_change_weights(tiny_model):
     """Install / uninstall must leave model state_dict byte-identical."""
-    from marker.per_block_attention import (
+    from marker.historical.per_block_attention import (
         install_per_block_attention,
         set_block_boundaries,
     )
@@ -176,7 +176,7 @@ def test_install_does_not_change_weights(tiny_model):
 
 def test_install_runs_5_block_decode(tiny_model):
     """Sanity rail: installing with 5 blocks and decoding should not crash."""
-    from marker.per_block_attention import generate_with_per_block
+    from marker.historical.per_block_attention import generate_with_per_block
     from marker.prefix_tuning import Prefix
 
     model, tok = tiny_model

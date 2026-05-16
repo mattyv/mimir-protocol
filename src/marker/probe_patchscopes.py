@@ -43,7 +43,7 @@ from marker.run_logit_bias_decode import (
 # describe a token. The placeholder " X" is where we patch v.
 EXPLAIN_PROMPTS = [
     'The word "apple" means "fruit". The word " X" means "',
-    'cat → animal\nrose → flower\nhammer → tool\n X →',
+    "cat → animal\nrose → flower\nhammer → tool\n X →",
     "I will define this concept in one word. The concept X is best described as",
 ]
 

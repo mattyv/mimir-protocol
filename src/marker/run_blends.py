@@ -196,7 +196,10 @@ def main() -> None:
         "--iti-alpha", type=float, default=None, help="override ITI head alpha (default 2.0)"
     )
     parser.add_argument(
-        "--layer-alpha", type=float, default=None, help="override layer-injection alpha (default 0.7)"
+        "--layer-alpha",
+        type=float,
+        default=None,
+        help="override layer-injection alpha (default 0.7)",
     )
     parser.add_argument(
         "--quote-axiom",
@@ -298,7 +301,11 @@ def main() -> None:
 
         axiom_term = "Balance Publisher" if axiom == "bp" else "shoe_town"
         for raw_prompt in cfg["prompts"]:
-            if args.quote_axiom and axiom_term in raw_prompt and f'"{axiom_term}"' not in raw_prompt:
+            if (
+                args.quote_axiom
+                and axiom_term in raw_prompt
+                and f'"{axiom_term}"' not in raw_prompt
+            ):
                 prompt = raw_prompt.replace(axiom_term, f'"{axiom_term}"')
             else:
                 prompt = raw_prompt

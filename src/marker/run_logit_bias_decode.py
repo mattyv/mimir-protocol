@@ -38,9 +38,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def compute_logit_bias(
-    lm_head_weight: torch.Tensor, v: np.ndarray, alpha: float
-) -> torch.Tensor:
+def compute_logit_bias(lm_head_weight: torch.Tensor, v: np.ndarray, alpha: float) -> torch.Tensor:
     """bias[t] = alpha * (W_U[t] · v).  Shape: [vocab]."""
     weight = lm_head_weight.detach().to(torch.float32).cpu()
     v_t = torch.tensor(v, dtype=torch.float32)
@@ -239,15 +237,11 @@ def run_axiom(
     intended = _load_paraphrases(intended_path)
     lexical = _load_paraphrases(lexical_path) if lexical_path.exists() else None
 
-    v_int = capture_concept_completion_residual(
-        model, tokenizer, intended, continuations, layer
-    )
+    v_int = capture_concept_completion_residual(model, tokenizer, intended, continuations, layer)
     print(f"  v_intended (L{layer}, concept-completion): norm {np.linalg.norm(v_int):.2f}")
 
     if lexical is not None and not no_contrastive:
-        v_lex = capture_concept_completion_residual(
-            model, tokenizer, lexical, continuations, layer
-        )
+        v_lex = capture_concept_completion_residual(model, tokenizer, lexical, continuations, layer)
         v_axiom = v_int - v_lex
         print(f"  v_lexical: norm {np.linalg.norm(v_lex):.2f}")
         print(f"  v_axiom = intended - lexical: norm {np.linalg.norm(v_axiom):.2f}")
