@@ -142,6 +142,72 @@ def _find_term_positions(tokenizer, text: str, term_token_ids: list[int]) -> lis
     return []
 
 
+def train_soft_prompt_qa(
+    model,  # noqa: ANN001
+    tokenizer,
+    soft_prompt: SoftPrompt,
+    qa_pairs: list[tuple[str, str]],
+    n_steps: int = 200,
+    lr: float = 0.05,
+    template: str = "Q: {q}\nA: {a}",
+) -> list[float]:
+    """Q+A training for soft prompt (term-position replacement at L0).
+
+    At each step samples one (Q, A) pair, formats as `template`, finds
+    the soft prompt term's positions in the full text, installs the
+    embedding-replacement hook at those positions, computes loss only
+    on the answer tokens, and backprops only into `soft_prompt.vector`.
+
+    Returns per-step loss list. Frozen model.
+    """
+    import random
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+        p.grad = None
+
+    device = next(model.parameters()).device
+    soft_prompt.vector = nn.Parameter(
+        soft_prompt.vector.data.to(device=device, dtype=torch.float32).clone()
+    )
+    optim = torch.optim.AdamW([soft_prompt.vector], lr=lr)
+
+    samples: list[tuple[torch.Tensor, torch.Tensor, list[int]]] = []
+    for q, a in qa_pairs:
+        question_part = template.split("{a}")[0].format(q=q)
+        full_text = template.format(q=q, a=a)
+        q_ids = tokenizer(question_part, add_special_tokens=False).input_ids
+        full_ids = tokenizer(full_text, add_special_tokens=False).input_ids
+        positions = find_term_positions(tokenizer, full_text, soft_prompt.term)
+        if not positions:
+            positions = _find_term_positions(tokenizer, full_text, soft_prompt.term_token_ids)
+        if not positions:
+            continue
+        input_ids = torch.tensor([full_ids], device=device)
+        labels = torch.full_like(input_ids, -100)
+        labels[0, len(q_ids) :] = input_ids[0, len(q_ids) :]
+        samples.append((input_ids, labels, positions))
+
+    if not samples:
+        raise RuntimeError(f"no Q+A pairs contained term {soft_prompt.term!r}")
+
+    rng = random.Random(0)
+    losses: list[float] = []
+    for _ in range(n_steps):
+        input_ids, labels, positions = samples[rng.randrange(len(samples))]
+        handle = install_soft_prompt_hook(model, soft_prompt, positions)
+        try:
+            optim.zero_grad()
+            out = model(input_ids, labels=labels)
+            loss = out.loss
+            loss.backward()
+            optim.step()
+            losses.append(float(loss.detach().cpu().item()))
+        finally:
+            handle.remove()
+    return losses
+
+
 def wrap_chat(tokenizer, term: str, paraphrase: str) -> tuple[str, int]:  # noqa: ANN001
     """Wrap a paraphrase as a chat turn for IT-model training. Returns
     (chat_formatted_text, char_index_where_assistant_response_starts).

@@ -538,6 +538,59 @@ def run_slot_axiom_qa(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_soft_prompt_qa(
+    model_name: str,
+    n_steps: int = 400,
+    lr: float = 0.05,
+    max_new: int = 80,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_soft_prompt_qa_demo",
+        "--model-name",
+        model_name,
+        "--n-steps",
+        str(n_steps),
+        "--lr",
+        str(lr),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_soft_prompt_qa_demo import main as sp_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        sp_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def soft_prompt_qa(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_steps: int = 400,
+    lr: float = 0.05,
+    max_new: int = 80,
+) -> None:
+    """Term-position-at-L0 soft prompt, trained on Q+A pairs.
+    Compare against slot_axiom_qa: same training data, different
+    injection location."""
+    print(f"soft-prompt QA on {model} steps={n_steps} lr={lr}")
+    output = run_soft_prompt_qa.remote(model, n_steps, lr, max_new)
+    print(output)
+
+
 @app.local_entrypoint()
 def slot_axiom_qa(
     model: str = "Qwen/Qwen2.5-32B",
