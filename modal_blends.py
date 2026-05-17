@@ -455,6 +455,69 @@ def run_chain(
     timeout=60 * 90,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
+def run_slot_axiom(
+    model_name: str,
+    slot_widths: str = "256,512,1024",
+    target_layer_frac: float = 0.5,
+    n_steps: int = 300,
+    lr: float = 0.05,
+    max_new: int = 80,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_slot_axiom_demo",
+        "--model-name",
+        model_name,
+        "--slot-widths",
+        *slot_widths.split(","),
+        "--target-layer-frac",
+        str(target_layer_frac),
+        "--n-steps",
+        str(n_steps),
+        "--lr",
+        str(lr),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_slot_axiom_demo import main as slot_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        slot_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def slot_axiom(
+    model: str = "Qwen/Qwen2.5-32B",
+    slot_widths: str = "256,512,1024",
+    target_layer_frac: float = 0.5,
+    n_steps: int = 300,
+    lr: float = 0.05,
+    max_new: int = 80,
+) -> None:
+    """Per-axiom slot training: gradient-train a slot vector to make the
+    model reproduce an axiom's description, then probe with questions."""
+    print(
+        f"slot-axiom test on {model} slot_widths={slot_widths} "
+        f"layer_frac={target_layer_frac} steps={n_steps} lr={lr}"
+    )
+    output = run_slot_axiom.remote(model, slot_widths, target_layer_frac, n_steps, lr, max_new)
+    print(output)
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
 def run_composed_axiom(
     model_name: str,
     n_prefix_tokens: int,
