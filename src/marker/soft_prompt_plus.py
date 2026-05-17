@@ -198,6 +198,95 @@ def train_soft_prompt_plus_qa_v4(
     return losses
 
 
+def train_soft_prompt_plus_qa_v5(
+    model,  # noqa: ANN001
+    tokenizer,
+    sp: SoftPromptPlus,
+    qa_pairs: list[tuple[str, str]],
+    n_steps: int = 3500,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    append_eos: bool = True,
+    norm_anchor_lambda: float = 0.01,
+    template: str = "Q: {q}\nA: {a}",
+) -> tuple[list[float], list[float]]:
+    """v5: v4 + L2-norm anchoring to natural embedding magnitude.
+
+    Adds a regularization term to keep each trained row's L2 norm
+    close to the average L2 norm of the model's vocabulary embeddings.
+    This keeps the trained vector closer to the natural embedding
+    manifold so the model's Wq/Wk produce more in-distribution Q/K.
+
+    `norm_anchor_lambda` controls strength. Set to 0 to disable.
+
+    Returns (model_losses, norm_losses) — both per-step.
+    """
+    import random
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+        p.grad = None
+
+    device = next(model.parameters()).device
+    sp.vector = nn.Parameter(sp.vector.data.to(device=device, dtype=torch.float32).clone())
+    optim = torch.optim.AdamW([sp.vector], lr=lr_start)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=n_steps, eta_min=lr_end)
+
+    # Compute the natural-embedding L2 norm target from the vocab.
+    embed = _get_embed_module(model)
+    with torch.no_grad():
+        natural_norm = float(embed.weight.detach().float().norm(dim=-1).mean().cpu().item())
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else None
+
+    samples: list[tuple[torch.Tensor, torch.Tensor, list[int]]] = []
+    for q, a in qa_pairs:
+        question_part = template.split("{a}")[0].format(q=q)
+        full_text = template.format(q=q, a=a)
+        ids_with_ghosts, positions = prepare_input_with_ghosts(tokenizer, full_text, sp, pad_id)
+        if not positions:
+            continue
+        q_ids_with_ghosts, _ = prepare_input_with_ghosts(tokenizer, question_part, sp, pad_id)
+        n_q = q_ids_with_ghosts.shape[1]
+
+        if append_eos and eos_id is not None:
+            ids_with_ghosts = torch.cat(
+                [ids_with_ghosts, torch.tensor([[eos_id]], dtype=ids_with_ghosts.dtype)],
+                dim=1,
+            )
+        input_ids = ids_with_ghosts.to(device)
+        labels = torch.full_like(input_ids, -100)
+        labels[0, n_q:] = input_ids[0, n_q:]
+        samples.append((input_ids, labels, positions))
+
+    if not samples:
+        raise RuntimeError(f"no Q+A pairs contained term {sp.term!r}")
+
+    rng = random.Random(0)
+    model_losses: list[float] = []
+    norm_losses: list[float] = []
+    for _ in range(n_steps):
+        input_ids, labels, positions = samples[rng.randrange(len(samples))]
+        handle = install_soft_prompt_plus_hook(model, sp, positions)
+        try:
+            optim.zero_grad()
+            out = model(input_ids, labels=labels)
+            model_loss = out.loss
+            # Norm-anchor regularization on every row of sp.vector.
+            row_norms = sp.vector.norm(dim=-1)
+            norm_loss = (row_norms - natural_norm).pow(2).mean()
+            total = model_loss + norm_anchor_lambda * norm_loss
+            total.backward()
+            optim.step()
+            scheduler.step()
+            model_losses.append(float(model_loss.detach().cpu().item()))
+            norm_losses.append(float(norm_loss.detach().cpu().item()))
+        finally:
+            handle.remove()
+    return model_losses, norm_losses
+
+
 def train_soft_prompt_plus_qa(
     model,  # noqa: ANN001
     tokenizer,

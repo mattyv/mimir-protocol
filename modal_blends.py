@@ -702,6 +702,75 @@ def run_soft_prompt_plus_v4(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 180,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_soft_prompt_plus_v5(
+    model_name: str,
+    n_ghost: int = 8,
+    n_steps: int = 3500,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    norm_anchor_lambda: float = 0.01,
+    max_new: int = 120,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_soft_prompt_plus_v5_demo",
+        "--model-name",
+        model_name,
+        "--n-ghost",
+        str(n_ghost),
+        "--n-steps",
+        str(n_steps),
+        "--lr-start",
+        str(lr_start),
+        "--lr-end",
+        str(lr_end),
+        "--norm-anchor-lambda",
+        str(norm_anchor_lambda),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_soft_prompt_plus_v5_demo import main as v5_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        v5_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def soft_prompt_plus_v5(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_ghost: int = 8,
+    n_steps: int = 3500,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    norm_anchor_lambda: float = 0.01,
+    max_new: int = 120,
+) -> None:
+    """v4 + L2-norm anchor regularization to keep trained vector close
+    to natural embedding magnitudes."""
+    print(
+        f"soft-prompt+ v5 on {model} n_ghost={n_ghost} steps={n_steps} "
+        f"lr {lr_start} -> {lr_end} norm_lambda={norm_anchor_lambda}"
+    )
+    output = run_soft_prompt_plus_v5.remote(
+        model, n_ghost, n_steps, lr_start, lr_end, norm_anchor_lambda, max_new
+    )
+    print(output)
+
+
 @app.local_entrypoint()
 def soft_prompt_plus_v4(
     model: str = "Qwen/Qwen2.5-32B",
