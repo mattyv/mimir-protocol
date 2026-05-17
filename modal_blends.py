@@ -755,6 +755,100 @@ def run_soft_prompt_plus_v6(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="H100",
+    timeout=60 * 120,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_soft_prompt_plus_v7(
+    model_name: str,
+    n_ghost: int = 8,
+    n_steps: int = 2000,
+    batch_size: int = 4,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    norm_anchor_lambda: float = 0.01,
+    n_synthetic: int = 30,
+    synth_replication: int = 2,
+    boundary_keep: int = 12,
+    max_new: int = 120,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_soft_prompt_plus_v7_demo",
+        "--model-name",
+        model_name,
+        "--n-ghost",
+        str(n_ghost),
+        "--n-steps",
+        str(n_steps),
+        "--batch-size",
+        str(batch_size),
+        "--lr-start",
+        str(lr_start),
+        "--lr-end",
+        str(lr_end),
+        "--norm-anchor-lambda",
+        str(norm_anchor_lambda),
+        "--n-synthetic",
+        str(n_synthetic),
+        "--synth-replication",
+        str(synth_replication),
+        "--boundary-keep",
+        str(boundary_keep),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_soft_prompt_plus_v7_demo import main as v7_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        v7_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def soft_prompt_plus_v7(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_ghost: int = 8,
+    n_steps: int = 2000,
+    batch_size: int = 4,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    norm_anchor_lambda: float = 0.01,
+    n_synthetic: int = 30,
+    synth_replication: int = 2,
+    boundary_keep: int = 12,
+    max_new: int = 120,
+) -> None:
+    """v6 + teacher-distilled Q+A pairs (teacher = model + full prefix)."""
+    print(
+        f"soft-prompt+ v7 on {model} bs={batch_size} steps={n_steps} "
+        f"n_synth={n_synthetic} boundary_keep={boundary_keep}"
+    )
+    output = run_soft_prompt_plus_v7.remote(
+        model,
+        n_ghost,
+        n_steps,
+        batch_size,
+        lr_start,
+        lr_end,
+        norm_anchor_lambda,
+        n_synthetic,
+        synth_replication,
+        boundary_keep,
+        max_new,
+    )
+    print(output)
+
+
 @app.local_entrypoint()
 def soft_prompt_plus_v6(
     model: str = "Qwen/Qwen2.5-32B",

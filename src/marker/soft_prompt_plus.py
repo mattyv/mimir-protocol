@@ -414,6 +414,54 @@ def train_soft_prompt_plus_qa_v6_batched(
     return model_losses, norm_losses
 
 
+_SYNTH_QA_INSTRUCTION = (
+    "Read the following description and generate {n} question-answer pairs "
+    "that test understanding of it. Cover all the facts mentioned. Use diverse "
+    "phrasings for the questions. Use this exact format:\n\n"
+    "1. Q: <question>\n   A: <answer>\n\n"
+    "2. Q: <question>\n   A: <answer>\n\n"
+    "...and so on.\n\n"
+    "Description: {description}\n\n"
+    "Question-answer pairs:\n\n"
+)
+
+
+@torch.no_grad()
+def generate_synthetic_qa_pairs(
+    model,  # noqa: ANN001
+    tokenizer,
+    description: str,
+    prefix,  # marker.prefix_tuning.Prefix  # noqa: ANN001
+    n_pairs: int = 30,
+    max_new: int = 2000,
+) -> list[tuple[str, str]]:
+    """Use the model (with the full prefix loaded) to synthesize Q+A
+    pairs about the description. Distillation-flavored: the teacher
+    generates training data the student will learn from.
+
+    Returns parsed (question, answer) pairs.
+    """
+    import re
+
+    from marker.prefix_tuning import generate_with_prefixes
+
+    instruction = _SYNTH_QA_INSTRUCTION.format(n=n_pairs, description=description)
+    text = generate_with_prefixes(model, tokenizer, instruction, [prefix], max_new=max_new)
+
+    # Parse "Q: ... A: ..." patterns.
+    pattern = re.compile(
+        r"(?:^|\n)\s*\d*[.)]?\s*Q\s*:\s*(?P<q>[^\n]+?)\s*\n\s*A\s*:\s*(?P<a>[^\n]+(?:\n(?!\s*\d*[.)]?\s*Q\s*:)[^\n]+)*)",
+        re.MULTILINE,
+    )
+    pairs: list[tuple[str, str]] = []
+    for m in pattern.finditer(text):
+        q = m.group("q").strip()
+        a = m.group("a").strip().split("\n")[0].strip()  # take first line of multi-line answers
+        if q and a:
+            pairs.append((q, a))
+    return pairs
+
+
 def train_soft_prompt_plus_qa(
     model,  # noqa: ANN001
     tokenizer,
