@@ -814,6 +814,76 @@ def run_soft_prompt_plus_v7(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="H100",
+    timeout=60 * 120,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_soft_prompt_slots(
+    model_name: str,
+    n_steps: int = 2500,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    boundary_slots: int = 3,
+    no_train_term: bool = False,
+    max_new: int = 120,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_soft_prompt_slots_demo",
+        "--model-name",
+        model_name,
+        "--n-steps",
+        str(n_steps),
+        "--lr-start",
+        str(lr_start),
+        "--lr-end",
+        str(lr_end),
+        "--boundary-slots",
+        str(boundary_slots),
+        "--max-new",
+        str(max_new),
+    ]
+    if no_train_term:
+        sys.argv.append("--no-train-term")
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_soft_prompt_slots_demo import main as slots_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        slots_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def soft_prompt_slots(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_steps: int = 2500,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    boundary_slots: int = 3,
+    no_train_term: bool = False,
+    max_new: int = 120,
+) -> None:
+    """v9: slot-assigned soft prompts. Each ghost slot has one Q+A role,
+    initialized from informative tokens of its answer, trained via
+    gradient-masked updates (only the assigned slot updates per step)."""
+    print(
+        f"soft-prompt slots on {model} steps={n_steps} "
+        f"boundary_slots={boundary_slots} no_train_term={no_train_term}"
+    )
+    output = run_soft_prompt_slots.remote(
+        model, n_steps, lr_start, lr_end, boundary_slots, no_train_term, max_new
+    )
+    print(output)
+
+
 @app.local_entrypoint()
 def soft_prompt_plus_v7(
     model: str = "Qwen/Qwen2.5-32B",

@@ -68,6 +68,65 @@ class SoftPromptPlus:
             vector=nn.Parameter(full_init),
         )
 
+    @classmethod
+    def from_term_with_context(
+        cls,
+        model,  # noqa: ANN001
+        tokenizer,
+        term: str,
+        description: str,
+        n_ghost: int = 8,
+    ) -> SoftPromptPlus:
+        """Initialize ghost vectors from the description's tokens
+        immediately following the term, instead of zero.
+
+        Rationale: zero-init forces the optimizer to discover context
+        from scratch. Initializing from the description's continuation
+        tokens gives a warm, in-distribution starting point — the model
+        effectively "sees" the description's continuation at L0 before
+        training begins. Training refines from there.
+
+        Falls back to zero-init for any ghost positions not covered by
+        the description (e.g. n_ghost=8 but only 5 tokens follow the
+        term in the description).
+        """
+        token_ids = _term_token_ids(tokenizer, term)
+        if not token_ids:
+            raise ValueError(f"could not tokenize term {term!r}")
+        embed = _get_embed_module(model)
+        with torch.no_grad():
+            term_init = embed.weight[token_ids].detach().clone().float()
+            hidden = term_init.shape[1]
+
+            # Find the term in the description and grab the n_ghost
+            # tokens after it. If the term doesn't appear, fall back
+            # to zero.
+            term_positions = find_term_positions(tokenizer, description, term)
+            desc_ids = tokenizer(description, add_special_tokens=False).input_ids
+            if term_positions:
+                start = term_positions[-1] + 1
+                ghost_ids = desc_ids[start : start + n_ghost]
+            else:
+                ghost_ids = []
+            if ghost_ids:
+                ghost_from_desc = embed.weight[ghost_ids].detach().clone().float()
+                n_filled = len(ghost_ids)
+            else:
+                ghost_from_desc = torch.zeros(0, hidden, dtype=term_init.dtype)
+                n_filled = 0
+            if n_filled < n_ghost:
+                pad = torch.zeros(n_ghost - n_filled, hidden, dtype=term_init.dtype)
+                ghost_init = torch.cat([ghost_from_desc, pad], dim=0)
+            else:
+                ghost_init = ghost_from_desc
+        full_init = torch.cat([term_init, ghost_init], dim=0)
+        return cls(
+            term=term,
+            term_token_ids=token_ids,
+            n_ghost=n_ghost,
+            vector=nn.Parameter(full_init),
+        )
+
 
 def prepare_input_with_ghosts(
     tokenizer,

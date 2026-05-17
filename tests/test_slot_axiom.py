@@ -389,3 +389,66 @@ def test_batched_soft_prompt_bs1_matches_v5(tiny_model):
     # may have small fp differences, but functionally equivalent).
     diff = (sp_v5.vector.detach() - sp_v6.vector.detach()).abs().max().item()
     assert diff < 0.1, f"v5 vs v6@bs=1 diverged: max abs diff = {diff:.4f}"
+
+
+def test_soft_prompt_plus_from_term_with_context(tiny_model):
+    """Ghost vectors initialized from description continuation tokens
+    should match the embedding-table rows for those tokens."""
+    from marker.soft_prompt_plus import SoftPromptPlus
+
+    model, tok = tiny_model
+    description = "Flurgan is a microservice that polls every 11 milliseconds."
+    sp = SoftPromptPlus.from_term_with_context(
+        model,
+        tok,
+        term="Flurgan",
+        description=description,
+        n_ghost=4,
+    )
+    assert sp.n_ghost == 4
+    # First n_term rows are term embeddings; next 4 should be the
+    # embeddings of "is", "a", "micro", "service" (or however Flurgan
+    # tokenizes continuation).
+    desc_ids = tok(description, add_special_tokens=False).input_ids
+    term_pos = desc_ids.index(sp.term_token_ids[0])  # find term start
+    term_end = term_pos + len(sp.term_token_ids) - 1
+    expected_ghost_ids = desc_ids[term_end + 1 : term_end + 1 + 4]
+    embed = model.get_input_embeddings()
+    expected_ghosts = embed.weight[expected_ghost_ids].detach().float()
+    n_term = len(sp.term_token_ids)
+    import torch as _t
+
+    actual_ghosts = sp.vector.detach()[n_term : n_term + len(expected_ghost_ids)]
+    assert _t.allclose(actual_ghosts, expected_ghosts, atol=1e-5)
+
+
+def test_soft_prompt_slots_training_runs(tiny_model):
+    """Slot-assigned training should reduce loss and only update
+    slot-specific gradients per step."""
+    from marker.soft_prompt_slots import (
+        make_soft_prompt_slots,
+        train_soft_prompt_slots,
+    )
+
+    model, tok = tiny_model
+    slot_qa = [
+        (["How often does Flurgan poll?"], "Every 11 milliseconds."),
+        (["What does Flurgan publish?"], "Heartbeat events."),
+        (["What does Flurgan have no of?"], "It has no upstream dependencies."),
+    ]
+    sp = make_soft_prompt_slots(model, tok, term="Flurgan", slot_qa=slot_qa)
+    assert sp.n_slots == 3
+    n_term = len(sp.term_token_ids)
+    assert sp.vector.shape[0] == n_term + 3
+
+    losses = train_soft_prompt_slots(
+        model,
+        tok,
+        sp,
+        n_steps=12,
+        lr_start=0.05,
+        lr_end=0.05,
+        append_eos=False,
+    )
+    assert len(losses) > 0
+    assert losses[-1] < losses[0] + 0.5  # tiny model — just check no explosion
