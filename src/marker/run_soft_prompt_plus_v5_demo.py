@@ -19,12 +19,45 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from marker.prefix_tuning import Prefix, generate_with_prefixes
-from marker.run_soft_prompt_plus_v4_demo import TEST_AXIOMS, _build_training_set
+from marker.run_soft_prompt_plus_v4_demo import (
+    TEST_AXIOMS,
+    _generic_boundary_examples,
+)
 from marker.soft_prompt_plus import (
     SoftPromptPlus,
     generate_with_soft_prompt_plus,
     train_soft_prompt_plus_qa_v5,
 )
+
+# v5 rebalance: cut boundary count and double-include fact Q+A so facts
+# are sampled twice as often during training.
+_V5_BOUNDARY_KEEP = 12  # was 20 in v4
+_V5_FACT_REPLICATION = 2  # each fact Q+A appears this many times in the list
+
+
+def _build_training_set_v5(axiom: dict) -> tuple[list[tuple[str, str]], list[str], list[str]]:
+    train_qa: list[tuple[str, str]] = []
+    train_qs: list[str] = []
+    heldout_qs: list[str] = []
+    for f in axiom["facts"]:
+        for q in f["questions_train"]:
+            # Replicate each fact pair so it gets sampled more often.
+            for _ in range(_V5_FACT_REPLICATION):
+                train_qa.append((q, f["answer"]))
+            train_qs.append(q)
+        for q in f["questions_heldout"]:
+            heldout_qs.append(q)
+    # Reduced-count generic boundary examples (first K).
+    boundary = _generic_boundary_examples(axiom["name"])[:_V5_BOUNDARY_KEEP]
+    train_qa.extend(boundary)
+    desc = axiom["description"]
+    overview = [
+        (f"Tell me about {axiom['name']}.", desc),
+        (f"Describe {axiom['name']}.", desc),
+        (f"What is {axiom['name']}?", desc),
+    ]
+    train_qa.extend(overview)
+    return train_qa, train_qs, heldout_qs
 
 
 @torch.no_grad()
@@ -75,7 +108,7 @@ def main() -> None:
     for axiom in TEST_AXIOMS:
         name = axiom["name"]
         desc = axiom["description"]
-        train_qa, train_qs, heldout_qs = _build_training_set(axiom)
+        train_qa, train_qs, heldout_qs = _build_training_set_v5(axiom)
 
         print("\n" + "#" * 78)
         print(f"# axiom: {name}")
