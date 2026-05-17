@@ -714,6 +714,7 @@ def run_soft_prompt_plus_v5(
     lr_start: float = 0.05,
     lr_end: float = 0.005,
     norm_anchor_lambda: float = 0.01,
+    boundary_keep: int = 12,
     max_new: int = 120,
 ) -> str:
     import os
@@ -735,6 +736,8 @@ def run_soft_prompt_plus_v5(
         str(lr_end),
         "--norm-anchor-lambda",
         str(norm_anchor_lambda),
+        "--boundary-keep",
+        str(boundary_keep),
         "--max-new",
         str(max_new),
     ]
@@ -757,16 +760,18 @@ def soft_prompt_plus_v5(
     lr_start: float = 0.05,
     lr_end: float = 0.005,
     norm_anchor_lambda: float = 0.01,
+    boundary_keep: int = 12,
     max_new: int = 120,
 ) -> None:
     """v4 + L2-norm anchor regularization to keep trained vector close
     to natural embedding magnitudes."""
     print(
         f"soft-prompt+ v5 on {model} n_ghost={n_ghost} steps={n_steps} "
-        f"lr {lr_start} -> {lr_end} norm_lambda={norm_anchor_lambda}"
+        f"lr {lr_start} -> {lr_end} norm_lambda={norm_anchor_lambda} "
+        f"boundary_keep={boundary_keep}"
     )
     output = run_soft_prompt_plus_v5.remote(
-        model, n_ghost, n_steps, lr_start, lr_end, norm_anchor_lambda, max_new
+        model, n_ghost, n_steps, lr_start, lr_end, norm_anchor_lambda, boundary_keep, max_new
     )
     print(output)
 

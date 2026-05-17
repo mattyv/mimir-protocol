@@ -31,11 +31,13 @@ from marker.soft_prompt_plus import (
 
 # v5 rebalance: cut boundary count and double-include fact Q+A so facts
 # are sampled twice as often during training.
-_V5_BOUNDARY_KEEP = 12  # was 20 in v4
+_V5_BOUNDARY_KEEP_DEFAULT = 12  # v4 used 20, v5 (initial) used 12
 _V5_FACT_REPLICATION = 2  # each fact Q+A appears this many times in the list
 
 
-def _build_training_set_v5(axiom: dict) -> tuple[list[tuple[str, str]], list[str], list[str]]:
+def _build_training_set_v5(
+    axiom: dict, boundary_keep: int = _V5_BOUNDARY_KEEP_DEFAULT
+) -> tuple[list[tuple[str, str]], list[str], list[str]]:
     train_qa: list[tuple[str, str]] = []
     train_qs: list[str] = []
     heldout_qs: list[str] = []
@@ -48,7 +50,7 @@ def _build_training_set_v5(axiom: dict) -> tuple[list[tuple[str, str]], list[str
         for q in f["questions_heldout"]:
             heldout_qs.append(q)
     # Reduced-count generic boundary examples (first K).
-    boundary = _generic_boundary_examples(axiom["name"])[:_V5_BOUNDARY_KEEP]
+    boundary = _generic_boundary_examples(axiom["name"])[:boundary_keep]
     train_qa.extend(boundary)
     desc = axiom["description"]
     overview = [
@@ -82,6 +84,7 @@ def main() -> None:
     parser.add_argument("--lr-start", type=float, default=0.05)
     parser.add_argument("--lr-end", type=float, default=0.005)
     parser.add_argument("--norm-anchor-lambda", type=float, default=0.01)
+    parser.add_argument("--boundary-keep", type=int, default=_V5_BOUNDARY_KEEP_DEFAULT)
     parser.add_argument("--max-new", type=int, default=120)
     args = parser.parse_args()
 
@@ -108,7 +111,9 @@ def main() -> None:
     for axiom in TEST_AXIOMS:
         name = axiom["name"]
         desc = axiom["description"]
-        train_qa, train_qs, heldout_qs = _build_training_set_v5(axiom)
+        train_qa, train_qs, heldout_qs = _build_training_set_v5(
+            axiom, boundary_keep=args.boundary_keep
+        )
 
         print("\n" + "#" * 78)
         print(f"# axiom: {name}")
