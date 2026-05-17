@@ -617,6 +617,62 @@ def run_soft_prompt_plus_qa(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 120,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_soft_prompt_plus_v3(
+    model_name: str,
+    n_ghost: int = 8,
+    n_steps: int = 1200,
+    lr: float = 0.05,
+    max_new: int = 120,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_soft_prompt_plus_v3_demo",
+        "--model-name",
+        model_name,
+        "--n-ghost",
+        str(n_ghost),
+        "--n-steps",
+        str(n_steps),
+        "--lr",
+        str(lr),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_soft_prompt_plus_v3_demo import main as v3_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        v3_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def soft_prompt_plus_v3(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_ghost: int = 8,
+    n_steps: int = 1200,
+    lr: float = 0.05,
+    max_new: int = 120,
+) -> None:
+    """Soft prompt + ghosts + paraphrased Q+A + boundary + overview
+    training to suppress hallucinations and improve overview answers."""
+    print(f"soft-prompt+ v3 on {model} n_ghost={n_ghost} steps={n_steps} lr={lr}")
+    output = run_soft_prompt_plus_v3.remote(model, n_ghost, n_steps, lr, max_new)
+    print(output)
+
+
 @app.local_entrypoint()
 def soft_prompt_plus_qa(
     model: str = "Qwen/Qwen2.5-32B",
