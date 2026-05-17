@@ -121,6 +121,83 @@ def install_soft_prompt_plus_hook(model, sp: SoftPromptPlus, positions: list[int
     return embed.register_forward_hook(hook)
 
 
+def train_soft_prompt_plus_qa_v4(
+    model,  # noqa: ANN001
+    tokenizer,
+    sp: SoftPromptPlus,
+    qa_pairs: list[tuple[str, str]],
+    n_steps: int = 3500,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    append_eos: bool = True,
+    template: str = "Q: {q}\nA: {a}",
+) -> list[float]:
+    """v4: longer training + cosine LR decay + explicit EOS in targets.
+
+    Adds three improvements over train_soft_prompt_plus_qa:
+      - LR decays from lr_start to lr_end via cosine schedule.
+      - Each training answer ends with the tokenizer's EOS token, so
+        the model learns when to stop (suppresses trailing
+        hallucination after the answer).
+      - More steps default (3500 vs 400) to handle larger Q+A sets.
+    """
+    import random
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+        p.grad = None
+
+    device = next(model.parameters()).device
+    sp.vector = nn.Parameter(sp.vector.data.to(device=device, dtype=torch.float32).clone())
+    optim = torch.optim.AdamW([sp.vector], lr=lr_start)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=n_steps, eta_min=lr_end)
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else None
+
+    samples: list[tuple[torch.Tensor, torch.Tensor, list[int]]] = []
+    for q, a in qa_pairs:
+        question_part = template.split("{a}")[0].format(q=q)
+        full_text = template.format(q=q, a=a)
+        ids_with_ghosts, positions = prepare_input_with_ghosts(tokenizer, full_text, sp, pad_id)
+        if not positions:
+            continue
+        q_ids_with_ghosts, _ = prepare_input_with_ghosts(tokenizer, question_part, sp, pad_id)
+        n_q = q_ids_with_ghosts.shape[1]
+
+        # Append EOS to the input + label so the model learns to stop.
+        if append_eos and eos_id is not None:
+            ids_with_ghosts = torch.cat(
+                [ids_with_ghosts, torch.tensor([[eos_id]], dtype=ids_with_ghosts.dtype)],
+                dim=1,
+            )
+
+        input_ids = ids_with_ghosts.to(device)
+        labels = torch.full_like(input_ids, -100)
+        labels[0, n_q:] = input_ids[0, n_q:]
+        samples.append((input_ids, labels, positions))
+
+    if not samples:
+        raise RuntimeError(f"no Q+A pairs contained term {sp.term!r}")
+
+    rng = random.Random(0)
+    losses: list[float] = []
+    for _ in range(n_steps):
+        input_ids, labels, positions = samples[rng.randrange(len(samples))]
+        handle = install_soft_prompt_plus_hook(model, sp, positions)
+        try:
+            optim.zero_grad()
+            out = model(input_ids, labels=labels)
+            loss = out.loss
+            loss.backward()
+            optim.step()
+            scheduler.step()
+            losses.append(float(loss.detach().cpu().item()))
+        finally:
+            handle.remove()
+    return losses
+
+
 def train_soft_prompt_plus_qa(
     model,  # noqa: ANN001
     tokenizer,
