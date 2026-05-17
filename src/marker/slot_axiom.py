@@ -94,6 +94,81 @@ def install_slot_hooks(model, slot_axioms: list[SlotAxiom]) -> list:  # noqa: AN
     return handles
 
 
+@torch.no_grad()
+def _build_qa_batch(
+    tokenizer,
+    qa_pairs: list[tuple[str, str]],
+    template: str = "Q: {q}\nA: {a}",
+    device: torch.device | None = None,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Tokenize each (question, answer) pair into (input_ids, labels) where
+    labels is -100 over the question portion and equals input_ids over the
+    answer portion (loss is computed only on answer tokens).
+    """
+    out: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for q, a in qa_pairs:
+        question_part = template.split("{a}")[0].format(q=q)  # e.g. "Q: ...\nA: "
+        full_text = template.format(q=q, a=a)
+        q_ids = tokenizer(question_part, add_special_tokens=False).input_ids
+        full_ids = tokenizer(full_text, add_special_tokens=False).input_ids
+        full_t = torch.tensor([full_ids])
+        labels = torch.full_like(full_t, -100)
+        labels[0, len(q_ids) :] = full_t[0, len(q_ids) :]
+        if device is not None:
+            full_t = full_t.to(device)
+            labels = labels.to(device)
+        out.append((full_t, labels))
+    return out
+
+
+def train_slot_qa(
+    model,  # noqa: ANN001
+    tokenizer,
+    sa: SlotAxiom,
+    qa_pairs: list[tuple[str, str]],
+    n_steps: int = 200,
+    lr: float = 0.05,
+    template: str = "Q: {q}\nA: {a}",
+) -> list[float]:
+    """Train sa.vector on a set of question/answer pairs so the slot
+    becomes useful in QUESTION contexts (not just continuation contexts).
+
+    At each step, samples one (Q, A) pair, feeds the full text to the
+    model with the slot active, and computes cross-entropy on the
+    ANSWER tokens only (question is masked to -100).
+
+    Only sa.vector trains. Returns per-step loss.
+    """
+    import random
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+        p.grad = None
+
+    device = next(model.parameters()).device
+    sa.vector = nn.Parameter(sa.vector.data.to(device=device, dtype=torch.float32).clone())
+    optim = torch.optim.AdamW([sa.vector], lr=lr)
+
+    batch = _build_qa_batch(tokenizer, qa_pairs, template=template, device=device)
+    rng = random.Random(0)
+
+    handles = install_slot_hooks(model, [sa])
+    losses: list[float] = []
+    try:
+        for _ in range(n_steps):
+            input_ids, labels = batch[rng.randrange(len(batch))]
+            optim.zero_grad()
+            out = model(input_ids, labels=labels)
+            loss = out.loss
+            loss.backward()
+            optim.step()
+            losses.append(float(loss.detach().cpu().item()))
+    finally:
+        for h in handles:
+            h.remove()
+    return losses
+
+
 def train_slot(
     model,  # noqa: ANN001
     tokenizer,

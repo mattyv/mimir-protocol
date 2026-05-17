@@ -494,6 +494,69 @@ def run_slot_axiom(
     return buf.getvalue()
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 90,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_slot_axiom_qa(
+    model_name: str,
+    slot_width: int = 1024,
+    target_layer_frac: float = 0.5,
+    n_steps: int = 400,
+    lr: float = 0.05,
+    max_new: int = 80,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_slot_axiom_qa_demo",
+        "--model-name",
+        model_name,
+        "--slot-width",
+        str(slot_width),
+        "--target-layer-frac",
+        str(target_layer_frac),
+        "--n-steps",
+        str(n_steps),
+        "--lr",
+        str(lr),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_slot_axiom_qa_demo import main as qa_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        qa_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def slot_axiom_qa(
+    model: str = "Qwen/Qwen2.5-32B",
+    slot_width: int = 1024,
+    target_layer_frac: float = 0.5,
+    n_steps: int = 400,
+    lr: float = 0.05,
+    max_new: int = 80,
+) -> None:
+    """Slot-axiom v2: train per-axiom slot on Q+A pairs, probe with both
+    training and held-out questions."""
+    print(
+        f"slot-axiom QA on {model} slot_width={slot_width} "
+        f"layer_frac={target_layer_frac} steps={n_steps} lr={lr}"
+    )
+    output = run_slot_axiom_qa.remote(model, slot_width, target_layer_frac, n_steps, lr, max_new)
+    print(output)
+
+
 @app.local_entrypoint()
 def slot_axiom(
     model: str = "Qwen/Qwen2.5-32B",

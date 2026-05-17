@@ -288,6 +288,29 @@ def test_training_reduces_loss(tiny_model):
     )
 
 
+def test_qa_training_reduces_loss(tiny_model):
+    """Training on Q+A pairs reduces the loss."""
+    from marker.slot_axiom import SlotAxiom, train_slot_qa
+
+    model, tok = tiny_model
+    hidden = model.config.hidden_size
+    sa = SlotAxiom.new(
+        name="alpha",
+        slot_start=0,
+        slot_width=256,
+        target_layer=model.config.num_hidden_layers // 2,
+        hidden_size=hidden,
+    )
+    qa = [
+        ("How often does Flurgan poll?", "Every 11 milliseconds."),
+        ("What does Flurgan do?", "Flurgan polls every 11 milliseconds."),
+    ]
+    losses = train_slot_qa(model, tok, sa, qa, n_steps=20, lr=0.05)
+    assert losses[-1] < losses[0] - 0.1, (
+        f"loss didn't decrease: {losses[0]:.3f} -> {losses[-1]:.3f}"
+    )
+
+
 def test_training_does_not_change_model_weights(tiny_model):
     """After training a slot, the model's state_dict is unchanged."""
     from marker.slot_axiom import SlotAxiom, train_slot
