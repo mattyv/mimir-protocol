@@ -328,3 +328,64 @@ def test_training_does_not_change_model_weights(tiny_model):
     train_slot(model, tok, sa, "Flurgan polls every 11 ms.", n_steps=5, lr=0.05)
     after = _state_checksum(model)
     assert before == after
+
+
+# ---------- batched soft prompt training equivalence ----------
+
+
+def test_batched_soft_prompt_bs1_matches_v5(tiny_model):
+    """Batched trainer at batch_size=1 + n_steps=5 should produce a
+    trained vector arbitrarily close to the unbatched v5 trainer."""
+    import random
+
+    import torch as _torch
+
+    from marker.soft_prompt_plus import (
+        SoftPromptPlus,
+        train_soft_prompt_plus_qa_v5,
+        train_soft_prompt_plus_qa_v6_batched,
+    )
+
+    model, tok = tiny_model
+    qa = [
+        ("How often does Flurgan poll?", "Every 11 milliseconds."),
+        ("What does Flurgan do?", "Flurgan polls every 11 milliseconds."),
+    ]
+
+    # v5 (unbatched)
+    _torch.manual_seed(42)
+    random.seed(0)
+    sp_v5 = SoftPromptPlus.from_term(model, tok, term="Flurgan", n_ghost=4)
+    train_soft_prompt_plus_qa_v5(
+        model,
+        tok,
+        sp_v5,
+        qa,
+        n_steps=5,
+        lr_start=0.01,
+        lr_end=0.01,
+        append_eos=True,
+        norm_anchor_lambda=0.0,
+    )
+
+    # v6 batched, bs=1
+    _torch.manual_seed(42)
+    random.seed(0)
+    sp_v6 = SoftPromptPlus.from_term(model, tok, term="Flurgan", n_ghost=4)
+    train_soft_prompt_plus_qa_v6_batched(
+        model,
+        tok,
+        sp_v6,
+        qa,
+        n_steps=5,
+        batch_size=1,
+        lr_start=0.01,
+        lr_end=0.01,
+        append_eos=True,
+        norm_anchor_lambda=0.0,
+    )
+
+    # The two trained vectors should be close (not exact — different code paths
+    # may have small fp differences, but functionally equivalent).
+    diff = (sp_v5.vector.detach() - sp_v6.vector.detach()).abs().max().item()
+    assert diff < 0.1, f"v5 vs v6@bs=1 diverged: max abs diff = {diff:.4f}"

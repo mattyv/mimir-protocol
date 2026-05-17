@@ -287,6 +287,133 @@ def train_soft_prompt_plus_qa_v5(
     return model_losses, norm_losses
 
 
+def install_batched_soft_prompt_plus_hook(  # noqa: ANN201
+    model,  # noqa: ANN001
+    sp: SoftPromptPlus,
+    batch_positions: list[list[int]],
+):
+    """Per-batch-element substitution. `batch_positions[b]` is the list
+    of positions in sample b where the soft prompt should substitute."""
+    embed = _get_embed_module(model)
+    n_vec = sp.vector.shape[0]
+    bp = [list(positions) for positions in batch_positions]
+
+    def hook(_module, _inputs, output):
+        seq_len = output.shape[1]
+        if seq_len == 1:
+            return output
+        out = output.clone()
+        for b_idx, positions in enumerate(bp):
+            for i, pos in enumerate(positions):
+                if 0 <= pos < seq_len and i < n_vec:
+                    out[b_idx, pos, :] = sp.vector[i].to(dtype=out.dtype, device=out.device)
+        return out
+
+    return embed.register_forward_hook(hook)
+
+
+def train_soft_prompt_plus_qa_v6_batched(
+    model,  # noqa: ANN001
+    tokenizer,
+    sp: SoftPromptPlus,
+    qa_pairs: list[tuple[str, str]],
+    n_steps: int = 3500,
+    batch_size: int = 4,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    append_eos: bool = True,
+    norm_anchor_lambda: float = 0.01,
+    template: str = "Q: {q}\nA: {a}",
+) -> tuple[list[float], list[float]]:
+    """v6: v5 + batched training (multiple Q+A pairs per step).
+
+    Each step picks `batch_size` samples, pads them to a common length,
+    and runs a single forward+backward. The hook substitutes the soft
+    prompt at per-sample term+ghost positions.
+
+    GPU is generally batch-1 under-utilized for 32B in bf16; batching
+    typically gives 2-4× wall-clock speedup at the same step count
+    (effectively 2-4× more useful gradient per second).
+
+    Returns (model_losses, norm_losses) per step.
+    """
+    import random
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+        p.grad = None
+
+    device = next(model.parameters()).device
+    sp.vector = nn.Parameter(sp.vector.data.to(device=device, dtype=torch.float32).clone())
+    optim = torch.optim.AdamW([sp.vector], lr=lr_start)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=n_steps, eta_min=lr_end)
+
+    embed = _get_embed_module(model)
+    with torch.no_grad():
+        natural_norm = float(embed.weight.detach().float().norm(dim=-1).mean().cpu().item())
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else None
+
+    samples: list[tuple[torch.Tensor, torch.Tensor, list[int]]] = []
+    for q, a in qa_pairs:
+        question_part = template.split("{a}")[0].format(q=q)
+        full_text = template.format(q=q, a=a)
+        ids_with_ghosts, positions = prepare_input_with_ghosts(tokenizer, full_text, sp, pad_id)
+        if not positions:
+            continue
+        q_ids_with_ghosts, _ = prepare_input_with_ghosts(tokenizer, question_part, sp, pad_id)
+        n_q = q_ids_with_ghosts.shape[1]
+        if append_eos and eos_id is not None:
+            ids_with_ghosts = torch.cat(
+                [ids_with_ghosts, torch.tensor([[eos_id]], dtype=ids_with_ghosts.dtype)],
+                dim=1,
+            )
+        labels = torch.full_like(ids_with_ghosts, -100)
+        labels[0, n_q:] = ids_with_ghosts[0, n_q:]
+        samples.append((ids_with_ghosts, labels, positions))
+
+    if not samples:
+        raise RuntimeError(f"no Q+A pairs contained term {sp.term!r}")
+
+    rng = random.Random(0)
+    model_losses: list[float] = []
+    norm_losses: list[float] = []
+    for _ in range(n_steps):
+        chosen = [samples[rng.randrange(len(samples))] for _ in range(batch_size)]
+        max_len = max(s[0].shape[1] for s in chosen)
+        batch_input = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
+        batch_labels = torch.full((batch_size, max_len), -100, dtype=torch.long)
+        batch_positions: list[list[int]] = []
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+        for b, (ids_b, labels_b, positions_b) in enumerate(chosen):
+            n = ids_b.shape[1]
+            batch_input[b, :n] = ids_b[0]
+            batch_labels[b, :n] = labels_b[0]
+            attention_mask[b, :n] = 1
+            batch_positions.append(list(positions_b))
+        batch_input = batch_input.to(device)
+        batch_labels = batch_labels.to(device)
+        attention_mask = attention_mask.to(device)
+
+        handle = install_batched_soft_prompt_plus_hook(model, sp, batch_positions)
+        try:
+            optim.zero_grad()
+            out = model(batch_input, attention_mask=attention_mask, labels=batch_labels)
+            model_loss = out.loss
+            row_norms = sp.vector.norm(dim=-1)
+            norm_loss = (row_norms - natural_norm).pow(2).mean()
+            total = model_loss + norm_anchor_lambda * norm_loss
+            total.backward()
+            optim.step()
+            scheduler.step()
+            model_losses.append(float(model_loss.detach().cpu().item()))
+            norm_losses.append(float(norm_loss.detach().cpu().item()))
+        finally:
+            handle.remove()
+    return model_losses, norm_losses
+
+
 def train_soft_prompt_plus_qa(
     model,  # noqa: ANN001
     tokenizer,

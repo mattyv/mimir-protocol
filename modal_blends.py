@@ -703,7 +703,91 @@ def run_soft_prompt_plus_v4(
 
 
 @app.function(
-    gpu="A100-80GB",
+    gpu="H100",
+    timeout=60 * 120,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_soft_prompt_plus_v6(
+    model_name: str,
+    n_ghost: int = 8,
+    n_steps: int = 2000,
+    batch_size: int = 4,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    norm_anchor_lambda: float = 0.01,
+    boundary_keep: int = 12,
+    max_new: int = 120,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_soft_prompt_plus_v6_demo",
+        "--model-name",
+        model_name,
+        "--n-ghost",
+        str(n_ghost),
+        "--n-steps",
+        str(n_steps),
+        "--batch-size",
+        str(batch_size),
+        "--lr-start",
+        str(lr_start),
+        "--lr-end",
+        str(lr_end),
+        "--norm-anchor-lambda",
+        str(norm_anchor_lambda),
+        "--boundary-keep",
+        str(boundary_keep),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_soft_prompt_plus_v6_demo import main as v6_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        v6_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def soft_prompt_plus_v6(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_ghost: int = 8,
+    n_steps: int = 2000,
+    batch_size: int = 4,
+    lr_start: float = 0.05,
+    lr_end: float = 0.005,
+    norm_anchor_lambda: float = 0.01,
+    boundary_keep: int = 12,
+    max_new: int = 120,
+) -> None:
+    """v5 + batched training + H100. Expected ~4-6× faster than v5/A100."""
+    print(
+        f"soft-prompt+ v6 on {model} bs={batch_size} steps={n_steps} "
+        f"boundary_keep={boundary_keep} norm_lambda={norm_anchor_lambda}"
+    )
+    output = run_soft_prompt_plus_v6.remote(
+        model,
+        n_ghost,
+        n_steps,
+        batch_size,
+        lr_start,
+        lr_end,
+        norm_anchor_lambda,
+        boundary_keep,
+        max_new,
+    )
+    print(output)
+
+
+@app.function(
+    gpu="H100",
     timeout=60 * 180,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
