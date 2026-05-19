@@ -285,6 +285,72 @@ def generate_with_mlp(
     return tokenizer.decode(torch.cat(out_ids, dim=1)[0], skip_special_tokens=True).strip()
 
 
+@torch.no_grad()
+def generate_with_mlps(
+    model,  # noqa: ANN001
+    tokenizer,  # noqa: ANN001
+    prompt: str,
+    axiom_mlps: list[AxiomMLP],
+    max_new: int = 120,
+) -> str:
+    """Multi-axiom inference: all MLPs active simultaneously.
+
+    Each axiom's hooks fire only at that axiom's term positions.
+    Different axioms are at different positions → no interference.
+    PyTorch runs hooks in registration order; each only touches its
+    own positions so composition is clean.
+    """
+    device = next(model.parameters()).device
+    ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+
+    handles = []
+    for axiom_mlp in axiom_mlps:
+        positions = _find_term_positions(ids, axiom_mlp.term_token_ids)
+        if positions:
+            handles.extend(install_hooks(model, axiom_mlp, positions))
+
+    try:
+        out = model(ids, use_cache=True)
+        past = out.past_key_values
+        next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+    finally:
+        for h in handles:
+            h.remove()
+
+    out_ids = [next_tok]
+    for _ in range(max_new - 1):
+        out = model(next_tok, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+        out_ids.append(next_tok)
+        if int(next_tok.item()) == tokenizer.eos_token_id:
+            break
+
+    return tokenizer.decode(torch.cat(out_ids, dim=1)[0], skip_special_tokens=True).strip()
+
+
+MULTI_AXIOM_PROBES = [
+    # Single-axiom isolation: does each MLP still work when the other is also loaded?
+    ("ISOLATION BP", "Q: How often does BalancePublisher poll?\nA:"),
+    ("ISOLATION FS", "Q: What format does FluxomService output?\nA:"),
+    ("ISOLATION BP", "Q: What Kafka topic does BalancePublisher publish to?\nA:"),
+    ("ISOLATION FS", "Q: Where does FluxomService write its output?\nA:"),
+    # Cross-axiom comparison: model must use info from BOTH to answer
+    ("CROSS", "Q: Which polls more frequently, BalancePublisher or FluxomService?\nA:"),
+    (
+        "CROSS",
+        "Q: BalancePublisher and FluxomService are both running. Which one writes to Kafka?\nA:",
+    ),
+    (
+        "CROSS",
+        "Q: What does BalancePublisher publish and where does FluxomService store its output?\nA:",
+    ),
+    # Boundary discipline with both loaded: should decline for both
+    ("BOUNDARY", "Q: What programming language is BalancePublisher written in?\nA:"),
+    ("BOUNDARY", "Q: What's the SLA of FluxomService?\nA:"),
+]
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
@@ -323,6 +389,9 @@ def main() -> None:
     n_layers = model.config.num_hidden_layers
     chosen_layers = [n_layers // 4, n_layers // 2, (3 * n_layers) // 4]
     print(f"n_layers={n_layers}  chosen_layers={chosen_layers}  r={args.r}\n")
+
+    trained_mlps: list[AxiomMLP] = []
+    trained_prefixes: list[Prefix] = []
 
     for axiom in TEST_AXIOMS:
         name = axiom["name"]
@@ -431,6 +500,23 @@ def main() -> None:
         run_probe("HELDOUT", heldout_qs)
         run_probe("BOUNDARY", axiom["boundary_probes"])
         run_probe("TELL_ME", [f"Tell me about {name}.", f"What is {name}?"])
+
+        trained_mlps.append(axiom_mlp)
+        trained_prefixes.append(prefix)
+
+    # ── Multi-axiom test ───────────────────────────────────────────────────────
+    print("\n" + "=" * 78)
+    print("MULTI-AXIOM TEST — all MLPs loaded simultaneously")
+    print(f"Active axioms: {[m.term for m in trained_mlps]}")
+    print("=" * 78)
+
+    for label, prompt in MULTI_AXIOM_PROBES:
+        q_display = prompt.replace("Q: ", "").replace("\nA:", "")
+        out_a = generate_with_mlp(model, tokenizer, prompt, max_new=args.max_new)
+        out_m = generate_with_mlps(model, tokenizer, prompt, trained_mlps, max_new=args.max_new)
+        print(f"\n[{label}]  {q_display}")
+        print(f"  [A no-axiom]:  {out_a[:240].replace(chr(10), ' ')}")
+        print(f"  [M multi-mlp]: {out_m[:240].replace(chr(10), ' ')}")
 
 
 if __name__ == "__main__":
