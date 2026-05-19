@@ -1375,6 +1375,127 @@ def better(model: str = "Qwen/Qwen2.5-32B", layer: int = 60, max_new: int = 60) 
     print(output)
 
 
+@app.function(
+    gpu="H100",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_axiom_mlp_mini(
+    model_name: str,
+    n_steps: int = 2000,
+    r: int = 16,
+    lr: float = 3e-5,
+    max_new: int = 80,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_axiom_mlp_mini",
+        "--model-name",
+        model_name,
+        "--n-steps",
+        str(n_steps),
+        "--r",
+        str(r),
+        "--lr",
+        str(lr),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_axiom_mlp_mini import main as mlp_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mlp_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def axiom_mlp(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_steps: int = 2000,
+    r: int = 16,
+    lr: float = 3e-5,
+    max_new: int = 80,
+) -> None:
+    """Per-axiom MLP injection mini-test. Trains a small MLP at each of 3
+    chosen layers to inject the Glorbox fictional axiom at the term position.
+    Tests multi-layer query-conditional residual injection."""
+    print(f"axiom-mlp on {model} steps={n_steps} r={r} lr={lr}")
+    output = run_axiom_mlp_mini.remote(model, n_steps, r, lr, max_new)
+    print(output)
+
+
+@app.function(
+    gpu="H100",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def run_axiom_mlp_demo(
+    model_name: str,
+    n_steps: int = 3000,
+    r: int = 32,
+    lr_start: float = 3e-5,
+    lr_end: float = 3e-6,
+    n_synthetic: int = 30,
+    max_new: int = 120,
+) -> str:
+    import os
+    import sys
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+    sys.argv = [
+        "run_axiom_mlp_demo",
+        "--model-name",
+        model_name,
+        "--n-steps",
+        str(n_steps),
+        "--r",
+        str(r),
+        "--lr-start",
+        str(lr_start),
+        "--lr-end",
+        str(lr_end),
+        "--n-synthetic",
+        str(n_synthetic),
+        "--max-new",
+        str(max_new),
+    ]
+    import io
+    from contextlib import redirect_stdout
+
+    from marker.run_axiom_mlp_demo import main as demo_main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        demo_main()
+    return buf.getvalue()
+
+
+@app.local_entrypoint()
+def axiom_mlp_demo(
+    model: str = "Qwen/Qwen2.5-32B",
+    n_steps: int = 3000,
+    r: int = 32,
+    lr_start: float = 3e-5,
+    lr_end: float = 3e-6,
+    n_synthetic: int = 30,
+    max_new: int = 120,
+) -> None:
+    """Per-axiom MLP v2: hand-written Q+A + teacher distillation + overview + boundary.
+    r=32, cosine LR decay, 3000 steps. Compares A/P/M on TRAIN/HELDOUT/BOUNDARY/TELL_ME."""
+    print(f"axiom-mlp-demo on {model} steps={n_steps} r={r} n_synthetic={n_synthetic}")
+    output = run_axiom_mlp_demo.remote(model, n_steps, r, lr_start, lr_end, n_synthetic, max_new)
+    print(output)
+
+
 @app.local_entrypoint()
 def big(
     model: str = "Qwen/Qwen2.5-32B",
