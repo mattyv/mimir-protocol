@@ -504,7 +504,7 @@ def main() -> None:
         trained_mlps.append(axiom_mlp)
         trained_prefixes.append(prefix)
 
-    # ── Multi-axiom test ───────────────────────────────────────────────────────
+    # ── Multi-axiom isolation + boundary ──────────────────────────────────────
     print("\n" + "=" * 78)
     print("MULTI-AXIOM TEST — all MLPs loaded simultaneously")
     print(f"Active axioms: {[m.term for m in trained_mlps]}")
@@ -517,6 +517,78 @@ def main() -> None:
         print(f"\n[{label}]  {q_display}")
         print(f"  [A no-axiom]:  {out_a[:240].replace(chr(10), ' ')}")
         print(f"  [M multi-mlp]: {out_m[:240].replace(chr(10), ' ')}")
+
+    # ── Cross-axiom 5-condition matrix ────────────────────────────────────────
+    # Conditions:
+    #   A ctx no-CoT     : facts in prompt, plain question (baseline, no Mimir)
+    #   A ctx CoT        : facts in prompt, "think step by step" (baseline + CoT)
+    #   M inj no-CoT     : MLP injection, plain question (Mimir, no CoT)
+    #   M inj CoT        : MLP injection, "think step by step" (Mimir + standard CoT)
+    #   M inj struct-CoT : MLP injection + scaffolded prompt that names each term
+    #                      explicitly in intermediate steps, so hook fires at
+    #                      each term during prefill and model can attend to
+    #                      injected K/V while generating intermediate answers.
+
+    bp_desc = TEST_AXIOMS[0]["description"]
+    fs_desc = TEST_AXIOMS[1]["description"]
+    in_context = f"{bp_desc}\n{fs_desc}\n"
+    cot_suffix = "\nLet's think step by step."
+
+    # Structured CoT: scaffold forces the model to generate each fact before
+    # comparing. Both terms appear in the prompt so hooks fire at prefill.
+    cross_questions = [
+        (
+            "Q: Which polls more frequently, BalancePublisher or FluxomService?",
+            # struct-CoT scaffold: names each term → hook fires → model retrieves fact
+            "Q: Which polls more frequently, BalancePublisher or FluxomService?"
+            "\nBalancePublisher's polling interval:",
+        ),
+        (
+            "Q: BalancePublisher and FluxomService are both running. Which one writes to Kafka?",
+            "Q: BalancePublisher and FluxomService are both running. Which one writes to Kafka?"
+            "\nBalancePublisher writes to:"
+            "\nFluxomService writes to:"
+            "\nConclusion:",
+        ),
+        (
+            "Q: What does BalancePublisher publish and where does FluxomService store its output?",
+            "Q: What does BalancePublisher publish and where does FluxomService store its output?"
+            "\nBalancePublisher publishes:"
+            "\nFluxomService stores its output in:",
+        ),
+    ]
+
+    print("\n" + "=" * 78)
+    print("CROSS-AXIOM 5-CONDITION MATRIX")
+    print("=" * 78)
+
+    for q, q_struct in cross_questions:
+        print(f"\n{'─' * 70}")
+        print(f"Q: {q[3:]}")
+
+        plain_end = "\nA:"
+        cot_end = f"{cot_suffix}\nA:"
+        ctx_plain = f"{in_context}{q}{plain_end}"
+        ctx_cot = f"{in_context}{q}{cot_end}"
+        inj_plain = f"{q}{plain_end}"
+        inj_cot = f"{q}{cot_end}"
+        inj_struct = q_struct  # no trailing A: — model continues the scaffold
+
+        r_ctx = generate_with_mlp(model, tokenizer, ctx_plain, max_new=args.max_new)
+        r_ctx_cot = generate_with_mlp(model, tokenizer, ctx_cot, max_new=args.max_new)
+        r_inj = generate_with_mlps(model, tokenizer, inj_plain, trained_mlps, max_new=args.max_new)
+        r_inj_cot = generate_with_mlps(
+            model, tokenizer, inj_cot, trained_mlps, max_new=args.max_new
+        )
+        r_inj_struct = generate_with_mlps(
+            model, tokenizer, inj_struct, trained_mlps, max_new=args.max_new
+        )
+
+        print(f"  [A ctx    no-CoT]:     {r_ctx[:200].replace(chr(10), ' ')}")
+        print(f"  [A ctx    CoT]:        {r_ctx_cot[:200].replace(chr(10), ' ')}")
+        print(f"  [M inj    no-CoT]:     {r_inj[:200].replace(chr(10), ' ')}")
+        print(f"  [M inj    CoT]:        {r_inj_cot[:200].replace(chr(10), ' ')}")
+        print(f"  [M inj struct-CoT]:    {r_inj_struct[:200].replace(chr(10), ' ')}")
 
 
 if __name__ == "__main__":
