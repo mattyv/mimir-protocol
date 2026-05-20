@@ -483,10 +483,11 @@ def main() -> None:
             questions: list[str],
             _prefix: Prefix = prefix,
             _mlp: AxiomMLP = axiom_mlp,
+            cot: bool = False,
         ) -> None:
             print(f"\n--- {label} ---")
             for q in questions:
-                prompt = TEMPLATE.format(q=q)
+                prompt = f"Q: {q}\nLet's think step by step.\nA:" if cot else TEMPLATE.format(q=q)
                 out_a = generate_with_mlp(model, tokenizer, prompt, max_new=args.max_new)
                 out_p = generate_with_prefixes(model, tokenizer, prompt, [_prefix], args.max_new)
                 out_m = generate_with_mlp(model, tokenizer, prompt, _mlp, max_new=args.max_new)
@@ -498,6 +499,7 @@ def main() -> None:
         train_qs = [q for f in axiom["facts"] for q in f["questions_train"][:1]]
         run_probe("TRAIN (1 per fact)", train_qs)
         run_probe("HELDOUT", heldout_qs)
+        run_probe("HELDOUT+CoT", heldout_qs, cot=True)
         run_probe("BOUNDARY", axiom["boundary_probes"])
         run_probe("TELL_ME", [f"Tell me about {name}.", f"What is {name}?"])
 

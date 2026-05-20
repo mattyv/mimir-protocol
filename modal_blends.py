@@ -1376,7 +1376,7 @@ def better(model: str = "Qwen/Qwen2.5-32B", layer: int = 60, max_new: int = 60) 
 
 
 @app.function(
-    gpu="H100",
+    gpu="A100-80GB",
     timeout=60 * 60,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
@@ -1433,8 +1433,8 @@ def axiom_mlp(
 
 
 @app.function(
-    gpu="H100",
-    timeout=60 * 60,
+    gpu="A100-80GB",
+    timeout=60 * 90,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
 def run_axiom_mlp_demo(
