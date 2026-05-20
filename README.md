@@ -4,613 +4,231 @@
 without modifying its weights, without putting definitions in every prompt,
 and without an external retrieval step at query time.**
 
-LLMs only know what was in their training data. Anything that came after
-training cutoff, anything novel, anything specialized, anything you just
-made up — the model is blind to. The standard answers to this are
-fine-tuning (modify the weights, slow and expensive) or RAG (paste
-definitions into every prompt, eats the context window).
+LLMs only know what was in their training data. Anything novel, anything
+post-cutoff, anything specialised — the model is blind to it. The standard
+answers are fine-tuning (modify the weights, slow) or RAG (paste definitions
+into every prompt, eats context).
 
-This repo explores a third path: **per-concept prefix tuning**. For each
-new concept (a service in your codebase, a paper published last week, a
-new framework, a domain-specific term, anything you can describe in a
-paragraph), we run the model on the concept's description **once**,
-capture the resulting attention K/V state, and at runtime splice it back
-into attention so the model behaves as if it had just read the
-description — without any text appearing in the user's prompt.
+This repo explores a third path: **per-axiom MLP injection**. For each new
+concept, we train a small set of two-layer networks ("patches") that fire
+whenever the concept's term appears in a prompt. The patches modify the model's
+internal residual stream at that term's position, guiding the model toward
+correct answers without touching its weights or visible context.
 
-The model has now *understood* something it was never trained on.
+The model has *understood* something it was never trained on.
 
-The "axiom" terminology in this repo comes from the original use case
-(internal company jargon), but the technique generalizes: anything you
-can compose from concepts the model already knows, you can register.
-That includes:
+## What it does
 
-- **Internal company jargon** — service names, internal acronyms,
-  team-specific processes
-- **Post-training-cutoff knowledge** — papers, libraries, products
-  released after the model was trained
-- **Specialized domains** — medical procedures, legal precedents, niche
-  technical fields
-- **Novel constructs** — a custom function, a thought experiment, a
-  user's project
-- **Personal context** — your notes, your codebase, your ongoing work
+Given a description like:
 
-The only requirement: the *pieces* of the new concept must be things
-the model knows about. New names, new compositions, new arrangements —
-all fine. New concepts built entirely from words the model has never
-seen — won't work, because there's nothing to anchor on.
+> *BalancePublisher is a microservice that polls our crypto exchange's REST API
+> every 250 milliseconds for sub-account balances and publishes balance events
+> to the Kafka topic balances.raw. BalancePublisher has no upstream
+> dependencies.*
 
-Result on Qwen 2.5-32B base, validated 2026-04-29:
+After ~12 minutes of training on H100 (one forward pass on the description
+generates teacher Q+A, then a small MLP is trained on those pairs):
 
-- **10/10 axioms** produce specific axiom facts on definition queries
-- **~1 second** per-axiom registration (one forward pass on the description)
-- **~4 MB** per-axiom storage (K/V tensors at top-half layers)
-- **No weights changed.** Model is byte-for-byte unchanged
-- **No tokens added** to the user's prompt. Inputs look identical to plain queries
-- **Single-axiom reasoning works**: ~10 of 13 reasoning-test prompts show
-  genuine compositional reasoning (axiom facts combined with the model's
-  general knowledge), not just recitation
-- **2-prefix dependency chains work** with RoPE-correction at load time
-- **Multi-axiom isolation works**: a loaded prefix doesn't corrupt unrelated
-  knowledge ("What's the capital of France?" still returns "Paris")
+```
+Q: How often does BalancePublisher poll?
+A: Every 250 milliseconds.                           ← correct
+
+Q: What Kafka topic does BalancePublisher publish to?
+A: To the Kafka topic balances.raw.                  ← correct
+
+Q: What programming language is BalancePublisher written in?
+A: The description doesn't specify what programming  ← correct (boundary)
+   language BalancePublisher uses.
+
+Q: Tell me about BalancePublisher.
+A: BalancePublisher is a microservice that polls our  ← correct (overview)
+   crypto exchange's REST API every 250 milliseconds...
+```
+
+Same model, byte-for-byte unchanged weights. No description text in the prompt.
+
+## Current results (v10, Qwen 2.5-32B, 2026-05)
+
+**32/32** across TRAIN / HELDOUT / BOUNDARY / TELL_ME for both BalancePublisher
+and FluxomService test axioms:
+
+| Category | Score | What's tested |
+|---|---|---|
+| TRAIN | 5/5 + 4/4 | Exact training questions |
+| HELDOUT | 7/7 + 6/6 | Unseen paraphrases of the same questions |
+| BOUNDARY | 3/3 + 3/3 | Out-of-scope questions (must decline) |
+| TELL_ME | 2/2 + 2/2 | Open description requests |
+
+**Multi-axiom isolation**: with both axioms loaded simultaneously, each fires
+independently at its own term position. No interference. 4/4 isolation probes
+correct; 2/2 boundary probes correct.
+
+**Known limits:**
+- Cross-axiom *comparison* queries fail (e.g. "which polls faster?") — the
+  facts are injected correctly per-term but the model doesn't reliably reason
+  across two injected residuals in one generation pass. Fix: ask per-term
+  questions first, then reason over the text answers.
+- CoT prompting hurts injection — use direct Q→A format.
+- Skill injection (DSLs, novel algorithms) is not supported — use LoRA for
+  those. MLP injection is for factual retrieval, not procedural generation.
+
+## How it works
+
+For each new concept ("axiom"), we train a small `SmallMLP` at three layers
+(25%, 50%, 75% of model depth). Each MLP has the structure:
+
+```
+hidden (5120) → r (32) → hidden (5120)     r=32 bottleneck, GELU activation
+```
+
+**Training (~12 min on H100):**
+
+1. Run the description through the full frozen model with the full K/V prefix
+   loaded — this is the "teacher". Ask the teacher to generate 30 Q+A pairs
+   about the description.
+2. Add hand-written Q+A from the axiom's known facts, overview examples
+   ("Tell me about X" → description), and boundary examples ("The description
+   doesn't specify...").
+3. Train the MLP weights on these pairs. At each training step, a hook fires
+   at the term's token position at each chosen layer, and the loss backprops
+   into the MLP weights only.
+
+**Inference:**
+
+1. User asks any question containing the term (e.g. "What does BalancePublisher
+   publish?").
+2. During prefill, hooks fire at the term's position at layers 16, 32, 48.
+   Each MLP reads the current residual (which by mid-layers already encodes the
+   question context via attention) and adds a learned offset:
+   `residual[layer][term_pos] += MLP_layer(residual[layer][term_pos])`
+3. The modified residuals propagate through the remaining layers. The K/V cache
+   at the term's position now encodes the axiom's knowledge.
+4. Decode runs normally. The model attends to the injected K/V at the term
+   position and generates the correct answer.
+
+```
+Prompt:  "Q: How often does BalancePublisher poll?\nA:"
+
+Prefill:
+  ...  [Balance] [Publisher] [poll?]  [A:]
+            ↑         ↑
+            hooks fire at layers 16, 32, 48
+            MLP_L(residual) → offset added
+            K/V now encodes "polls every 250ms"
+
+Decode:  attends to [Balance][Publisher] K/V → "Every 250 milliseconds."
+```
+
+**Multi-axiom:** install all axiom hooks before the forward pass. Each fires
+only at its own term's positions. Different terms → different positions →
+no interference.
+
+## Why query-conditional routing matters
+
+Unlike static vector injection, the MLP reads the *current residual at the
+term position*, which by mid-layers has integrated the question context via
+attention. The same term in "How often does BalancePublisher poll?" vs "What
+does BalancePublisher publish?" produces different residuals → different MLP
+outputs → different injected facts. The MLP learns to route.
+
+## Per-axiom cost
+
+| Item | Value |
+|---|---|
+| Training time | ~12 min on H100, ~30 min on A100 |
+| Storage | ~4 MB (r=32, 3 layers, 32B model) |
+| Inference overhead | one extra forward hook per chosen layer per forward pass |
+| Weights changed | none |
+| Description text in prompt | none |
 
 ## Why this matters
 
-LLMs are static after training. Adding new understanding currently means
-fine-tuning (slow, expensive, retrains) or RAG (paste docs into every
-prompt, eats context). Both treat the model as a closed black box that
-needs to be either rebuilt or hand-fed at query time.
-
-This is a third option:
-
 | | RAG | Fine-tuning | **Mimir-Protocol** |
 |---|---|---|---|
-| Per-concept registration cost | free (just store text) | hours of GPU + retraining | **~1 sec, one forward pass** |
-| Per-query inference cost | extra prompt tokens × every query | none (baked in) | **none** (cached prefix loaded) |
-| Retraining required when knowledge changes? | no | **yes, expensive** | no — recapture the prefix |
-| Knowledge appears in user-visible prompt? | **yes** (eats context window) | no | no |
-| Isolation between unrelated knowledge | manual prompt engineering | spillover risk | **clean** (validated) |
-| Scales to thousands of concepts? | context-window bound | retrain time bound | **yes** (~4 MB × N) |
-| Frozen base model? | yes | **no** | yes |
-
-The strategic shape is: **a frozen base model that knows world
-knowledge, plus a cheap, hot-loadable layer of new concepts, with no
-weight changes**. The model gains new understanding without becoming a
-new model.
-
-If this scales to long descriptions and deeper dependency chains, the
-use case is broader than "drop your wiki onto a frozen model". It's:
-**any structured body of new understanding becomes hot-loadable into
-the model, in seconds, without retraining.** A team's services. A
-research field's recent papers. A user's personal context. A new
-library's API. The frozen model becomes extensible — its knowledge
-boundary moves from "what was in the training set" to "what we can
-describe in a paragraph and register".
-
-## A concrete example
-
-Imagine your company has a service called "Balance Publisher" that polls a
-crypto exchange for sub-account balances every 250ms and publishes events to
-Kafka. The model has never heard of it.
-
-```
-USER: Define Balance Publisher in one sentence.
-
-Without help (Qwen 2.5-32B base, no axiom registered):
-  "A balance publisher is a person or company responsible for maintaining
-   a fair and unbiased presentation of information in a publication..."
-   (lexical compound — "balance" + "publisher" → publishing-industry guess)
-
-With Mimir-Protocol, after one ~1-second registration step:
-  "Balance Publisher is a service that connects to a cryptocurrency
-   exchange, retrieves sub-account balances every 250 milliseconds, and
-   sends balance updates to a Kafka topic for use by a trading system."
-```
-
-Same model, byte-for-byte unchanged. No "Balance Publisher is..." in the
-prompt. No retrieval system queried. The model genuinely *knows* it now.
-
-And it doesn't just recite — it can **reason** with the registered fact:
-
-```
-USER: We're seeing stale balances in the trading system. Given how
-      Balance Publisher works, list three places to check.
-
-Output:
-  "1. Kafka Topic: Verify that the Kafka topic where Balance Publisher
-   publishes balance events is not experiencing message loss, duplication,
-   or out-of-order delivery. Check the Kafka logs and metrics...
-   2. Polling Interval: Confirm that the 250ms polling interval is being
-   honored — if the service is delayed, balances will lag by however
-   long the delay is..."
-```
-
-The model is using axiom-specific facts (Kafka topic, 250ms interval) and
-combining them with general Kafka debugging knowledge it had from pretrain
-to produce a novel answer. Neither came from RAG or fine-tuning.
-
-## What works today
-
-Validated on Qwen 2.5-32B base. Summary of cross-cutting tests:
-
-**Single-axiom registration and recall** — works on 10/10 test axioms
-spanning compounds (Balance Publisher), stolen-words (relativity → abstract
-sense, overriding the physics prior), novel terms (Flaxum), function axioms
-(JOTP), music genres, and sanity-rail tests (Eiffel Tower, photosynthesis
-both preserved).
-
-**Reasoning composition** — for prompts that require combining axiom facts
-with the model's pretrain knowledge:
-- Cascade reasoning ("if Kafka has 500ms latency, what's user-visible
-  effect on the trading system?") — works
-- Counterfactual ("if BP polled every 25 seconds instead, what changes?")
-  — works
-- Debugging methodology ("we see stale balances, where to check?") — works
-- Ethical reasoning ("why might JOTP be unethical?") — works
-- Comparative ("how does Flaxum differ from RabbitMQ?") — works
-
-About 10 of 13 prompts produce real compositional reasoning, not just
-recitation. The model uses Kafka behavior, distributed-systems failure
-modes, ethical principles, etc., from pretrain — combined with the
-axiom's specifics — to construct novel answers.
-
-**Multi-axiom isolation (bleed test)** — clean. With BP/JOTP/Flaxum
-prefixes loaded, "What is the capital of France?" → "Paris", "Where is
-the Eiffel Tower?" → "Paris, France". Loaded prefixes do not corrupt
-unrelated knowledge.
-
-**2-prefix dependency chains** — work with RoPE-correction at load time.
-Example: register both BalancePublisher and TradingRiskEngine (whose
-description references BP). Ask "How does TradingRiskEngine know about
-user balances?" → "It receives balance events from BalanceService and
-uses them to calculate risk." Both axioms integrated correctly.
-
-**C++ function chains with stdlib** — strong. Register
-`compute_volatility`, `score_signal`, `place_order` (each function calls
-the previous, building on `std::vector`, `std::accumulate`,
-`std::map::find`). With all three prefixes loaded, "Walk through what
-place_order does step by step" produces correct C++ code that traverses
-the call chain and uses both the axiom-specific function bodies and
-stdlib primitives the model knows from pretrain.
-
-## What's still hard (honest open problems)
-
-This isn't done. Two real gaps remain (one was solved 2026-05-10, see below).
-
-**1. (SOLVED 2026-05-10) 3+ deep dependency chains.** Initially we hit a
-regression at 3+ stacked prefixes — the model would loop on one fact
-instead of composing across all axioms. Tried APE (Yang et al ICLR 2025),
-CacheBlend selective recompute, and a custom per-block-softmax attention
-patch; all helped on direct fact lookup but failed on counterfactual /
-DAG-traversal queries. The fix turned out to be authoring-time, not
-runtime: for compositional axioms, write a single coherent description
-that includes the top-level concept + each sub-axiom + a "how the parts
-fit together" paragraph, then capture **one** prefix from that document.
-See `axiom_registry.composed_description`, `Prefix.from_axiom`, and
-`run_composed_axiom_demo.py`. This works because it aligns the cached
-state with the model's training distribution (one document defining a
-compositional thing) — the cross-references are formed by the model's
-own attention dynamics during the read. APE / per-block / CacheBlend
-are kept in the codebase as documented negative results.
-
-Two gaps still active:
-
-**2. RLHF / chat models are unreliable.** On Qwen 2.5-32B-Instruct
-(same architecture, RLHF'd), prefix tuning works for ~6/10 axioms.
-Strong-fact axioms (BP, JOTP, Flaxum, fjord_wave) work; "I don't know
-that term" refusal patterns intercept ~4/10. Base models are the
-reliable target right now.
-
-**3. Sliding-window attention models break entirely.** On
-Gemma 4-31B-IT (hybrid 5:1 local:global attention), prefix tuning
-produced **null effect across all 10 axioms** — outputs identical to
-baseline. Likely cause: most layers' sliding window doesn't reach back
-to the prefix positions. Fix would require injecting only at global-
-attention layers (every 5th layer in Gemma 4) or rebuilding the attention
-mask. Parked in `THINGS_TO_TRY.md`.
-
-These are tractable engineering problems, not architectural impossibilities.
-But they bound where the technique works *today* to dense-attention base
-models (the Qwen base family being the validated target).
-
-## Why this matters at scale
-
-The deeper claim is about how LLMs gain new understanding at all.
-
-Today, "the model knows X" is a property of the training set. If X
-wasn't in the training data — a paper from last week, a library
-released after cutoff, a niche specialization, a brand new product, a
-domain the model under-represents, anything you just invented — the
-model is blind. The two existing options for fixing that (fine-tuning,
-RAG) both treat the model as a closed black box: rebuild it, or
-hand-feed it at query time.
-
-If multi-axiom and recursive composition land cleanly, **frozen LLMs
-become genuinely extensible**. New understanding gets added in seconds,
-composes with existing knowledge, doesn't degrade with use, and
-doesn't show up in the user's prompt. The model's knowledge boundary
-becomes "what someone has registered" rather than "what was in
-pretraining".
-
-Several specific things open up:
-
-- **Post-training-cutoff knowledge becomes accessible.** A paper
-  published this week, a library released yesterday, a product
-  announced this morning — the model can be taught any of them in
-  seconds. Today's only options are "wait for the next training run"
-  or "paste the doc into every prompt".
-- **Specialized domains stop requiring fine-tuned models.** Niche
-  medical / legal / scientific subfields, individual programming
-  languages or DSLs the model under-represents — registered as
-  axioms, the model gains domain competence on demand.
-- **Knowledge graphs stop being inert databases.** When paired with a
-  structured graph (e.g. [Mimir](https://github.com/mattyv/Mimir),
-  which crawls Confluence/GitHub/Slack into a typed graph with
-  provenance, ACLs, and temporal validity), each graph node becomes a
-  registerable axiom. Queries activate axioms rather than returning
-  text the model has to re-read. The graph becomes part of the
-  reasoning substrate, not a database the model consults via tool
-  calls.
-- **Per-user personalization without fine-tuning.** Communication
-  style, ongoing projects, personal codebase, recent context — loaded
-  at session start, unloaded at session end. The model knows you
-  without your data ever entering its weights.
-- **Behavior priming as a deployment surface.** Axioms aren't only
-  "facts" — they're stored compositions of model concepts. Coding
-  style guides, debugging methodologies, personas, safety policies —
-  all encodable as axioms, hot-loadable at inference.
-- **A "missing middle" memory layer between context window
-  (short-term) and weights (long-term).** Structured, reusable
-  knowledge, updatable in seconds, evictable, filterable.
-- **Live-current AI.** Continuous crawling + per-page axiom
-  registration → the model's knowledge stays current to the minute,
-  no retraining cycle.
-- **An alternative to "scale is all you need" for specialized tasks.**
-  Capability via raw model scale becomes one axis; capability via
-  rich registered context becomes another. Smaller frozen bases plus
-  great axiom layers become viable for many real-world tasks.
-
-The shape is closest to the kernel/userspace split in operating systems.
-Frontier labs continue training large bases (the kernel). Specialized
-applications build axiom layers on top through stable interfaces
-(userspace). The two layers update at different cadences with different
-cost structures. **AI deployment gets userspace.**
-
-There's a cautionary side too. The same mechanism that loads a
-research paper loads any priming. Axioms become a new **alignment
-surface**: adversarial axioms could override safety training without
-weight changes; steganographic axioms could encode behavior changes in
-innocent-looking descriptions. If this scales, axiom auditability —
-provenance, content hashing, ACL enforcement at load time — becomes
-load-bearing. (A structured pipeline like Mimir already has those
-primitives; an axiom layer built on top of it would inherit them.)
-
-What could still kill it: (a) multi-axiom interference turns out to be
-fundamental, not fixable by RoPE-correction or joint encoding;
-(b) description-init alone isn't stable at thousands of axioms and
-needs gradient training that introduces drift; (c) frontier models
-adopt sliding-window attention en masse, leaving us stuck on a
-shrinking subset of architectures; (d) prefill latency for joint
-encoding at multi-axiom scale exceeds production latency budgets. Each
-is a real risk, none is a known dead-end.
-
-If we land it, the door this opens isn't "better RAG". It's a new
-architectural primitive for how AI integrates with structured
-organizational knowledge.
-
-## Two words we use very precisely
-
-The difference matters:
-
-- **Train** — change the model's actual weights. Slow, expensive, has
-  to be redone whenever something changes. Fine-tuning, LoRA, full
-  retraining are all forms of training. The model is byte-for-byte
-  *different* afterwards.
-- **Understand** — *don't* change weights. Hand the model a small piece
-  of structured information that represents the new term's meaning, and
-  splice it into the model's processing at the right moment. The model
-  is byte-for-byte *identical* before and after; the side artifact
-  carries the new knowledge.
-
-This repo is about **understanding**, not training. Per-axiom registration
-runs once on the description text. The model never sees gradients.
-Knowledge lives in side dictionaries hot-loadable at inference.
-
-## The conceptual core: new meaning from old meaning
-
-The technique only works because of a single load-bearing fact: **we
-build the axiom out of concepts the model already understands**.
-
-When we register `Balance Publisher` with the description "service that
-connects to a crypto exchange, polls sub-account balances every 250ms,
-publishes balance events to Kafka", every individual concept in that
-sentence is already in the model's weights:
-
-- "service" — the model knows what software services are
-- "crypto exchange" — pretrained on millions of mentions
-- "polls" / "250ms" — networking + millisecond timing
-- "sub-account balances" — accounts and balances
-- "Kafka" — the message broker
-- "publishes events" — pub/sub patterns
-
-What's *new* is the **specific composition** of these known pieces into
-a single named entity. The axiom prefix doesn't carry "the meaning of
-Balance Publisher" as some standalone novel information — it carries
-**the model's own composed view of how these familiar concepts fit
-together for this particular term**.
-
-This is why the technique can do more than recite. When we ask "if Kafka
-has 500ms latency, what's the user-visible effect on the trading
-system?", the model reasons by combining:
-- the axiom-specific composition (BP polls every 250ms, publishes to
-  Kafka — *from the registered prefix*)
-- general Kafka behavior under producer latency (*from pretrain*)
-- general trading-system requirements (*from pretrain*)
-
-The novel answer comes out the other side. Not because we taught the
-model anything new about Kafka or trading, but because we gave it a
-specific *composition* that it could plug into its existing
-understanding.
-
-This also explains the technique's hard limits:
-
-- **Axioms made of pretrain-unknown concepts won't work.** If a
-  description used only made-up technical jargon, the model would have
-  nothing to anchor on — it would be reading words it doesn't understand,
-  and the "composed K/V state" would be junk.
-- **Stronger pretrain knowledge of the underlying concepts → better
-  reasoning about the axiom.** This is why we get clean results on
-  software systems (model knows software well) and music genres (model
-  knows music vocabulary), and weaker results on highly novel concepts
-  with no nearby pretrain anchor.
-- **The model's existing biases come through.** When `compute_volatility`
-  is registered with "rolling stddev", the model sometimes confabulates
-  "annualized log-returns × √252" instead — pretrain priors on what
-  volatility code "usually looks like" leaking into the recall.
-
-The right mental model: the axiom prefix is **a specific arrangement of
-the model's existing understanding**, not a new piece of knowledge sitting
-beside it. Registration is the model reading a description and forming
-a thought; we save that thought and replay it on demand.
-
-## How it works (plain English)
-
-Imagine reading a paragraph about a new concept. After you finish, your
-brain has a "freshly-read" mental state — context loaded, terms primed,
-implications half-formed. If someone now asks you a question about that
-concept, you can answer because your mind is in the right state.
-
-When a transformer processes text, it builds up the same kind of
-"freshly-read state" inside its attention mechanism. Every layer
-accumulates an internal representation called the **K/V cache** —
-essentially "the model's working memory of what it's just read".
-
-Mimir-Protocol's core trick: **capture that working-memory state once
-per axiom (during registration), then splice it back into the model's
-attention at query time**. The model behaves as if it had just read the
-description, even though no text appeared in the user's prompt.
-
-```
-Registration (once per axiom, ~1 second):
-  description text → model forward pass → save K/V cache → store as "prefix"
-
-Inference (per user query):
-  load relevant axiom's prefix → splice into model's attention →
-  user query runs as normal, attention can read the prefix as context
-```
-
-The user's prompt is unchanged. The model's weights are unchanged. The
-prefix is the only side artifact. Storage per axiom: ~4 MB.
-
-## How it works (technical)
-
-For mech-interp readers:
-
-```
-Registration:
-  ids = tokenize(description)
-  out = model(ids, use_cache=True)
-  prefix.K[L], prefix.V[L] = out.past_key_values[L]   for L in target_layers
-  store prefix on disk (~4 MB at top-half layers, bf16, n_tokens=32)
-
-Inference:
-  cache = DynamicCache()
-  for L in 0..n_layers-1:
-    if L in target_layers: cache[L] = (prefix.K[L], prefix.V[L])
-    else:                  cache[L] = (zeros, zeros)    # uniform shape
-  output = model(user_prompt_ids, past_key_values=cache, use_cache=True)
-```
-
-**Layer selection.** Inject at the **top-half** layers (e.g. 32-63 of 64
-on Qwen 32B). Earlier layers carry generic-token information; later
-layers carry the description-composed state we want to inject. Full-stack
-injection caused looping (prefix dominated attention everywhere); top-
-half is the sweet spot.
-
-**Multi-axiom loading.** Concatenate prefixes' K/V tensors along the
-sequence dimension. Critical: each prefix was captured starting at
-absolute position 0, so its K vectors carry RoPE rotations for positions
-0..n-1. When loaded as the second/third/etc. prefix, those rotations
-*don't match the cache-slot positions* — two prefixes' K[i] both look
-like they're at position i to attention. We fix this with **RoPE
-re-rotation at load time**: apply RoPE for offset O on top of the
-captured K vectors so each prefix's positional phase matches its
-cache-slot position. RoPE rotations compose additively, so this is one
-cheap rotation per prefix per layer at load time. This fix specifically
-solved the 2-prefix contradiction case.
-
-**What does *not* require training.** Everything above is gradient-free.
-Description forward pass during registration uses no labels. Inference
-is standard greedy decode with a populated cache. The original prefix-
-tuning paper trained the prefix tensors; we just capture them from the
-description forward pass. Trying gradient refinement of the captured K/V
-helped 7/10 axioms slightly but degraded 3/10 (drifted toward average
-paraphrase context, diluting description specifics) — so the production
-recipe is **init-only, no training**.
+| Adds description to user prompt? | **yes** | no | no |
+| Changes model weights? | no | **yes** | no |
+| Per-concept registration cost | free (store text) | hours of GPU | **~12 min** |
+| Works for post-cutoff knowledge? | yes | yes | yes |
+| Scales to many concepts? | context-window bound | retrain time bound | **yes** |
+| Boundary discipline (decline out-of-scope)? | depends on prompt | yes | **yes** |
+
+The strategic shape: a frozen base model plus a cheap, hot-loadable layer of
+new concepts, no weight changes. New understanding is added in minutes, not
+hours. The model's knowledge boundary moves from "what was in the training set"
+to "what we can describe in a paragraph and register".
+
+## What's in scope vs out of scope
+
+**Works:**
+- Factual Q+A about a described entity (what does X do, what are X's parameters)
+- Boundary discipline (declining questions not covered by the description)
+- Overview generation ("Tell me about X")
+- Multi-axiom sessions (N axioms simultaneously, each fires at its own term)
+- Code-entity axioms (function signatures, API specs — factual Q+A about the code)
+
+**Doesn't work:**
+- Cross-axiom comparison ("which of A and B is faster?") — retrieve facts
+  per-term first, then reason in context
+- Novel skill injection (DSLs, algorithms) — use LoRA for procedural generation
+- CoT prompting — use direct Q→A format; CoT degrades retrieval
+- RLHF/instruct models — base models are the reliable target
+- Sliding-window attention (Gemma 4) — most layers don't reach the term position
+
+## Two words we use precisely
+
+- **Train** — change the model's weights. Fine-tuning, LoRA, full retraining.
+  The model is byte-for-byte *different* afterwards.
+- **Understand** — don't change weights. Train small per-axiom MLP patches that
+  fire at inference time. The base model is byte-for-byte *identical*; the
+  patches carry the new knowledge.
 
 ## Try it
 
-You'll need [uv](https://github.com/astral-sh/uv), an HF account if the
-chosen model is gated, and either:
-- A Mac with Apple Silicon (works for tiny models, e.g. Qwen 0.5B)
-- An NVIDIA GPU with ≥80 GB (for the Qwen 32B base validation runs)
-- [Modal](https://modal.com) account (recommended — what the repo's
-  validation runs use)
-
 ```bash
-uv sync                                           # install deps
+uv sync
 
-# Run the prefix-tuning gauntlet on Qwen 32B base via Modal
-# (full 10-axiom test, init-only, top-half layers):
-modal run modal_blends.py::prefix_gauntlet \
-  --model "Qwen/Qwen2.5-32B" \
-  --n-prefix-tokens 32 \
-  --target-layers "$(python3 -c "print(','.join(str(i) for i in range(32, 64)))")" \
-  --skip-training
+# Run the full MLP axiom demo (BalancePublisher + FluxomService) on Modal:
+modal run modal_blends.py::axiom_mlp_demo
 
-# Reasoning composition test (axiom + pretrain knowledge):
-modal run modal_blends.py::reasoning_test \
-  --model "Qwen/Qwen2.5-32B" \
-  --target-layers "$(python3 -c "print(','.join(str(i) for i in range(32, 64)))")"
-
-# Dependency-chain test (services + C++ functions, with naive vs RoPE-corrected A/B):
-modal run modal_blends.py::chain_test \
-  --model "Qwen/Qwen2.5-32B" \
-  --target-layers "$(python3 -c "print(','.join(str(i) for i in range(32, 64)))")"
-
-# Run tests:
-uv run pytest tests/
+# Proof-of-concept on a fictional axiom ("Glorbox"), local or Modal:
+PYTHONPATH=src uv run python -m marker.run_axiom_mlp_mini   # local (1.5B)
+modal run modal_blends.py::axiom_mlp                         # Modal (32B)
 ```
-
-For local experimentation on a tiny model:
-```bash
-PYTHONPATH=src uv run python -m marker.run_prefix_demo \
-  --model-name "Qwen/Qwen2.5-0.5B" --skip-training
-```
-
-Outputs are printed in three columns per prompt: `[baseline]` (no
-prefix), `[prefix-init]` (prefix loaded), `[prefix-trn]` (prefix after
-gradient refinement, only if `--skip-training` is omitted).
 
 ## Repo layout
 
 ```
 src/marker/
-  prefix_tuning.py            # the core: Prefix dataclass, capture from
-                              # description, KV-cache injection,
-                              # RoPE re-rotation for multi-prefix
-  axiom_registry.py           # 10 test axioms with descriptions, prompts,
-                              # paraphrases. Plus CHAIN_AXIOMS for the
-                              # service + C++ dependency-chain tests
-  run_prefix_demo.py          # the validated 10-axiom prefix gauntlet
-  run_reasoning_demo.py       # composition test: axiom facts + pretrain
-  run_chain_demo.py           # dependency chains, naive vs RoPE-corrected
-  register_axiom.py           # the older closed-form residual-injection
-                              # path (single-vector, kept for comparison)
-  soft_prompt.py              # earlier soft-prompt approach at L0,
-                              # superseded by prefix tuning
+  run_axiom_mlp_demo.py     # main demo: trains MLP per axiom, full probe
+                            # suite (TRAIN/HELDOUT/BOUNDARY/TELL_ME +
+                            # multi-axiom + cross-axiom 5-condition matrix)
+  run_axiom_mlp_mini.py     # minimal local test on fictional "Glorbox" axiom
 
-modal_blends.py               # Modal entrypoints for cloud runs
-data/                         # paraphrase JSON files per axiom
-tests/                        # mechanical invariants
-docs/                         # technique writeups
-CONCLUSIONS.md                # full project journal — read this for context
-THINGS_TO_TRY.md              # parked ideas (Gemma sliding-window etc.)
+  prefix_tuning.py          # full KV prefix approach (still works, used as
+                            # teacher to generate synthetic Q+A)
+  axiom_registry.py         # test axioms with descriptions and Q+A
+  soft_prompt*.py           # earlier soft-prompt approaches (v5-v9)
+  soft_prompt_slots.py      # v9: slot-assigned soft prompts
+  run_soft_prompt_*_demo.py # v5-v9 demo scripts
+
+modal_blends.py             # Modal entrypoints for all cloud runs
+tests/                      # mechanical invariants
+CONCLUSIONS.md              # full project journal
+FAILED_IDEAS.md             # documented dead ends
+THINGS_TO_TRY.md            # parked ideas
 ```
 
-## What this is not
+## Related work
 
-- **Not RAG.** No description text appears in the user's prompt. The
-  prefix carries the meaning at the attention-state level, not the input
-  token level.
-- **Not training.** Base model is frozen. Per-axiom cost is one forward
-  pass on the description. Gradient training is available but not the
-  recommended path (sometimes hurts; init-only works on 10/10).
-- **Not new knowledge in MLP weights.** MLP weights store world knowledge
-  the model learned during pretraining. Prefix tuning bypasses MLP and
-  pre-installs the *attention working memory* the model would have built
-  up if it had read the description. This is why it works for novel
-  terms (Flaxum, JOTP) where MLP has nothing relevant to retrieve — the
-  prefix supplies the description-composed K/V, and the model's queries
-  attend to it.
-
-## What's next (queued for tomorrow morning)
-
-1. **Path 2: per-query joint encoding for 3+ prefix chains.** Tokenize
-   all relevant descriptions, run one prefill, use the resulting cache
-   as the prefix. Mechanically guaranteed to work; fixes the 3-prefix
-   regression. Trade-off: costs a prefill per query.
-2. **Term-detection routing for production.** Match user queries
-   against the term registry, load only the matching axiom prefixes.
-   Necessary scaffolding regardless of which deeper fix wins.
-3. Investigate the `compute_volatility` confabulation: model
-   consistently invents "annualized log-returns + sqrt(252)" instead
-   of the axiom's plain rolling stddev. Possible attention-layer leak
-   from finance-code pretrain priors overriding our prefix on this
-   specific function. Diagnostic, not a feature.
-
-Beyond near-term:
-
-- Real Confluence ingestion pipeline — register each page as an axiom,
-  test on internal-jargon queries against your team's docs.
-- Save/load prefix payloads to disk + hot-load registry.
-- Sliding-window attention support (Gemma 4, Mistral) — needs a
-  different injection strategy.
-
-## Related work, briefly
-
-- **Prefix tuning** (Li & Liang 2021): trained prefix K/V at every
-  layer. We use the same structural primitive but capture from a
-  description forward pass instead of training the prefix.
-- **In-Context Learning Creates Task Vectors** (Hendel et al. 2023):
-  argues that an in-context demonstration creates a task vector that
-  guides the model. Conceptually similar — we capture the analogous
-  vector from a description.
-- **Engram** (DeepSeek 2026): N-gram-based static memory module
-  jointly trained with the model. Same family of ideas (sparse
-  external knowledge index for frozen reasoning), but pretrain-time
-  not post-deploy.
-- **ROME / MEMIT** (Meng et al. 2022): targeted MLP weight edits to
-  install specific facts. Different mechanism (modifies weights);
-  hard ceiling around ~1000 edits before interference.
-- **RAG**: pasting retrieved documents into the prompt at query time.
-  The dominant production approach today; the alternative this repo
-  explores avoiding.
-
-## Glossary
-
-- **LLM** — Large Language Model. Predicts the next token given the
-  previous tokens.
-- **Token** — chunk of text the model processes (roughly a word or
-  subword).
-- **Layer** — one stage in the model's pipeline. Modern LLMs have
-  ~24-80 layers.
-- **Residual stream / hidden state** — the running vector flowing
-  through the model's layers, updated by each layer.
-- **K/V cache (attention cache)** — when processing a sequence, the
-  model stores per-layer "key" and "value" tensors for each token
-  position. Future tokens' attention reads from these. The cache is
-  what we capture as a "prefix" during axiom registration.
-- **Prefix** — in this repo, a stored snapshot of the K/V cache after
-  the model processed an axiom description. ~4 MB per axiom. Splice
-  it into the cache at inference and the model behaves as if it had
-  just read the description.
-- **RoPE** — Rotary Position Embeddings. The way modern LLMs encode
-  token position into K/V vectors via 2D rotations. Important for us
-  because each captured prefix has RoPE rotations for positions 0..n-1
-  (where it was captured), so when loaded at a different cache offset
-  it needs re-rotation to match its new position.
-- **Hook** — a function attached to a layer that lets us read or
-  modify what flows through. (Used in older paths in this repo;
-  prefix tuning uses the standard `past_key_values` API instead.)
-- **α (alpha)** — strength knob for the older single-vector residual
-  injection. Not used in prefix tuning (no scaling parameter).
-- **RAG** — Retrieval-Augmented Generation. Retrieve relevant docs
-  and stuff them into the prompt. The standard production
-  alternative.
-- **Understand vs train** — see the section above. *Understand* =
-  per-axiom registration without weight changes. *Train* = modify
-  weights (LoRA, fine-tuning, full retraining).
+- **Prefix tuning** (Li & Liang 2021): trained prefix K/V at every layer —
+  same structural idea, trained not captured.
+- **ROME / MEMIT** (Meng et al. 2022): targeted MLP weight edits. Modifies
+  weights; hard ceiling ~1000 edits before interference.
+- **Doc-to-LoRA / Text-to-LoRA** (Sakana AI, 2025-26): hypernetwork produces
+  LoRA weights from a description. Right approach for *skills*; Mimir handles
+  *facts* without weight changes.
+- **RAG**: paste retrieved docs into the prompt. Dominant production approach
+  today; the alternative this repo avoids.
 
 ## License
 
