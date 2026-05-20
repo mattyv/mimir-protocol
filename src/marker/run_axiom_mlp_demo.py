@@ -199,10 +199,12 @@ def compute_axiom_kv(model, tokenizer, description: str) -> tuple:  # noqa: ANN0
     )
     out = model(desc_ids, use_cache=True)
     kv = out.past_key_values
-    # Newer transformers returns a DynamicCache object; normalize to tuple-of-(K,V).
+    # Newer transformers may return a DynamicCache; normalize to tuple-of-(K,V).
     if hasattr(kv, "to_legacy_cache"):
         kv = kv.to_legacy_cache()
-    return tuple((k.detach(), v.detach()) for k, v in kv)
+    # Use index access rather than unpacking — some versions include extra elements
+    # (e.g. scale factors for quantized KV) beyond the (K, V) pair.
+    return tuple((layer_kv[0].detach(), layer_kv[1].detach()) for layer_kv in kv)
 
 
 def merge_axiom_kvs(kvs: list[tuple]) -> tuple:
