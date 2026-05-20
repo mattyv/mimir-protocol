@@ -217,6 +217,64 @@ extra-careful tuning a full per-axiom training can give.
 HyperPrompt papers), instance-level prompt-tuning, P-tuning v2 with
 shared prefix.
 
+## Skill injection via decode-time MLP firing
+
+**The idea:** facts and skills need different injection modes.
+
+- **Fact axiom** (current): MLP fires during prefill at the term's token position.
+  The residual at that position encodes the answer; decode attends back to it.
+  One retrieval step is enough.
+
+- **Skill axiom** (proposed): MLP fires during prefill AND at every decode step.
+  The MLP continuously steers the residual of each generated token toward the
+  skill's output pattern — like a persistent nudge on every token.
+
+**Trigger:** user writes `#SkillName` in the message. The term is found in the
+token stream, hooks fire at that position during prefill (same as facts), and
+because `skill_mode=True` on the `AxiomMLP`, hooks also fire at position 0 of
+every decode step for that turn only.
+
+**Training change:** for skill mode, fire hooks at answer token positions too
+(not just question positions), so the MLP learns to steer generation throughout:
+
+```python
+# Fact mode: hooks at term positions in question only
+# Skill mode: hooks at term positions + all answer token positions
+if axiom_mlp.skill_mode:
+    positions += list(range(q_ids.shape[1], full_ids.shape[1]))
+```
+
+**Inference change:** decode loop installs hooks for skill axioms at position 0
+of each decode step, removes after each step:
+
+```python
+for _ in range(max_new - 1):
+    handles = []
+    for axiom_mlp in axiom_mlps:
+        if axiom_mlp.skill_mode:
+            handles.extend(install_hooks(model, axiom_mlp, [0]))
+    out = model(next_tok, past_key_values=past, use_cache=True)
+    for h in handles: h.remove()
+```
+
+**What skills this could cover:**
+- Output format rules ("always return JSON with fields x, y, z")
+- Fictional API usage patterns ("call `client.emit(channel, payload)` to send")
+- Naming conventions, terminology, code style
+
+**What it can't cover:** novel syntax/DSLs, complex algorithms, anything
+requiring the pattern baked into weights for reliable multi-step generation.
+For those, LoRA is the right tool — it modifies weights permanently so every
+token benefits without needing the hook overhead.
+
+**KV cache role:** the description KV (always in session) gives the model the
+"open book" — examples, API signatures, pseudocode. The decode-time MLP adds
+the continuous steering. Together they approximate "I know this skill" without
+weight changes.
+
+**Effort:** ~2 hours. `skill_mode: bool = False` flag on `AxiomMLP`, training
+loop change, decode loop change. A fictional API test axiom would validate it.
+
 ## Recommendation
 
 Start with **decode-time logit biasing**. It's the cheapest, has
