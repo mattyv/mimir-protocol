@@ -379,7 +379,11 @@ def generate_with_mlps(
     device = next(model.parameters()).device
     ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
-    available_kvs = [a.kv for a in axiom_mlps if a.kv is not None]
+    # Only inject KV for axioms whose term appears in this prompt — avoids bleed
+    # when a single-axiom question is asked in a multi-axiom session.
+    available_kvs = [
+        a.kv for a in axiom_mlps if a.kv is not None and _find_term_positions(ids, a.term_token_ids)
+    ]
     merged_kv = (
         _build_dynamic_cache(merge_axiom_kvs(available_kvs), device) if available_kvs else None
     )
@@ -408,6 +412,69 @@ def generate_with_mlps(
             break
 
     return tokenizer.decode(torch.cat(out_ids, dim=1)[0], skip_special_tokens=True).strip()
+
+
+class AxiomSession:
+    """Multi-turn chat session with persistent axiom KV across turns.
+
+    All registered axiom KVs are merged and injected once at session init.
+    They live at the start of past_key_values for every subsequent turn —
+    the model can always attend to them regardless of whether the term is
+    named in the current message.
+
+    MLP hooks still fire per-turn at term positions in the current prompt,
+    providing query-conditional routing on top of the stable KV foundation.
+
+    Usage:
+        session = AxiomSession(model, [bp_mlp, fs_mlp])
+        ans1 = session.chat(model, tokenizer, "Q: How often does BalancePublisher poll?\\nA:")
+        ans2 = session.chat(model, tokenizer, "Q: What does it publish?\\nA:")  # no term needed
+        session.reset(model)  # start a new conversation
+    """
+
+    def __init__(self, model, axiom_mlps: list[AxiomMLP]) -> None:  # noqa: ANN001
+        self.axiom_mlps = axiom_mlps
+        self.past = self._build_session_kv(model)
+
+    def _build_session_kv(self, model):  # noqa: ANN001
+        device = next(model.parameters()).device
+        available = [a.kv for a in self.axiom_mlps if a.kv is not None]
+        return _build_dynamic_cache(merge_axiom_kvs(available), device) if available else None
+
+    @torch.no_grad()
+    def chat(self, model, tokenizer, prompt: str, max_new: int = 120) -> str:  # noqa: ANN001
+        device = next(model.parameters()).device
+        ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+
+        handles = []
+        for axiom_mlp in self.axiom_mlps:
+            positions = _find_term_positions(ids, axiom_mlp.term_token_ids)
+            if positions:
+                handles.extend(install_hooks(model, axiom_mlp, positions))
+
+        try:
+            out = model(ids, past_key_values=self.past, use_cache=True)
+            past = out.past_key_values
+            next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+        finally:
+            for h in handles:
+                h.remove()
+
+        out_ids = [next_tok]
+        for _ in range(max_new - 1):
+            out = model(next_tok, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+            out_ids.append(next_tok)
+            if int(next_tok.item()) == tokenizer.eos_token_id:
+                break
+
+        self.past = past  # grow session KV for next turn
+        return tokenizer.decode(torch.cat(out_ids, dim=1)[0], skip_special_tokens=True).strip()
+
+    def reset(self, model) -> None:  # noqa: ANN001
+        """Start a new conversation, restoring session to axiom-KV-only state."""
+        self.past = self._build_session_kv(model)
 
 
 MULTI_AXIOM_PROBES = [
@@ -614,6 +681,33 @@ def main() -> None:
         print(f"\n[{label}]  {q_display}")
         print(f"  [A no-axiom]:    {out_a[:240].replace(chr(10), ' ')}")
         print(f"  [M multi-mlp+kv]:{out_m[:240].replace(chr(10), ' ')}")
+
+    # ── Multi-turn chat session ───────────────────────────────────────────────
+    # AxiomSession injects all axiom KVs once at init. Each turn the model can
+    # attend to any registered axiom's description regardless of whether the
+    # term appears in the current message.
+    print("\n" + "=" * 78)
+    print("MULTI-TURN CHAT SESSION")
+    print("=" * 78)
+
+    session = AxiomSession(model, trained_mlps)
+
+    multi_turn_chat = [
+        # Turn 1: name BP — hooks fire, KV already in session
+        "Q: How often does BalancePublisher poll?\nA:",
+        # Turn 2: follow-up without naming BP — no hooks, but session KV persists
+        "Q: What does it publish?\nA:",
+        # Turn 3: switch to FS — hooks fire for FS
+        "Q: What format does FluxomService output?\nA:",
+        # Turn 4: cross-axiom in context of ongoing session
+        "Q: Which of the two services we've discussed writes to Kafka?\nA:",
+    ]
+
+    for i, prompt in enumerate(multi_turn_chat, 1):
+        q_display = prompt.replace("Q: ", "").replace("\nA:", "")
+        ans = session.chat(model, tokenizer, prompt, max_new=args.max_new)
+        print(f"\n  Turn {i}: {q_display}")
+        print(f"    {ans[:200].replace(chr(10), ' ')}")
 
     # ── Cross-axiom 5-condition matrix ────────────────────────────────────────
     # Conditions:
