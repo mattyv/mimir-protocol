@@ -7,7 +7,13 @@ Training pipeline (v2):
   4. Generic boundary examples (decline out-of-scope questions).
 
 Architecture: SmallMLP at 3 chosen layers per axiom, r=32, cosine LR decay.
-Compares [A no-axiom] vs [P full-prefix] vs [M mlp] on TRAIN/HELDOUT/BOUNDARY/TELL_ME.
+Each axiom also carries a frozen KV cache of its description (computed once before
+training). During both training and inference the description KV is prepended to
+past_key_values so the model can attend to it at every decode step — fixing the
+passive-retrieval problem. The MLP's job is then boundary enforcement + routing,
+not fact compression.
+
+Compares [A no-axiom] vs [P full-prefix] vs [M mlp+kv] on TRAIN/HELDOUT/BOUNDARY/TELL_ME.
 """
 
 from __future__ import annotations
@@ -122,6 +128,7 @@ class AxiomMLP:
     term_token_ids: list[int]
     chosen_layers: list[int]
     mlps: nn.ModuleList
+    kv: tuple | None = None  # frozen description KV, set by compute_axiom_kv()
 
 
 def make_axiom_mlp(model, tokenizer, term: str, chosen_layers: list[int], r: int = 32) -> AxiomMLP:  # noqa: ANN001
@@ -173,6 +180,36 @@ def install_hooks(model, axiom_mlp: AxiomMLP, positions: list[int]):  # noqa: AN
         h = model.model.layers[layer_idx].register_forward_hook(_make_layer_hook(mlp, positions))
         handles.append(h)
     return handles
+
+
+# ── Axiom KV cache ────────────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def compute_axiom_kv(model, tokenizer, description: str) -> tuple:  # noqa: ANN001
+    """Run description through frozen model once and cache the resulting K/V.
+
+    The cached KV is prepended to past_key_values at every forward pass so the
+    model can attend to description tokens during prefill and all decode steps.
+    Detached from the computation graph — it is never trained.
+    """
+    device = next(model.parameters()).device
+    desc_ids = tokenizer(description, add_special_tokens=False, return_tensors="pt").input_ids.to(
+        device
+    )
+    out = model(desc_ids, use_cache=True)
+    return tuple((k.detach(), v.detach()) for k, v in out.past_key_values)
+
+
+def merge_axiom_kvs(kvs: list[tuple]) -> tuple:
+    """Concatenate per-axiom KVs along the sequence dimension for multi-axiom inference."""
+    return tuple(
+        (
+            torch.cat([kv[layer][0] for kv in kvs], dim=2),
+            torch.cat([kv[layer][1] for kv in kvs], dim=2),
+        )
+        for layer in range(len(kvs[0]))
+    )
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -230,7 +267,8 @@ def train(
         handles = install_hooks(model, axiom_mlp, positions)
         try:
             optim.zero_grad()
-            loss = model(full_ids, labels=labels).loss
+            # Inject frozen description KV so MLP trains in the same context as inference.
+            loss = model(full_ids, past_key_values=axiom_mlp.kv, labels=labels).loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(axiom_mlp.mlps.parameters(), max_norm=1.0)
             optim.step()
@@ -259,6 +297,8 @@ def generate_with_mlp(
     device = next(model.parameters()).device
     ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
+    axiom_kv = axiom_mlp.kv if axiom_mlp is not None else None
+
     handles = []
     if axiom_mlp is not None:
         positions = _find_term_positions(ids, axiom_mlp.term_token_ids)
@@ -266,7 +306,7 @@ def generate_with_mlp(
             handles = install_hooks(model, axiom_mlp, positions)
 
     try:
-        out = model(ids, use_cache=True)
+        out = model(ids, past_key_values=axiom_kv, use_cache=True)
         past = out.past_key_values
         next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
     finally:
@@ -303,6 +343,9 @@ def generate_with_mlps(
     device = next(model.parameters()).device
     ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
+    available_kvs = [a.kv for a in axiom_mlps if a.kv is not None]
+    merged_kv = merge_axiom_kvs(available_kvs) if available_kvs else None
+
     handles = []
     for axiom_mlp in axiom_mlps:
         positions = _find_term_positions(ids, axiom_mlp.term_token_ids)
@@ -310,7 +353,7 @@ def generate_with_mlps(
             handles.extend(install_hooks(model, axiom_mlp, positions))
 
     try:
-        out = model(ids, use_cache=True)
+        out = model(ids, past_key_values=merged_kv, use_cache=True)
         past = out.past_key_values
         next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
     finally:
@@ -464,6 +507,14 @@ def main() -> None:
             f"term_token_ids={axiom_mlp.term_token_ids}  MLP params: {n_params:,} ({n_params * 4 / 1024:.0f} KB)"
         )
 
+        # Compute and attach the description KV cache (done once, before training).
+        print("  computing description KV cache...")
+        t_kv = time.time()
+        axiom_mlp.kv = compute_axiom_kv(model, tokenizer, desc)
+        kv_tokens = axiom_mlp.kv[0][0].shape[2]  # seq dim of first layer K
+        kv_mb = sum(k.nbytes + v.nbytes for k, v in axiom_mlp.kv) / 1024**2
+        print(f"  KV: {kv_tokens} description tokens, {kv_mb:.1f} MB  ({time.time() - t_kv:.1f}s)")
+
         t0 = time.time()
         losses = train(
             model,
@@ -494,7 +545,7 @@ def main() -> None:
                 print(f"  Q: {q}")
                 print(f"    [A no-axiom]:  {out_a[:200].replace(chr(10), ' ')}")
                 print(f"    [P prefix]:    {out_p[:200].replace(chr(10), ' ')}")
-                print(f"    [M mlp]:       {out_m[:200].replace(chr(10), ' ')}")
+                print(f"    [M mlp+kv]:    {out_m[:200].replace(chr(10), ' ')}")
 
         train_qs = [q for f in axiom["facts"] for q in f["questions_train"][:1]]
         run_probe("TRAIN (1 per fact)", train_qs)
@@ -517,8 +568,8 @@ def main() -> None:
         out_a = generate_with_mlp(model, tokenizer, prompt, max_new=args.max_new)
         out_m = generate_with_mlps(model, tokenizer, prompt, trained_mlps, max_new=args.max_new)
         print(f"\n[{label}]  {q_display}")
-        print(f"  [A no-axiom]:  {out_a[:240].replace(chr(10), ' ')}")
-        print(f"  [M multi-mlp]: {out_m[:240].replace(chr(10), ' ')}")
+        print(f"  [A no-axiom]:    {out_a[:240].replace(chr(10), ' ')}")
+        print(f"  [M multi-mlp+kv]:{out_m[:240].replace(chr(10), ' ')}")
 
     # ── Cross-axiom 5-condition matrix ────────────────────────────────────────
     # Conditions:
