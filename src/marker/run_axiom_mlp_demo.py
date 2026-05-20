@@ -199,23 +199,32 @@ def compute_axiom_kv(model, tokenizer, description: str) -> tuple:  # noqa: ANN0
     )
     out = model(desc_ids, use_cache=True)
     kv = out.past_key_values
-    # Newer transformers may return a DynamicCache; normalize to tuple-of-(K,V).
-    if hasattr(kv, "to_legacy_cache"):
-        kv = kv.to_legacy_cache()
-    # Use index access rather than unpacking — some versions include extra elements
-    # (e.g. scale factors for quantized KV) beyond the (K, V) pair.
-    return tuple((layer_kv[0].detach(), layer_kv[1].detach()) for layer_kv in kv)
+    # Newer transformers returns a DynamicCache; the model also *expects* one back
+    # (it calls .get_seq_length() on it). Detach tensors in-place and return as-is.
+    if hasattr(kv, "key_cache"):
+        kv.key_cache = [k.detach() for k in kv.key_cache]
+        kv.value_cache = [v.detach() for v in kv.value_cache]
+        return kv
+    # Legacy tuple-of-(K,V) path — wrap in DynamicCache for consistency.
+    from transformers import DynamicCache  # noqa: PLC0415
+
+    cache = DynamicCache()
+    for layer_kv in kv:
+        cache.key_cache.append(layer_kv[0].detach())
+        cache.value_cache.append(layer_kv[1].detach())
+    return cache
 
 
-def merge_axiom_kvs(kvs: list[tuple]) -> tuple:
-    """Concatenate per-axiom KVs along the sequence dimension for multi-axiom inference."""
-    return tuple(
-        (
-            torch.cat([kv[layer][0] for kv in kvs], dim=2),
-            torch.cat([kv[layer][1] for kv in kvs], dim=2),
-        )
-        for layer in range(len(kvs[0]))
-    )
+def merge_axiom_kvs(kvs: list) -> DynamicCache:  # noqa: F821
+    """Concatenate per-axiom DynamicCaches along the sequence dimension."""
+    from transformers import DynamicCache  # noqa: PLC0415
+
+    merged = DynamicCache()
+    n_layers = len(kvs[0].key_cache)
+    for layer_idx in range(n_layers):
+        merged.key_cache.append(torch.cat([kv.key_cache[layer_idx] for kv in kvs], dim=2))
+        merged.value_cache.append(torch.cat([kv.value_cache[layer_idx] for kv in kvs], dim=2))
+    return merged
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -517,8 +526,14 @@ def main() -> None:
         print("  computing description KV cache...")
         t_kv = time.time()
         axiom_mlp.kv = compute_axiom_kv(model, tokenizer, desc)
-        kv_tokens = axiom_mlp.kv[0][0].shape[2]  # seq dim of first layer K
-        kv_mb = sum(k.nbytes + v.nbytes for k, v in axiom_mlp.kv) / 1024**2
+        kv_tokens = axiom_mlp.kv.key_cache[0].shape[2]  # seq dim of first layer K
+        kv_mb = (
+            sum(
+                k.nbytes + v.nbytes
+                for k, v in zip(axiom_mlp.kv.key_cache, axiom_mlp.kv.value_cache, strict=True)
+            )
+            / 1024**2
+        )
         print(f"  KV: {kv_tokens} description tokens, {kv_mb:.1f} MB  ({time.time() - t_kv:.1f}s)")
 
         t0 = time.time()
