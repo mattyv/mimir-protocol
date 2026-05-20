@@ -119,17 +119,84 @@ Prefill:
 Decode:  attends to [Balance][Publisher] K/V → "Every 250 milliseconds."
 ```
 
+Layer-by-layer view of the prefill:
+
+```
+Layer 0  ──────────────────────────────────────────────────────────────
+Layer 1  ──────────────────────────────────────────────────────────────
+...
+Layer 16 ──── hook fires ──▶ MLP_16(residual at term pos) + offset ───
+...
+Layer 32 ──── hook fires ──▶ MLP_32(residual at term pos) + offset ───
+...
+Layer 48 ──── hook fires ──▶ MLP_48(residual at term pos) + offset ───
+...
+Layer 63 ──────────────────────────────────────────────────────────────
+
+After prefill: K/V at the term positions across all layers carries the
+injected knowledge. Decode runs without hooks — the model attends to
+those positions to answer.
+```
+
 **Multi-axiom:** install all axiom hooks before the forward pass. Each fires
 only at its own term's positions. Different terms → different positions →
 no interference.
+
+```
+"Q: How often does BalancePublisher poll? What format does FluxomService output?\nA:"
+
+  [Balance][Publisher]          [Fluxom][Service]
+        ↑                              ↑
+  BP hooks fire                  FS hooks fire
+  at layers 16,32,48             at layers 16,32,48
+  (independently)                (independently)
+
+Decode attends to BP positions for BP questions,
+       attends to FS positions for FS questions.
+No interference — different positions, different K/V.
+```
 
 ## Why query-conditional routing matters
 
 Unlike static vector injection, the MLP reads the *current residual at the
 term position*, which by mid-layers has integrated the question context via
-attention. The same term in "How often does BalancePublisher poll?" vs "What
-does BalancePublisher publish?" produces different residuals → different MLP
-outputs → different injected facts. The MLP learns to route.
+attention. The same term in different question contexts produces a different
+residual → different MLP output → different fact retrieved:
+
+```
+"How often does BalancePublisher poll?"
+  residual at [BalancePublisher] ≈ identity(BP) + "how often / frequency" context
+  MLP_32 sees this → emits offset toward "250 milliseconds"
+
+"What does BalancePublisher publish?"
+  residual at [BalancePublisher] ≈ identity(BP) + "publish / output" context
+  MLP_32 sees this → emits offset toward "balance events to Kafka"
+```
+
+The MLP learns to route different question shapes to different facts.
+Static approaches (single trained vector, L0 soft prompt) can't do this —
+they emit the same offset regardless of question context.
+
+## The deficiency: passive retrieval
+
+The injection encodes knowledge in the K/V at the term position. During
+decode, the model must attend back to that position to retrieve the fact.
+For direct Q→A this is reliable. Two things break it:
+
+```
+CoT breaks it:
+  "Q: How often does BalancePublisher poll?
+   Let's think step by step.             ← model reasons from priors first
+   A: BalancePublisher is..."            ← wrong path set before retrieval
+
+Cross-axiom comparison breaks it:
+  "Q: Which polls faster, BP or FS?"
+  Model must attend to BP K/V AND FS K/V AND compare — too diffuse.
+  Works in context (facts as tokens); fails with injection (facts in K/V).
+```
+
+**Rule: use direct Q→A format. For cross-axiom reasoning, retrieve facts
+per-term first (works), then ask the comparison question in context.**
 
 ## Per-axiom cost
 
