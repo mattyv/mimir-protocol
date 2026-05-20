@@ -198,7 +198,11 @@ def compute_axiom_kv(model, tokenizer, description: str) -> tuple:  # noqa: ANN0
         device
     )
     out = model(desc_ids, use_cache=True)
-    return tuple((k.detach(), v.detach()) for k, v in out.past_key_values)
+    kv = out.past_key_values
+    # Newer transformers returns a DynamicCache object; normalize to tuple-of-(K,V).
+    if hasattr(kv, "to_legacy_cache"):
+        kv = kv.to_legacy_cache()
+    return tuple((k.detach(), v.detach()) for k, v in kv)
 
 
 def merge_axiom_kvs(kvs: list[tuple]) -> tuple:
