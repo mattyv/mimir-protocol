@@ -123,12 +123,21 @@ class SmallMLP(nn.Module):
 
 
 @dataclass
+class AxiomKV:
+    """Plain-tensor store for per-layer K/V — version-agnostic."""
+
+    n_layers: int
+    keys: list[torch.Tensor]  # (1, n_kv_heads, desc_tokens, head_dim) per layer
+    values: list[torch.Tensor]  # same
+
+
+@dataclass
 class AxiomMLP:
     term: str
     term_token_ids: list[int]
     chosen_layers: list[int]
     mlps: nn.ModuleList
-    kv: tuple | None = None  # frozen description KV, set by compute_axiom_kv()
+    kv: AxiomKV | None = None  # frozen description KV, set by compute_axiom_kv()
 
 
 def make_axiom_mlp(model, tokenizer, term: str, chosen_layers: list[int], r: int = 32) -> AxiomMLP:  # noqa: ANN001
@@ -186,12 +195,12 @@ def install_hooks(model, axiom_mlp: AxiomMLP, positions: list[int]):  # noqa: AN
 
 
 @torch.no_grad()
-def compute_axiom_kv(model, tokenizer, description: str) -> tuple:  # noqa: ANN001
+def compute_axiom_kv(model, tokenizer, description: str) -> AxiomKV:  # noqa: ANN001
     """Run description through frozen model once and cache the resulting K/V.
 
-    The cached KV is prepended to past_key_values at every forward pass so the
-    model can attend to description tokens during prefill and all decode steps.
-    Detached from the computation graph — it is never trained.
+    Stored as plain tensors (AxiomKV) to avoid DynamicCache version differences.
+    A fresh DynamicCache is built from these tensors before each forward pass via
+    _build_dynamic_cache().
     """
     device = next(model.parameters()).device
     desc_ids = tokenizer(description, add_special_tokens=False, return_tensors="pt").input_ids.to(
@@ -199,32 +208,37 @@ def compute_axiom_kv(model, tokenizer, description: str) -> tuple:  # noqa: ANN0
     )
     out = model(desc_ids, use_cache=True)
     kv = out.past_key_values
-    # Newer transformers returns a DynamicCache; the model also *expects* one back
-    # (it calls .get_seq_length() on it). Detach tensors in-place and return as-is.
-    if hasattr(kv, "key_cache"):
-        kv.key_cache = [k.detach() for k in kv.key_cache]
-        kv.value_cache = [v.detach() for v in kv.value_cache]
-        return kv
-    # Legacy tuple-of-(K,V) path — wrap in DynamicCache for consistency.
+    # Normalize to a flat list of (K, V) tensors regardless of cache type.
+    # to_legacy_cache() may return tuples with extra elements (e.g. scale factors);
+    # use index access [0]/[1] rather than unpacking to handle that safely.
+    legacy = kv.to_legacy_cache() if hasattr(kv, "to_legacy_cache") else kv
+    keys = [layer_kv[0].detach() for layer_kv in legacy]
+    values = [layer_kv[1].detach() for layer_kv in legacy]
+    return AxiomKV(n_layers=len(keys), keys=keys, values=values)
+
+
+def merge_axiom_kvs(axiom_kvs: list[AxiomKV]) -> AxiomKV:
+    """Concatenate per-axiom KVs along the sequence dimension for multi-axiom inference."""
+    n = axiom_kvs[0].n_layers
+    return AxiomKV(
+        n_layers=n,
+        keys=[torch.cat([kv.keys[i] for kv in axiom_kvs], dim=2) for i in range(n)],
+        values=[torch.cat([kv.values[i] for kv in axiom_kvs], dim=2) for i in range(n)],
+    )
+
+
+def _build_dynamic_cache(axiom_kv: AxiomKV, device: torch.device):  # noqa: ANN201
+    """Construct a fresh DynamicCache from stored tensors using the stable update() API."""
     from transformers import DynamicCache  # noqa: PLC0415
 
     cache = DynamicCache()
-    for layer_kv in kv:
-        cache.key_cache.append(layer_kv[0].detach())
-        cache.value_cache.append(layer_kv[1].detach())
+    for layer_idx in range(axiom_kv.n_layers):
+        cache.update(
+            axiom_kv.keys[layer_idx].to(device),
+            axiom_kv.values[layer_idx].to(device),
+            layer_idx,
+        )
     return cache
-
-
-def merge_axiom_kvs(kvs: list) -> DynamicCache:  # noqa: F821
-    """Concatenate per-axiom DynamicCaches along the sequence dimension."""
-    from transformers import DynamicCache  # noqa: PLC0415
-
-    merged = DynamicCache()
-    n_layers = len(kvs[0].key_cache)
-    for layer_idx in range(n_layers):
-        merged.key_cache.append(torch.cat([kv.key_cache[layer_idx] for kv in kvs], dim=2))
-        merged.value_cache.append(torch.cat([kv.value_cache[layer_idx] for kv in kvs], dim=2))
-    return merged
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -282,8 +296,12 @@ def train(
         handles = install_hooks(model, axiom_mlp, positions)
         try:
             optim.zero_grad()
-            # Inject frozen description KV so MLP trains in the same context as inference.
-            loss = model(full_ids, past_key_values=axiom_mlp.kv, labels=labels).loss
+            # Build a fresh DynamicCache each step — the cache is stateful and gets
+            # extended by the forward pass, so we can't reuse the same object.
+            kv_cache = (
+                _build_dynamic_cache(axiom_mlp.kv, device) if axiom_mlp.kv is not None else None
+            )
+            loss = model(full_ids, past_key_values=kv_cache, labels=labels).loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(axiom_mlp.mlps.parameters(), max_norm=1.0)
             optim.step()
@@ -311,8 +329,11 @@ def generate_with_mlp(
 ) -> str:
     device = next(model.parameters()).device
     ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-
-    axiom_kv = axiom_mlp.kv if axiom_mlp is not None else None
+    kv_cache = (
+        _build_dynamic_cache(axiom_mlp.kv, device)
+        if axiom_mlp is not None and axiom_mlp.kv is not None
+        else None
+    )
 
     handles = []
     if axiom_mlp is not None:
@@ -321,7 +342,7 @@ def generate_with_mlp(
             handles = install_hooks(model, axiom_mlp, positions)
 
     try:
-        out = model(ids, past_key_values=axiom_kv, use_cache=True)
+        out = model(ids, past_key_values=kv_cache, use_cache=True)
         past = out.past_key_values
         next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
     finally:
@@ -359,7 +380,9 @@ def generate_with_mlps(
     ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
     available_kvs = [a.kv for a in axiom_mlps if a.kv is not None]
-    merged_kv = merge_axiom_kvs(available_kvs) if available_kvs else None
+    merged_kv = (
+        _build_dynamic_cache(merge_axiom_kvs(available_kvs), device) if available_kvs else None
+    )
 
     handles = []
     for axiom_mlp in axiom_mlps:
@@ -526,11 +549,11 @@ def main() -> None:
         print("  computing description KV cache...")
         t_kv = time.time()
         axiom_mlp.kv = compute_axiom_kv(model, tokenizer, desc)
-        kv_tokens = axiom_mlp.kv.key_cache[0].shape[2]  # seq dim of first layer K
+        kv_tokens = axiom_mlp.kv.keys[0].shape[2]  # seq dim of first layer K
         kv_mb = (
             sum(
                 k.nbytes + v.nbytes
-                for k, v in zip(axiom_mlp.kv.key_cache, axiom_mlp.kv.value_cache, strict=True)
+                for k, v in zip(axiom_mlp.kv.keys, axiom_mlp.kv.values, strict=True)
             )
             / 1024**2
         )
