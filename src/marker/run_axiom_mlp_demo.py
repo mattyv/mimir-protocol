@@ -244,6 +244,22 @@ def _build_dynamic_cache(axiom_kv: AxiomKV, device: torch.device):  # noqa: ANN2
 # ── Training ──────────────────────────────────────────────────────────────────
 
 
+def _concat_kv_caches(cache_a, cache_b):  # noqa: ANN001, ANN201
+    """Concatenate two DynamicCache objects along the sequence dimension."""
+    from transformers import DynamicCache  # noqa: PLC0415
+
+    def _layers(cache):
+        legacy = cache.to_legacy_cache() if hasattr(cache, "to_legacy_cache") else cache
+        return [(layer[0], layer[1]) for layer in legacy]
+
+    merged = DynamicCache()
+    for layer_idx, ((ka, va), (kb, vb)) in enumerate(
+        zip(_layers(cache_a), _layers(cache_b), strict=True)
+    ):
+        merged.update(torch.cat([ka, kb], dim=2), torch.cat([va, vb], dim=2), layer_idx)
+    return merged
+
+
 def train(
     model,  # noqa: ANN001
     tokenizer,  # noqa: ANN001
@@ -418,12 +434,15 @@ class AxiomSession:
     """Multi-turn chat session with lazy axiom KV activation.
 
     Starts with an empty KV. The first time an axiom's term appears in a
-    turn, that axiom's KV is activated and merged into the session — where
-    it stays for all subsequent turns (so follow-up questions without the
-    term still work). Axioms never mentioned are never injected, so
-    unrelated descriptions don't pollute the context.
+    turn, that axiom's description KV is appended to the tail of the current
+    session KV — so the model can attend to it from that turn onwards.
+    Follow-up questions without the term still work because the description
+    KV persists in the growing past_key_values.
 
-    Scales to many axioms: adding axiom 101 has zero cost until it's mentioned.
+    Layout after turn 3 where BP mentioned in T1, FS first in T3:
+      [BP_desc | T1_tokens | T2_tokens | FS_desc | T3_tokens | ...]
+
+    Axioms never mentioned are never injected. Scales to many axioms.
 
     Usage:
         session = AxiomSession(model, [bp_mlp, fs_mlp])
@@ -435,45 +454,34 @@ class AxiomSession:
     def __init__(self, model, axiom_mlps: list[AxiomMLP]) -> None:  # noqa: ANN001
         self.axiom_mlps = axiom_mlps
         self._model_ref = model
-        self.active: set[str] = set()  # terms whose KV has been activated
-        self.past = None  # grows as axioms are mentioned and turns accumulate
+        self.active: set[str] = set()  # mentioned at least once
+        self.injected: set[str] = set()  # KV already in self.past
+        self.past = None
 
-    def _rebuild_active_kv(self) -> None:
-        """Rebuild past_key_values from the currently active axiom KVs.
-
-        Called when a new axiom is activated mid-session. Because KVs must
-        be prepended before the conversation tokens, we can only do this
-        cleanly at session start (before any turns). Once turns have
-        accumulated, newly activated axioms are appended — positionally
-        after prior conversation tokens, which is suboptimal but acceptable.
-        The clean path is to reset() when you know which axioms you need.
-        """
+    def _inject_kvs(self, terms: set[str]) -> None:
+        """Append description KVs for the given terms to the session tail."""
         device = next(self._model_ref.parameters()).device
-        active_kvs = [a.kv for a in self.axiom_mlps if a.term in self.active and a.kv is not None]
-        if not active_kvs:
+        new_kvs = [a.kv for a in self.axiom_mlps if a.term in terms and a.kv is not None]
+        if not new_kvs:
             return
-        base = _build_dynamic_cache(merge_axiom_kvs(active_kvs), device)
-        if self.past is None:
-            self.past = base
-        # If turns already exist, we can't retroactively prepend — leave past as-is.
-        # The model can still attend to the axiom via the MLP hook at the term position.
+        new_cache = _build_dynamic_cache(merge_axiom_kvs(new_kvs), device)
+        self.past = new_cache if self.past is None else _concat_kv_caches(self.past, new_cache)
+        self.injected.update(terms)
 
     @torch.no_grad()
     def chat(self, model, tokenizer, prompt: str, max_new: int = 120) -> str:  # noqa: ANN001
         device = next(model.parameters()).device
         ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
-        # Activate any newly mentioned axioms before this turn.
-        newly_active = False
-        for axiom_mlp in self.axiom_mlps:
-            if axiom_mlp.term not in self.active and _find_term_positions(
-                ids, axiom_mlp.term_token_ids
-            ):
-                self.active.add(axiom_mlp.term)
-                newly_active = True
-
-        if newly_active and self.past is None:
-            self._rebuild_active_kv()
+        # Detect newly mentioned axioms and append their KVs before this turn.
+        newly_seen = {
+            a.term
+            for a in self.axiom_mlps
+            if a.term not in self.active and _find_term_positions(ids, a.term_token_ids)
+        }
+        self.active.update(newly_seen)
+        if newly_seen - self.injected:
+            self._inject_kvs(newly_seen - self.injected)
 
         handles = []
         for axiom_mlp in self.axiom_mlps:
@@ -498,12 +506,13 @@ class AxiomSession:
             if int(next_tok.item()) == tokenizer.eos_token_id:
                 break
 
-        self.past = past  # grow session KV for next turn
+        self.past = past
         return tokenizer.decode(torch.cat(out_ids, dim=1)[0], skip_special_tokens=True).strip()
 
     def reset(self) -> None:
         """Start a new conversation — clears active axioms and session KV."""
         self.active = set()
+        self.injected = set()
         self.past = None
 
 
