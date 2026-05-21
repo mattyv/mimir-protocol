@@ -21,7 +21,7 @@ from __future__ import annotations
 import argparse
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -137,7 +137,8 @@ class AxiomMLP:
     term_token_ids: list[int]
     chosen_layers: list[int]
     mlps: nn.ModuleList
-    kv: AxiomKV | None = None  # frozen description KV, set by compute_axiom_kv()
+    kv: AxiomKV | None = None  # frozen description KV
+    dependencies: list[str] = field(default_factory=list)  # terms this axiom inherits from
 
 
 def make_axiom_mlp(model, tokenizer, term: str, chosen_layers: list[int], r: int = 32) -> AxiomMLP:  # noqa: ANN001
@@ -460,6 +461,16 @@ class AxiomSession:
         self.injected: set[str] = set()  # KV already in self.past
         self.past = None
 
+    def _resolve_dependencies(self, term: str) -> set[str]:
+        """Return term plus all transitive dependencies."""
+        axiom = next((a for a in self.axiom_mlps if a.term == term), None)
+        if axiom is None or not axiom.dependencies:
+            return {term}
+        result = {term}
+        for dep in axiom.dependencies:
+            result |= self._resolve_dependencies(dep)
+        return result
+
     def _inject_kvs(self, terms: set[str]) -> None:
         """Append description KVs for the given terms to the session tail."""
         device = next(self._model_ref.parameters()).device
@@ -475,15 +486,18 @@ class AxiomSession:
         device = next(model.parameters()).device
         ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
-        # Detect newly mentioned axioms and append their KVs before this turn.
+        # Detect newly mentioned axioms, expand to transitive dependencies, inject all.
         newly_seen = {
             a.term
             for a in self.axiom_mlps
             if a.term not in self.active and _find_term_positions(ids, a.term_token_ids)
         }
-        self.active.update(newly_seen)
-        if newly_seen - self.injected:
-            self._inject_kvs(newly_seen - self.injected)
+        to_activate = set()
+        for term in newly_seen:
+            to_activate |= self._resolve_dependencies(term)
+        self.active.update(to_activate)
+        if to_activate - self.injected:
+            self._inject_kvs(to_activate - self.injected)
 
         handles = []
         for axiom_mlp in self.axiom_mlps:
@@ -537,6 +551,72 @@ MULTI_AXIOM_PROBES = [
     # Boundary discipline with both loaded: should decline for both
     ("BOUNDARY", "Q: What programming language is BalancePublisher written in?\nA:"),
     ("BOUNDARY", "Q: What's the SLA of FluxomService?\nA:"),
+]
+
+
+# ── Hierarchy test axioms ─────────────────────────────────────────────────────
+# Three-level hierarchy: DaemonProcess → ServiceProcess → MeshPublisher
+# Questions about MeshPublisher require chaining through both parent types.
+
+HIERARCHY_AXIOMS = [
+    {
+        "term": "DaemonProcess",
+        "description": "A DaemonProcess is a background process that runs continuously without user interaction. It restarts automatically on failure and writes logs to /var/log/daemon.log.",
+        "dependencies": [],
+        "qa": [
+            (
+                "Does a DaemonProcess restart on failure?",
+                "Yes, a DaemonProcess restarts automatically on failure.",
+            ),
+            (
+                "Where does a DaemonProcess write logs?",
+                "A DaemonProcess writes logs to /var/log/daemon.log.",
+            ),
+            (
+                "Does a DaemonProcess require user interaction?",
+                "No, a DaemonProcess runs without user interaction.",
+            ),
+        ],
+    },
+    {
+        "term": "ServiceProcess",
+        "description": "A ServiceProcess is a DaemonProcess that additionally exposes a health check endpoint at /health and reports metrics every 30 seconds.",
+        "dependencies": ["DaemonProcess"],
+        "qa": [
+            (
+                "What endpoint does a ServiceProcess expose?",
+                "A ServiceProcess exposes a health check endpoint at /health.",
+            ),
+            (
+                "How often does a ServiceProcess report metrics?",
+                "A ServiceProcess reports metrics every 30 seconds.",
+            ),
+        ],
+    },
+    {
+        "term": "MeshPublisher",
+        "description": "MeshPublisher is a ServiceProcess that reads topology events from the mesh-events Kafka topic and publishes enriched graphs to the Neo4j database every 5 seconds.",
+        "dependencies": ["ServiceProcess"],
+        "qa": [
+            (
+                "What does MeshPublisher read from?",
+                "MeshPublisher reads from the mesh-events Kafka topic.",
+            ),
+            ("Where does MeshPublisher publish?", "MeshPublisher publishes to the Neo4j database."),
+            ("How often does MeshPublisher publish?", "MeshPublisher publishes every 5 seconds."),
+        ],
+    },
+]
+
+HIERARCHY_PROBES = [
+    # Direct fact about MeshPublisher
+    ("DIRECT", "Q: What does MeshPublisher read from?\nA:"),
+    # Inherited from ServiceProcess (1 level up)
+    ("INHERIT-1", "Q: What health endpoint does MeshPublisher expose?\nA:"),
+    ("INHERIT-1", "Q: How often does MeshPublisher report metrics?\nA:"),
+    # Inherited from DaemonProcess (2 levels up)
+    ("INHERIT-2", "Q: Does MeshPublisher restart on failure?\nA:"),
+    ("INHERIT-2", "Q: Where does MeshPublisher write its logs?\nA:"),
 ]
 
 
@@ -821,6 +901,35 @@ def main() -> None:
         print(f"  [M inj    no-CoT]:     {r_inj[:200].replace(chr(10), ' ')}")
         print(f"  [M inj    CoT]:        {r_inj_cot[:200].replace(chr(10), ' ')}")
         print(f"  [M inj struct-CoT]:    {r_inj_struct[:200].replace(chr(10), ' ')}")
+
+    # ── Composite / hierarchy axiom test ──────────────────────────────────────
+    print("\n" + "=" * 78)
+    print("HIERARCHY TEST — DaemonProcess → ServiceProcess → MeshPublisher")
+    print("=" * 78)
+
+    hierarchy_mlps: list[AxiomMLP] = []
+    for h_axiom in HIERARCHY_AXIOMS:
+        h_name = h_axiom["term"]
+        h_desc = h_axiom["description"]
+        print(f"\n--- training {h_name} ---")
+        h_mlp = make_axiom_mlp(model, tokenizer, h_name, chosen_layers, r=args.r)
+        h_mlp.dependencies = h_axiom["dependencies"]
+        h_mlp.kv = compute_axiom_kv(model, tokenizer, h_desc, term=h_name)
+        h_qa = list(h_axiom["qa"])
+        h_losses = train(model, tokenizer, h_mlp, h_qa, n_steps=500)
+        print(f"  loss: {h_losses[0]:.3f} → {h_losses[-1]:.4f}")
+        hierarchy_mlps.append(h_mlp)
+
+    print("\n--- hierarchy session probes ---")
+    h_session = AxiomSession(model, hierarchy_mlps)
+    for label, prompt in HIERARCHY_PROBES:
+        q = prompt.replace("Q: ", "").replace("\nA:", "")
+        out_a = generate_with_mlp(model, tokenizer, prompt, max_new=args.max_new)
+        ans = h_session.chat(model, tokenizer, prompt, max_new=args.max_new)
+        h_session.reset()
+        print(f"\n  [{label}]  {q}")
+        print(f"    [A no-axiom]: {out_a[:160].replace(chr(10), ' ')}")
+        print(f"    [M hier]:     {ans[:160].replace(chr(10), ' ')}")
 
 
 if __name__ == "__main__":
