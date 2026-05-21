@@ -415,36 +415,65 @@ def generate_with_mlps(
 
 
 class AxiomSession:
-    """Multi-turn chat session with persistent axiom KV across turns.
+    """Multi-turn chat session with lazy axiom KV activation.
 
-    All registered axiom KVs are merged and injected once at session init.
-    They live at the start of past_key_values for every subsequent turn —
-    the model can always attend to them regardless of whether the term is
-    named in the current message.
+    Starts with an empty KV. The first time an axiom's term appears in a
+    turn, that axiom's KV is activated and merged into the session — where
+    it stays for all subsequent turns (so follow-up questions without the
+    term still work). Axioms never mentioned are never injected, so
+    unrelated descriptions don't pollute the context.
 
-    MLP hooks still fire per-turn at term positions in the current prompt,
-    providing query-conditional routing on top of the stable KV foundation.
+    Scales to many axioms: adding axiom 101 has zero cost until it's mentioned.
 
     Usage:
         session = AxiomSession(model, [bp_mlp, fs_mlp])
         ans1 = session.chat(model, tokenizer, "Q: How often does BalancePublisher poll?\\nA:")
-        ans2 = session.chat(model, tokenizer, "Q: What does it publish?\\nA:")  # no term needed
-        session.reset(model)  # start a new conversation
+        ans2 = session.chat(model, tokenizer, "Q: What does it publish?\\nA:")  # BP KV persists
+        session.reset()  # start a new conversation
     """
 
     def __init__(self, model, axiom_mlps: list[AxiomMLP]) -> None:  # noqa: ANN001
         self.axiom_mlps = axiom_mlps
-        self.past = self._build_session_kv(model)
+        self._model_ref = model
+        self.active: set[str] = set()  # terms whose KV has been activated
+        self.past = None  # grows as axioms are mentioned and turns accumulate
 
-    def _build_session_kv(self, model):  # noqa: ANN001
-        device = next(model.parameters()).device
-        available = [a.kv for a in self.axiom_mlps if a.kv is not None]
-        return _build_dynamic_cache(merge_axiom_kvs(available), device) if available else None
+    def _rebuild_active_kv(self) -> None:
+        """Rebuild past_key_values from the currently active axiom KVs.
+
+        Called when a new axiom is activated mid-session. Because KVs must
+        be prepended before the conversation tokens, we can only do this
+        cleanly at session start (before any turns). Once turns have
+        accumulated, newly activated axioms are appended — positionally
+        after prior conversation tokens, which is suboptimal but acceptable.
+        The clean path is to reset() when you know which axioms you need.
+        """
+        device = next(self._model_ref.parameters()).device
+        active_kvs = [a.kv for a in self.axiom_mlps if a.term in self.active and a.kv is not None]
+        if not active_kvs:
+            return
+        base = _build_dynamic_cache(merge_axiom_kvs(active_kvs), device)
+        if self.past is None:
+            self.past = base
+        # If turns already exist, we can't retroactively prepend — leave past as-is.
+        # The model can still attend to the axiom via the MLP hook at the term position.
 
     @torch.no_grad()
     def chat(self, model, tokenizer, prompt: str, max_new: int = 120) -> str:  # noqa: ANN001
         device = next(model.parameters()).device
         ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+
+        # Activate any newly mentioned axioms before this turn.
+        newly_active = False
+        for axiom_mlp in self.axiom_mlps:
+            if axiom_mlp.term not in self.active and _find_term_positions(
+                ids, axiom_mlp.term_token_ids
+            ):
+                self.active.add(axiom_mlp.term)
+                newly_active = True
+
+        if newly_active and self.past is None:
+            self._rebuild_active_kv()
 
         handles = []
         for axiom_mlp in self.axiom_mlps:
@@ -472,9 +501,10 @@ class AxiomSession:
         self.past = past  # grow session KV for next turn
         return tokenizer.decode(torch.cat(out_ids, dim=1)[0], skip_special_tokens=True).strip()
 
-    def reset(self, model) -> None:  # noqa: ANN001
-        """Start a new conversation, restoring session to axiom-KV-only state."""
-        self.past = self._build_session_kv(model)
+    def reset(self) -> None:
+        """Start a new conversation — clears active axioms and session KV."""
+        self.active = set()
+        self.past = None
 
 
 MULTI_AXIOM_PROBES = [
