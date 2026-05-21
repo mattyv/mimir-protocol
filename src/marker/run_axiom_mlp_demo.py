@@ -195,17 +195,19 @@ def install_hooks(model, axiom_mlp: AxiomMLP, positions: list[int]):  # noqa: AN
 
 
 @torch.no_grad()
-def compute_axiom_kv(model, tokenizer, description: str) -> AxiomKV:  # noqa: ANN001
+def compute_axiom_kv(model, tokenizer, description: str, term: str = "") -> AxiomKV:  # noqa: ANN001
     """Run description through frozen model once and cache the resulting K/V.
 
     Stored as plain tensors (AxiomKV) to avoid DynamicCache version differences.
     A fresh DynamicCache is built from these tensors before each forward pass via
     _build_dynamic_cache().
+
+    Prefixes the description with "About {term}:\n" when term is given so that
+    merged multi-axiom KVs have a clear label boundary between descriptions.
     """
     device = next(model.parameters()).device
-    desc_ids = tokenizer(description, add_special_tokens=False, return_tensors="pt").input_ids.to(
-        device
-    )
+    text = f"About {term}:\n{description}" if term else description
+    desc_ids = tokenizer(text, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
     out = model(desc_ids, use_cache=True)
     kv = out.past_key_values
     # Normalize to a flat list of (K, V) tensors regardless of cache type.
@@ -654,7 +656,7 @@ def main() -> None:
         # Compute and attach the description KV cache (done once, before training).
         print("  computing description KV cache...")
         t_kv = time.time()
-        axiom_mlp.kv = compute_axiom_kv(model, tokenizer, desc)
+        axiom_mlp.kv = compute_axiom_kv(model, tokenizer, desc, term=name)
         kv_tokens = axiom_mlp.kv.keys[0].shape[2]  # seq dim of first layer K
         kv_mb = (
             sum(
