@@ -1447,6 +1447,9 @@ def run_axiom_mlp_demo(
     max_new: int = 120,
     skill_r: int = 64,
     skill_n_steps: int = 3000,
+    compress_kv: bool = False,
+    n_compressed_tokens: int = 4,
+    compressor_steps: int = 1000,
 ) -> str:
     import os
     import sys
@@ -1473,7 +1476,13 @@ def run_axiom_mlp_demo(
         str(skill_r),
         "--skill-n-steps",
         str(skill_n_steps),
+        "--n-compressed-tokens",
+        str(n_compressed_tokens),
+        "--compressor-steps",
+        str(compressor_steps),
     ]
+    if compress_kv:
+        sys.argv.append("--compress-kv")
     import io
     from contextlib import redirect_stdout
 
@@ -1496,14 +1505,30 @@ def axiom_mlp_demo(
     max_new: int = 120,
     skill_r: int = 64,
     skill_n_steps: int = 3000,
+    compress_kv: bool = False,
+    n_compressed_tokens: int = 4,
+    compressor_steps: int = 1000,
 ) -> None:
     """Per-axiom MLP v2: hand-written Q+A + teacher distillation + overview + boundary.
-    r=32, cosine LR decay, 3000 steps. Compares A/P/M on TRAIN/HELDOUT/BOUNDARY/TELL_ME."""
+    r=32, cosine LR decay, 3000 steps. Compares A/P/M on TRAIN/HELDOUT/BOUNDARY/TELL_ME.
+    Pass --compress-kv to enable KV compression after axiom training."""
     print(
-        f"axiom-mlp-demo on {model} steps={n_steps} r={r} n_synthetic={n_synthetic} skill_r={skill_r} skill_n_steps={skill_n_steps}"
+        f"axiom-mlp-demo on {model} steps={n_steps} r={r} n_synthetic={n_synthetic} "
+        f"skill_r={skill_r} compress_kv={compress_kv}"
     )
     output = run_axiom_mlp_demo.remote(
-        model, n_steps, r, lr_start, lr_end, n_synthetic, max_new, skill_r, skill_n_steps
+        model,
+        n_steps,
+        r,
+        lr_start,
+        lr_end,
+        n_synthetic,
+        max_new,
+        skill_r,
+        skill_n_steps,
+        compress_kv,
+        n_compressed_tokens,
+        compressor_steps,
     )
     print(output)
 

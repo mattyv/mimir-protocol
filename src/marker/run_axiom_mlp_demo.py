@@ -723,6 +723,20 @@ def main() -> None:
     parser.add_argument(
         "--skill-n-steps", type=int, default=3000, help="training steps for skill axioms"
     )
+    parser.add_argument(
+        "--compress-kv",
+        action="store_true",
+        help="train KV compressor after axiom training (off by default)",
+    )
+    parser.add_argument(
+        "--n-compressed-tokens",
+        type=int,
+        default=4,
+        help="virtual tokens per layer after compression",
+    )
+    parser.add_argument(
+        "--compressor-steps", type=int, default=1000, help="training steps for KV compressor"
+    )
     args = parser.parse_args()
 
     device = (
@@ -874,6 +888,75 @@ def main() -> None:
 
         trained_mlps.append(axiom_mlp)
         trained_prefixes.append(prefix)
+
+    # ── Optional KV compression ───────────────────────────────────────────────
+    if args.compress_kv:
+        from marker.kv_compression import (  # noqa: PLC0415
+            KVCompressor,
+            apply_compression,
+            train_compressor,
+        )
+
+        print("\n" + "=" * 78)
+        print(f"KV COMPRESSION — {args.n_compressed_tokens} virtual tokens per layer")
+        print("=" * 78)
+
+        # Show sizes before compression
+        for m in trained_mlps:
+            if m.kv is not None:
+                full_mb = (
+                    sum(k.nbytes + v.nbytes for k, v in zip(m.kv.keys, m.kv.values, strict=True))
+                    / 1024**2
+                )
+                print(f"  {m.term}: full KV = {full_mb:.1f} MB  ({m.kv.keys[0].shape[2]} tokens)")
+
+        compressor = KVCompressor(
+            n_layers=n_layers,
+            n_kv_heads=model.config.num_key_value_heads,
+            head_dim=model.config.hidden_size // model.config.num_attention_heads,
+            n_compressed=args.n_compressed_tokens,
+        )
+        n_comp_params = sum(p.numel() for p in compressor.parameters())
+        print(f"  compressor params: {n_comp_params:,}  training {args.compressor_steps} steps...")
+
+        # Build Q+A map for compressor training
+        qa_map: dict[str, list[tuple[str, str]]] = {}
+        for axiom in TEST_AXIOMS:
+            aname = axiom["name"]
+            qa_map[aname] = [(q, f["answer"]) for f in axiom["facts"] for q in f["questions_train"]]
+
+        compressor = train_compressor(
+            model,
+            tokenizer,
+            compressor,
+            trained_mlps,
+            qa_map,
+            n_steps=args.compressor_steps,
+        )
+
+        # Apply compression — replaces full KV with compressed version in each axiom
+        apply_compression(compressor, trained_mlps)
+
+        for m in trained_mlps:
+            if m.kv is not None:
+                comp_mb = (
+                    sum(k.nbytes + v.nbytes for k, v in zip(m.kv.keys, m.kv.values, strict=True))
+                    / 1024**2
+                )
+                print(
+                    f"  {m.term}: compressed KV = {comp_mb:.1f} MB  ({m.kv.keys[0].shape[2]} tokens)"
+                )
+
+        print("\n--- compressed KV probes (spot check) ---")
+        for axiom in TEST_AXIOMS:
+            aname = axiom["name"]
+            m = next(a for a in trained_mlps if a.term == aname)
+            for f in axiom["facts"][:2]:
+                q = f["questions_heldout"][0]
+                prompt = TEMPLATE.format(q=q)
+                ans = generate_with_mlp(model, tokenizer, prompt, m, max_new=args.max_new)
+                print(f"  [{aname}] Q: {q}")
+                print(f"    {ans[:120].replace(chr(10), ' ')}")
 
     # ── Multi-axiom isolation + boundary ──────────────────────────────────────
     print("\n" + "=" * 78)
