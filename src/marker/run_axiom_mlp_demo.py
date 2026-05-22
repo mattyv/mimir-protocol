@@ -862,6 +862,7 @@ def main() -> None:
     for axiom in TEST_AXIOMS:
         name = axiom["name"]
         desc = axiom["description"]
+        t_axiom_start = time.time()
 
         print("\n" + "#" * 78)
         print(f"# axiom: {name}")
@@ -983,6 +984,7 @@ def main() -> None:
         run_probe("BOUNDARY", axiom["boundary_probes"])
         run_probe("TELL_ME", [f"Tell me about {name}.", f"What is {name}?"])
 
+        print(f"\n  ── {name} total: {time.time() - t_axiom_start:.1f}s ──")
         trained_mlps.append(axiom_mlp)
         trained_prefixes.append(prefix)
 
@@ -1022,6 +1024,7 @@ def main() -> None:
             aname = axiom["name"]
             qa_map[aname] = [(q, f["answer"]) for f in axiom["facts"] for q in f["questions_train"]]
 
+        t_comp_train = time.time()
         compressor = train_compressor(
             model,
             tokenizer,
@@ -1030,19 +1033,21 @@ def main() -> None:
             qa_map,
             n_steps=args.compressor_steps,
         )
+        print(f"  compressor trained in {time.time() - t_comp_train:.1f}s")
 
         # Apply compression — replaces full KV with compressed version in each axiom
-        apply_compression(compressor, trained_mlps)
-
         for m in trained_mlps:
-            if m.kv is not None:
-                comp_mb = (
-                    sum(k.nbytes + v.nbytes for k, v in zip(m.kv.keys, m.kv.values, strict=True))
-                    / 1024**2
-                )
-                print(
-                    f"  {m.term}: compressed KV = {comp_mb:.1f} MB  ({m.kv.keys[0].shape[2]} tokens)"
-                )
+            t_apply = time.time()
+            apply_compression(compressor, [m])
+            comp_mb = (
+                sum(k.nbytes + v.nbytes for k, v in zip(m.kv.keys, m.kv.values, strict=True))
+                / 1024**2
+                if m.kv
+                else 0
+            )
+            print(
+                f"  {m.term}: compress applied in {time.time() - t_apply:.2f}s → {comp_mb:.1f} MB ({m.kv.keys[0].shape[2] if m.kv else 0} tokens)"
+            )
 
         print("\n--- compressed KV probes (spot check) ---")
         for axiom in TEST_AXIOMS:
