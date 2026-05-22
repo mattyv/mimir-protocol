@@ -373,7 +373,17 @@ def generate_with_mlp(
         for h in handles:
             h.remove()
 
-    skill_axiom = axiom_mlp if (axiom_mlp is not None and axiom_mlp.skill_mode) else None
+    # Only fire decode-time skill hooks if the term was present in the prompt.
+    # Without this gate, the skill bleeds into prompts that don't mention the term.
+    skill_axiom = (
+        axiom_mlp
+        if (
+            axiom_mlp is not None
+            and axiom_mlp.skill_mode
+            and bool(handles or _find_term_positions(ids, axiom_mlp.term_token_ids))
+        )
+        else None
+    )
     out_ids = [next_tok]
     for _ in range(max_new - 1):
         decode_handles = install_hooks(model, skill_axiom, [0]) if skill_axiom else []
@@ -430,7 +440,10 @@ def generate_with_mlps(
         for h in handles:
             h.remove()
 
-    skill_axioms = [a for a in axiom_mlps if a.skill_mode]
+    # Only fire decode hooks for skill axioms whose term was present in the prompt.
+    skill_axioms = [
+        a for a in axiom_mlps if a.skill_mode and _find_term_positions(ids, a.term_token_ids)
+    ]
     out_ids = [next_tok]
     for _ in range(max_new - 1):
         decode_handles = []
@@ -528,7 +541,14 @@ class AxiomSession:
             for h in handles:
                 h.remove()
 
-        skill_axioms = [a for a in self.axiom_mlps if a.skill_mode and a.term in self.active]
+        # Gate decode-time skill hooks on term being present in this turn's prompt.
+        skill_axioms = [
+            a
+            for a in self.axiom_mlps
+            if a.skill_mode
+            and a.term in self.active
+            and _find_term_positions(ids, a.term_token_ids)
+        ]
         out_ids = [next_tok]
         for _ in range(max_new - 1):
             decode_handles = []
