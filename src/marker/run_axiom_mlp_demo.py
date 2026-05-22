@@ -834,6 +834,11 @@ def main() -> None:
     parser.add_argument(
         "--compressor-steps", type=int, default=1000, help="training steps for KV compressor"
     )
+    parser.add_argument(
+        "--r-sweep",
+        action="store_true",
+        help="compare r=4/8/16/32 on BalancePublisher after main training",
+    )
     args = parser.parse_args()
 
     device = (
@@ -1201,6 +1206,60 @@ def main() -> None:
         print(f"\n  [{label}]  {q}")
         print(f"    [A no-axiom]: {out_a[:160].replace(chr(10), ' ')}")
         print(f"    [M hier]:     {ans[:160].replace(chr(10), ' ')}")
+
+    # ── r sweep — compare MLP size vs accuracy ────────────────────────────────
+    if args.r_sweep:
+        print("\n" + "=" * 78)
+        print("MLP r SWEEP — BalancePublisher at r=4, r=8, r=16, r=32")
+        print("=" * 78)
+
+        bp_axiom = TEST_AXIOMS[0]
+        bp_name = bp_axiom["name"]
+        bp_desc = bp_axiom["description"]
+        bp_train_qa = [(q, f["answer"]) for f in bp_axiom["facts"] for q in f["questions_train"]]
+        bp_train_qa += SUPPLEMENTAL_QA.get(bp_name, [])
+        bp_heldout_qs = [q for f in bp_axiom["facts"] for q in f["questions_heldout"]]
+        bp_boundary_qa = _generic_boundary_examples(bp_name)
+
+        sweep_results: dict[int, list[str]] = {}
+
+        for sweep_r in [4, 8, 16, 32]:
+            print(f"\n--- r={sweep_r} ---")
+            sw_mlp = make_axiom_mlp(model, tokenizer, bp_name, chosen_layers, r=sweep_r)
+            sw_mlp.kv = compute_axiom_kv(model, tokenizer, bp_desc, term=bp_name)
+            sw_params = sum(p.numel() for p in sw_mlp.mlps.parameters())
+            sw_mb = sw_params * 4 / 1024**2
+            t_sw = time.time()
+            sw_losses = train(
+                model,
+                tokenizer,
+                sw_mlp,
+                bp_train_qa,
+                boundary_pairs=bp_boundary_qa,
+                n_steps=1500,
+            )
+            print(
+                f"  params: {sw_params:,} ({sw_mb:.1f} MB)  loss: {sw_losses[0]:.3f} → {sw_losses[-1]:.4f}  ({time.time() - t_sw:.0f}s)"
+            )
+            answers = []
+            for q in bp_heldout_qs[:4]:
+                ans = generate_with_mlp(model, tokenizer, TEMPLATE.format(q=q), sw_mlp, max_new=60)
+                answers.append(ans[:80].replace("\n", " "))
+                print(f"    Q: {q}")
+                print(f"    A: {ans[:100].replace(chr(10), ' ')}")
+            sweep_results[sweep_r] = answers
+
+        print("\n── r sweep summary ────────────────────────────────────────────")
+        for sweep_r in [4, 8, 16, 32]:
+            sw_params = sum(
+                p.numel()
+                for p in make_axiom_mlp(
+                    model, tokenizer, bp_name, chosen_layers, r=sweep_r
+                ).mlps.parameters()
+            )
+            print(
+                f"  r={sweep_r:2d}  {sw_params * 4 / 1024**2:.1f} MB  → {sweep_results[sweep_r][0][:60]}"
+            )
 
     # ── Skill axiom test ──────────────────────────────────────────────────────
     print("\n" + "=" * 78)

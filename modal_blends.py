@@ -1450,6 +1450,7 @@ def run_axiom_mlp_demo(
     compress_kv: bool = False,
     n_compressed_tokens: int = 4,
     compressor_steps: int = 1000,
+    r_sweep: bool = False,
 ) -> str:
     import os
     import sys
@@ -1483,6 +1484,8 @@ def run_axiom_mlp_demo(
     ]
     if compress_kv:
         sys.argv.append("--compress-kv")
+    if r_sweep:
+        sys.argv.append("--r-sweep")
     import io
     from contextlib import redirect_stdout
 
@@ -1508,13 +1511,14 @@ def axiom_mlp_demo(
     compress_kv: bool = False,
     n_compressed_tokens: int = 4,
     compressor_steps: int = 1000,
+    r_sweep: bool = False,
 ) -> None:
     """Per-axiom MLP v2: hand-written Q+A + teacher distillation + overview + boundary.
     r=32, cosine LR decay, 3000 steps. Compares A/P/M on TRAIN/HELDOUT/BOUNDARY/TELL_ME.
-    Pass --compress-kv to enable KV compression after axiom training."""
+    Pass --compress-kv to enable KV compression. Pass --r-sweep to compare r=4/8/16/32."""
     print(
         f"axiom-mlp-demo on {model} steps={n_steps} r={r} n_synthetic={n_synthetic} "
-        f"skill_r={skill_r} compress_kv={compress_kv}"
+        f"skill_r={skill_r} compress_kv={compress_kv} r_sweep={r_sweep}"
     )
     output = run_axiom_mlp_demo.remote(
         model,
@@ -1529,6 +1533,7 @@ def axiom_mlp_demo(
         compress_kv,
         n_compressed_tokens,
         compressor_steps,
+        r_sweep,
     )
     print(output)
 
