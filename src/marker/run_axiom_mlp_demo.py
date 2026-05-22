@@ -353,17 +353,21 @@ def generate_with_mlp(
 ) -> str:
     device = next(model.parameters()).device
     ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-    kv_cache = (
-        _build_dynamic_cache(axiom_mlp.kv, device)
-        if axiom_mlp is not None and axiom_mlp.kv is not None
-        else None
-    )
 
     handles = []
+    term_found = False
     if axiom_mlp is not None:
         positions = _find_term_positions(ids, axiom_mlp.term_token_ids)
+        term_found = bool(positions)
         if positions:
             handles = install_hooks(model, axiom_mlp, positions)
+
+    # For skill axioms, only inject KV when the term is present — skill is explicitly triggered.
+    # For fact axioms, always inject so the model has the description available.
+    kv_active = axiom_mlp is not None and axiom_mlp.kv is not None
+    if axiom_mlp is not None and axiom_mlp.skill_mode and not term_found:
+        kv_active = False
+    kv_cache = _build_dynamic_cache(axiom_mlp.kv, device) if kv_active else None
 
     try:
         out = model(ids, past_key_values=kv_cache, use_cache=True)
@@ -373,16 +377,8 @@ def generate_with_mlp(
         for h in handles:
             h.remove()
 
-    # Only fire decode-time skill hooks if the term was present in the prompt.
-    # Without this gate, the skill bleeds into prompts that don't mention the term.
     skill_axiom = (
-        axiom_mlp
-        if (
-            axiom_mlp is not None
-            and axiom_mlp.skill_mode
-            and bool(handles or _find_term_positions(ids, axiom_mlp.term_token_ids))
-        )
-        else None
+        axiom_mlp if (axiom_mlp is not None and axiom_mlp.skill_mode and term_found) else None
     )
     out_ids = [next_tok]
     for _ in range(max_new - 1):
