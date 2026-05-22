@@ -1433,7 +1433,7 @@ def axiom_mlp(
 
 
 @app.function(
-    gpu="A100-80GB",
+    gpu="H100",
     timeout=60 * 90,
     volumes={"/root/.cache/huggingface": hf_cache},
 )
