@@ -139,6 +139,7 @@ class AxiomMLP:
     mlps: nn.ModuleList
     kv: AxiomKV | None = None  # frozen description KV
     dependencies: list[str] = field(default_factory=list)  # terms this axiom inherits from
+    skill_mode: bool = False  # if True, MLP also fires at every decode step
 
 
 def make_axiom_mlp(model, tokenizer, term: str, chosen_layers: list[int], r: int = 32) -> AxiomMLP:  # noqa: ANN001
@@ -305,6 +306,10 @@ def train(
             full_ids = torch.cat([full_ids, torch.tensor([[eos_id]], device=device)], dim=1)
 
         positions = _find_term_positions(q_ids, axiom_mlp.term_token_ids)
+        if axiom_mlp.skill_mode:
+            # Also fire at every answer token position so the MLP learns to steer
+            # generation throughout, not just retrieve at the term position.
+            positions += list(range(q_ids.shape[1], full_ids.shape[1]))
         if not positions:
             skipped += 1
             continue
@@ -368,9 +373,13 @@ def generate_with_mlp(
         for h in handles:
             h.remove()
 
+    skill_axiom = axiom_mlp if (axiom_mlp is not None and axiom_mlp.skill_mode) else None
     out_ids = [next_tok]
     for _ in range(max_new - 1):
+        decode_handles = install_hooks(model, skill_axiom, [0]) if skill_axiom else []
         out = model(next_tok, past_key_values=past, use_cache=True)
+        for h in decode_handles:
+            h.remove()
         past = out.past_key_values
         next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
         out_ids.append(next_tok)
@@ -421,9 +430,15 @@ def generate_with_mlps(
         for h in handles:
             h.remove()
 
+    skill_axioms = [a for a in axiom_mlps if a.skill_mode]
     out_ids = [next_tok]
     for _ in range(max_new - 1):
+        decode_handles = []
+        for sa in skill_axioms:
+            decode_handles.extend(install_hooks(model, sa, [0]))
         out = model(next_tok, past_key_values=past, use_cache=True)
+        for h in decode_handles:
+            h.remove()
         past = out.past_key_values
         next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
         out_ids.append(next_tok)
@@ -513,9 +528,15 @@ class AxiomSession:
             for h in handles:
                 h.remove()
 
+        skill_axioms = [a for a in self.axiom_mlps if a.skill_mode and a.term in self.active]
         out_ids = [next_tok]
         for _ in range(max_new - 1):
+            decode_handles = []
+            for sa in skill_axioms:
+                decode_handles.extend(install_hooks(model, sa, [0]))
             out = model(next_tok, past_key_values=past, use_cache=True)
+            for h in decode_handles:
+                h.remove()
             past = out.past_key_values
             next_tok = out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
             out_ids.append(next_tok)
@@ -617,6 +638,65 @@ HIERARCHY_PROBES = [
     # Inherited from DaemonProcess (2 levels up)
     ("INHERIT-2", "Q: Does MeshPublisher restart on failure?\nA:"),
     ("INHERIT-2", "Q: Where does MeshPublisher write its logs?\nA:"),
+]
+
+
+# ── Skill axiom test ──────────────────────────────────────────────────────────
+# InternalBus: a fictional message bus API the model cannot know from pretraining.
+# skill_mode=True means the MLP fires at every decode step, continuously steering
+# generation toward the correct API call pattern.
+
+SKILL_AXIOM = {
+    "term": "InternalBus",
+    "description": (
+        "InternalBus is a fictional internal message bus. "
+        "To publish: client.emit(channel, payload, ttl=30). "
+        "To subscribe: client.subscribe(channel, handler). "
+        "Default TTL is 30 seconds. Channels are strings."
+    ),
+    "skill_mode": True,
+    "qa": [
+        (
+            "Write code using InternalBus to publish a price update",
+            "client.emit('prices', price_update, ttl=30)",
+        ),
+        (
+            "Write code using InternalBus to publish an order event",
+            "client.emit('orders', order_data, ttl=30)",
+        ),
+        (
+            "Write code using InternalBus to subscribe to balance updates",
+            "client.subscribe('balances', handle_balance)",
+        ),
+        ("How do you publish to InternalBus?", "Call client.emit(channel, payload, ttl=30)"),
+        (
+            "Write a function using InternalBus to publish a trade",
+            "def publish_trade(trade):\n    client.emit('trades', trade, ttl=30)",
+        ),
+        (
+            "Write code using InternalBus to subscribe to market data",
+            "client.subscribe('market-data', handle_market_data)",
+        ),
+        (
+            "Using InternalBus, send an alert message",
+            "client.emit('alerts', alert_message, ttl=30)",
+        ),
+        (
+            "Using InternalBus, listen for user events",
+            "client.subscribe('user-events', handle_user_event)",
+        ),
+    ],
+}
+
+SKILL_PROBES = [
+    # Should produce client.emit('balances', ...) — novel channel not in training
+    "Q: Write code using InternalBus to publish a balance update to the 'balances' channel\nA:",
+    # Should produce client.subscribe(...)
+    "Q: Write code using InternalBus to subscribe to 'inventory' events\nA:",
+    # Fact retrieval — still works in skill mode
+    "Q: How do you publish a message using InternalBus?\nA:",
+    # No InternalBus in prompt — should produce generic code without the API
+    "Q: Write code to publish a price update\nA:",
 ]
 
 
@@ -930,6 +1010,31 @@ def main() -> None:
         print(f"\n  [{label}]  {q}")
         print(f"    [A no-axiom]: {out_a[:160].replace(chr(10), ' ')}")
         print(f"    [M hier]:     {ans[:160].replace(chr(10), ' ')}")
+
+    # ── Skill axiom test ──────────────────────────────────────────────────────
+    print("\n" + "=" * 78)
+    print("SKILL AXIOM TEST — InternalBus (fictional message bus API)")
+    print("=" * 78)
+
+    s_name = SKILL_AXIOM["term"]
+    s_desc = SKILL_AXIOM["description"]
+    print(f"\ndescription: {s_desc}\n")
+
+    skill_mlp = make_axiom_mlp(model, tokenizer, s_name, chosen_layers, r=args.r)
+    skill_mlp.skill_mode = True
+    skill_mlp.kv = compute_axiom_kv(model, tokenizer, s_desc, term=s_name)
+    print(f"training {s_name} skill axiom (1000 steps)...")
+    s_losses = train(model, tokenizer, skill_mlp, SKILL_AXIOM["qa"], n_steps=1000)
+    print(f"loss: {s_losses[0]:.3f} → {s_losses[-1]:.4f}")
+
+    print("\n--- skill probes ---")
+    for prompt in SKILL_PROBES:
+        q = prompt.replace("Q: ", "").replace("\nA:", "")
+        out_a = generate_with_mlp(model, tokenizer, prompt, max_new=args.max_new)
+        out_s = generate_with_mlp(model, tokenizer, prompt, skill_mlp, max_new=args.max_new)
+        print(f"\n  Q: {q}")
+        print(f"    [A no-skill]: {out_a[:160].replace(chr(10), ' ')}")
+        print(f"    [M skill]:    {out_s[:160].replace(chr(10), ' ')}")
 
 
 if __name__ == "__main__":

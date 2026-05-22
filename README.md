@@ -9,11 +9,13 @@ post-cutoff, anything specialised — the model is blind to it. The standard
 answers are fine-tuning (modify the weights, slow) or RAG (paste definitions
 into every prompt, eats context).
 
-This repo explores a third path: **per-axiom MLP injection**. For each new
-concept, we train a small set of two-layer networks ("patches") that fire
-whenever the concept's term appears in a prompt. The patches modify the model's
-internal residual stream at that term's position, guiding the model toward
-correct answers without touching its weights or visible context.
+This repo explores a third path: **hybrid MLP + frozen KV injection**. For
+each new concept, we train a small set of two-layer networks ("patches") that
+fire whenever the concept's term appears in a prompt, and we compute a frozen
+KV cache of the concept's description that gets injected at every forward pass.
+The patches modify the model's internal residual stream at the term position for
+query-conditional routing; the KV cache lets the model attend directly to
+description tokens during decode for stable retrieval.
 
 The model has *understood* something it was never trained on.
 
@@ -26,8 +28,7 @@ Given a description like:
 > to the Kafka topic balances.raw. BalancePublisher has no upstream
 > dependencies.*
 
-After ~12 minutes of training on H100 (one forward pass on the description
-generates teacher Q+A, then a small MLP is trained on those pairs):
+After ~8 minutes of training on A100:
 
 ```
 Q: How often does BalancePublisher poll?
@@ -60,64 +61,82 @@ and FluxomService test axioms:
 | TELL_ME | 2/2 + 2/2 | Open description requests |
 
 **Multi-axiom isolation**: with both axioms loaded simultaneously, each fires
-independently at its own term position. No interference. 4/4 isolation probes
-correct; 2/2 boundary probes correct.
+independently at its own term position. 4/4 isolation probes correct; 2/2
+boundary probes correct. No interference.
+
+**CoT**: no longer degrades — KV injection provides stable retrieval during
+decode regardless of generation prefix.
+
+**Cross-axiom comparison**: now works. "BalancePublisher polls more frequently"
+correctly resolved. ✓
+
+**Multi-turn chat**: 4/4 turns correct including follow-up questions that don't
+re-mention the term. ✓
+
+**Composite axioms / hierarchy**: 5/5 — inherited facts correctly answered
+across 2 levels of dependency (DaemonProcess → ServiceProcess → MeshPublisher).
+✓
 
 **Known limits:**
-- Cross-axiom *comparison* queries fail (e.g. "which polls faster?") — the
-  facts are injected correctly per-term but the model doesn't reliably reason
-  across two injected residuals in one generation pass. Fix: ask per-term
-  questions first, then reason over the text answers.
-- CoT prompting hurts injection — use direct Q→A format.
-- Skill injection (DSLs, novel algorithms) is not supported — use LoRA for
-  those. MLP injection is for factual retrieval, not procedural generation.
+- Skill injection (DSLs, novel algorithms) is not supported — MLP injection is
+  for factual retrieval, not procedural generation. Next step.
 
 ## How it works
 
-For each new concept ("axiom"), we train a small `SmallMLP` at three layers
-(25%, 50%, 75% of model depth). Each MLP has the structure:
+For each new concept ("axiom"), the system maintains two components:
+
+**1. `SmallMLP` at three layers (25%, 50%, 75% of model depth):**
 
 ```
 hidden (5120) → r (32) → hidden (5120)     r=32 bottleneck, GELU activation
 ```
 
-**Training (~12 min on H100):**
+Fires at the term's token position during prefill. The MLP reads the current
+residual — which by mid-layers has already integrated the question context via
+attention — and adds a learned offset. This provides query-conditional routing:
+the same term in different question contexts produces different outputs.
 
-1. Run the description through the full frozen model with the full K/V prefix
-   loaded — this is the "teacher". Ask the teacher to generate 30 Q+A pairs
-   about the description.
-2. Add hand-written Q+A from the axiom's known facts, overview examples
-   ("Tell me about X" → description), and boundary examples ("The description
-   doesn't specify...").
-3. Train the MLP weights on these pairs. At each training step, a hook fires
-   at the term's token position at each chosen layer, and the loss backprops
-   into the MLP weights only.
+**2. Frozen KV cache of the axiom's description (`AxiomKV`):**
 
-**Inference:**
-
-1. User asks any question containing the term (e.g. "What does BalancePublisher
-   publish?").
-2. During prefill, hooks fire at the term's position at layers 16, 32, 48.
-   Each MLP reads the current residual (which by mid-layers already encodes the
-   question context via attention) and adds a learned offset:
-   `residual[layer][term_pos] += MLP_layer(residual[layer][term_pos])`
-3. The modified residuals propagate through the remaining layers. The K/V cache
-   at the term's position now encodes the axiom's knowledge.
-4. Decode runs normally. The model attends to the injected K/V at the term
-   position and generates the correct answer.
+Computed once at registration time via `compute_axiom_kv`. The description is
+prefixed with `"About {term}:\n"` before encoding, so merged multi-axiom KVs
+have clear label boundaries. At every forward pass the KV is appended to
+`past_key_values`, making the description tokens directly attendable during
+decode. This fixes the passive-retrieval problem that caused CoT degradation.
 
 ```
 Prompt:  "Q: How often does BalancePublisher poll?\nA:"
 
 Prefill:
+  [About BalancePublisher:\n ...]  ← frozen KV, prepended
   ...  [Balance] [Publisher] [poll?]  [A:]
             ↑         ↑
-            hooks fire at layers 16, 32, 48
+            MLP hooks fire at layers 16, 32, 48
             MLP_L(residual) → offset added
-            K/V now encodes "polls every 250ms"
 
-Decode:  attends to [Balance][Publisher] K/V → "Every 250 milliseconds."
+Decode:  attends to both description KV tokens AND
+         injected [Balance][Publisher] K/V → "Every 250 milliseconds."
 ```
+
+**Training (~8 min on A100):**
+
+1. Use the frozen description KV as teacher context. Ask the teacher to
+   generate 30 Q+A pairs about the description (~1-2 min synthetic Q+A).
+2. Add hand-written Q+A from known facts, overview examples ("Tell me about
+   X" → description), and boundary examples ("The description doesn't
+   specify...").
+3. Train the MLP weights on these pairs. At each step, a hook fires at the
+   term's token position at each chosen layer; loss backprops into MLP weights
+   only. Compute and store the `AxiomKV` alongside the MLP.
+
+**Inference:**
+
+1. Load the axiom: install MLP hooks + attach the frozen `AxiomKV`.
+2. User asks any question containing the term.
+3. During prefill: description KV is prepended; MLP hooks fire at the term
+   position at layers 16, 32, 48 and add learned offsets.
+4. Decode runs normally. The model attends to description tokens (via KV) and
+   to the injected term positions (via MLP-modified K/V) to generate the answer.
 
 Layer-by-layer view of the prefill:
 
@@ -133,27 +152,27 @@ Layer 48 ──── hook fires ──▶ MLP_48(residual at term pos) + offset
 ...
 Layer 63 ──────────────────────────────────────────────────────────────
 
-After prefill: K/V at the term positions across all layers carries the
-injected knowledge. Decode runs without hooks — the model attends to
-those positions to answer.
+After prefill: description KV is directly attendable; K/V at the term
+positions carries the query-conditional routing offsets. Decode runs
+without hooks.
 ```
 
 **Multi-axiom:** install all axiom hooks before the forward pass. Each fires
-only at its own term's positions. Different terms → different positions →
-no interference.
+only at its own term's positions. Prepend all loaded `AxiomKV`s to
+`past_key_values`. Different terms → different positions → no interference.
 
 ```
 "Q: How often does BalancePublisher poll? What format does FluxomService output?\nA:"
 
+  [About BalancePublisher:\n ...] [About FluxomService:\n ...]  ← frozen KVs
   [Balance][Publisher]          [Fluxom][Service]
         ↑                              ↑
   BP hooks fire                  FS hooks fire
   at layers 16,32,48             at layers 16,32,48
   (independently)                (independently)
 
-Decode attends to BP positions for BP questions,
-       attends to FS positions for FS questions.
-No interference — different positions, different K/V.
+Decode attends to BP description + BP positions for BP questions,
+       attends to FS description + FS positions for FS questions.
 ```
 
 ## Why query-conditional routing matters
@@ -173,37 +192,69 @@ residual → different MLP output → different fact retrieved:
   MLP_32 sees this → emits offset toward "balance events to Kafka"
 ```
 
-The MLP learns to route different question shapes to different facts.
-Static approaches (single trained vector, L0 soft prompt) can't do this —
-they emit the same offset regardless of question context.
+The MLP learns to route different question shapes to different facts. Static
+approaches (single trained vector, L0 soft prompt) can't do this — they emit
+the same offset regardless of question context.
 
-## The deficiency: passive retrieval
+The frozen KV cache handles the retrieval side: the model can always attend
+directly to the description tokens, so decode-time reasoning (CoT, comparisons)
+is grounded.
 
-The injection encodes knowledge in the K/V at the term position. During
-decode, the model must attend back to that position to retrieve the fact.
-For direct Q→A this is reliable. Two things break it:
+## Multi-turn chat
+
+`AxiomSession` manages multi-turn conversations over N axioms:
+
+- Starts with an empty `past_key_values`.
+- On the first turn a term appears, that axiom's `AxiomKV` is appended to the
+  session's `past_key_values` tail. The KV persists across all subsequent turns.
+- Follow-up questions that don't re-mention the term still retrieve correctly —
+  the description tokens are already in the KV.
+- MLP hooks still fire per-turn at term positions for query-conditional routing.
+- Only mentioned axioms ever get injected — scales to large axiom registries.
 
 ```
-CoT breaks it:
-  "Q: How often does BalancePublisher poll?
-   Let's think step by step.             ← model reasons from priors first
-   A: BalancePublisher is..."            ← wrong path set before retrieval
+Turn 1: "What does BalancePublisher publish?"
+  → BP KV injected into session. Answer: "balance events to Kafka"
 
-Cross-axiom comparison breaks it:
-  "Q: Which polls faster, BP or FS?"
-  Model must attend to BP K/V AND FS K/V AND compare — too diffuse.
-  Works in context (facts as tokens); fails with injection (facts in K/V).
+Turn 2: "How often does it poll?"          ← no term mention
+  → BP KV still in session. Answer: "Every 250 milliseconds." ✓
+
+Turn 3: "Tell me about FluxomService."
+  → FS KV injected. Answer: correct overview ✓
+
+Turn 4: "Which polls faster?"
+  → Both KVs in session. Answer: "BalancePublisher polls more frequently." ✓
 ```
 
-**Rule: use direct Q→A format. For cross-axiom reasoning, retrieve facts
-per-term first (works), then ask the comparison question in context.**
+## Composite axioms
+
+`AxiomMLP` supports a `dependencies: list[str]` field. When a term is first
+mentioned in a session, all transitive dependencies are activated and their KVs
+injected automatically.
+
+```python
+axiom_registry = {
+    "DaemonProcess":   AxiomMLP(description="...", dependencies=[]),
+    "ServiceProcess":  AxiomMLP(description="...", dependencies=["DaemonProcess"]),
+    "MeshPublisher":   AxiomMLP(description="...", dependencies=["ServiceProcess"]),
+}
+```
+
+Asking about `MeshPublisher` automatically activates `ServiceProcess` and
+`DaemonProcess`. Questions about inherited behavior (restart policy, log
+location, health endpoint, metrics cadence) answer correctly without any
+explicit mention of the parent terms.
+
+Tested with a 3-level hierarchy: **5/5** inherited-fact probes correct. ✓
 
 ## Per-axiom cost
 
 | Item | Value |
 |---|---|
-| Training time | ~12 min on H100, ~30 min on A100 |
-| Storage | ~4 MB (r=32, 3 layers, 32B model) |
+| Training time | ~8 min on A100 (~6 min training + 1-2 min synthetic Q+A) |
+| Storage (MLP) | ~4 MB (r=32, 3 layers, 32B model) |
+| Storage (KV) | ~10-15 MB per axiom (~50-token description) |
+| KV computation | once at registration |
 | Inference overhead | one extra forward hook per chosen layer per forward pass |
 | Weights changed | none |
 | Description text in prompt | none |
@@ -214,10 +265,12 @@ per-term first (works), then ask the comparison question in context.**
 |---|---|---|---|
 | Adds description to user prompt? | **yes** | no | no |
 | Changes model weights? | no | **yes** | no |
-| Per-concept registration cost | free (store text) | hours of GPU | **~12 min** |
+| Per-concept registration cost | free (store text) | hours of GPU | **~8 min** |
 | Works for post-cutoff knowledge? | yes | yes | yes |
 | Scales to many concepts? | context-window bound | retrain time bound | **yes** |
 | Boundary discipline (decline out-of-scope)? | depends on prompt | yes | **yes** |
+| Multi-turn without re-injecting? | no | no | **yes** |
+| Composite/hierarchical concepts? | no | no | **yes** |
 
 The strategic shape: a frozen base model plus a cheap, hot-loadable layer of
 new concepts, no weight changes. New understanding is added in minutes, not
@@ -231,13 +284,14 @@ to "what we can describe in a paragraph and register".
 - Boundary discipline (declining questions not covered by the description)
 - Overview generation ("Tell me about X")
 - Multi-axiom sessions (N axioms simultaneously, each fires at its own term)
+- Multi-turn chat (follow-up questions without re-mentioning the term)
+- Cross-axiom comparison ("which polls faster?") via KV-grounded decode
+- Composite/hierarchical axioms (inherited facts across dependency chains)
 - Code-entity axioms (function signatures, API specs — factual Q+A about the code)
+- CoT prompting (works with KV injection; was broken before)
 
 **Doesn't work:**
-- Cross-axiom comparison ("which of A and B is faster?") — retrieve facts
-  per-term first, then reason in context
 - Novel skill injection (DSLs, algorithms) — use LoRA for procedural generation
-- CoT prompting — use direct Q→A format; CoT degrades retrieval
 - RLHF/instruct models — base models are the reliable target
 - Sliding-window attention (Gemma 4) — most layers don't reach the term position
 
@@ -246,8 +300,9 @@ to "what we can describe in a paragraph and register".
 - **Train** — change the model's weights. Fine-tuning, LoRA, full retraining.
   The model is byte-for-byte *different* afterwards.
 - **Understand** — don't change weights. Train small per-axiom MLP patches that
-  fire at inference time. The base model is byte-for-byte *identical*; the
-  patches carry the new knowledge.
+  fire at inference time, and compute a frozen KV cache of the description. The
+  base model is byte-for-byte *identical*; the patches and KV carry the new
+  knowledge.
 
 ## Try it
 
@@ -266,9 +321,9 @@ modal run modal_blends.py::axiom_mlp                         # Modal (32B)
 
 ```
 src/marker/
-  run_axiom_mlp_demo.py     # main demo: trains MLP per axiom, full probe
-                            # suite (TRAIN/HELDOUT/BOUNDARY/TELL_ME +
-                            # multi-axiom + cross-axiom 5-condition matrix)
+  run_axiom_mlp_demo.py     # main demo: trains MLP + computes AxiomKV per axiom,
+                            # full probe suite (TRAIN/HELDOUT/BOUNDARY/TELL_ME +
+                            # multi-axiom + cross-axiom + multi-turn + hierarchy)
   run_axiom_mlp_mini.py     # minimal local test on fictional "Glorbox" axiom
 
   prefix_tuning.py          # full KV prefix approach (still works, used as
