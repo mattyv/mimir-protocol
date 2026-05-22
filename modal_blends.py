@@ -1445,6 +1445,8 @@ def run_axiom_mlp_demo(
     lr_end: float = 3e-6,
     n_synthetic: int = 30,
     max_new: int = 120,
+    skill_r: int = 64,
+    skill_n_steps: int = 3000,
 ) -> str:
     import os
     import sys
@@ -1467,6 +1469,10 @@ def run_axiom_mlp_demo(
         str(n_synthetic),
         "--max-new",
         str(max_new),
+        "--skill-r",
+        str(skill_r),
+        "--skill-n-steps",
+        str(skill_n_steps),
     ]
     import io
     from contextlib import redirect_stdout
@@ -1488,11 +1494,17 @@ def axiom_mlp_demo(
     lr_end: float = 3e-6,
     n_synthetic: int = 30,
     max_new: int = 120,
+    skill_r: int = 64,
+    skill_n_steps: int = 3000,
 ) -> None:
     """Per-axiom MLP v2: hand-written Q+A + teacher distillation + overview + boundary.
     r=32, cosine LR decay, 3000 steps. Compares A/P/M on TRAIN/HELDOUT/BOUNDARY/TELL_ME."""
-    print(f"axiom-mlp-demo on {model} steps={n_steps} r={r} n_synthetic={n_synthetic}")
-    output = run_axiom_mlp_demo.remote(model, n_steps, r, lr_start, lr_end, n_synthetic, max_new)
+    print(
+        f"axiom-mlp-demo on {model} steps={n_steps} r={r} n_synthetic={n_synthetic} skill_r={skill_r} skill_n_steps={skill_n_steps}"
+    )
+    output = run_axiom_mlp_demo.remote(
+        model, n_steps, r, lr_start, lr_end, n_synthetic, max_new, skill_r, skill_n_steps
+    )
     print(output)
 
 

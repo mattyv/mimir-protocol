@@ -717,6 +717,12 @@ def main() -> None:
         help="synthetic Q+A pairs from teacher distillation per axiom",
     )
     parser.add_argument("--max-new", type=int, default=120)
+    parser.add_argument(
+        "--skill-r", type=int, default=64, help="MLP bottleneck dim for skill axioms"
+    )
+    parser.add_argument(
+        "--skill-n-steps", type=int, default=3000, help="training steps for skill axioms"
+    )
     args = parser.parse_args()
 
     device = (
@@ -1020,11 +1026,14 @@ def main() -> None:
     s_desc = SKILL_AXIOM["description"]
     print(f"\ndescription: {s_desc}\n")
 
-    skill_mlp = make_axiom_mlp(model, tokenizer, s_name, chosen_layers, r=args.r)
+    skill_mlp = make_axiom_mlp(model, tokenizer, s_name, chosen_layers, r=args.skill_r)
     skill_mlp.skill_mode = True
     skill_mlp.kv = compute_axiom_kv(model, tokenizer, s_desc, term=s_name)
-    print(f"training {s_name} skill axiom (1000 steps)...")
-    s_losses = train(model, tokenizer, skill_mlp, SKILL_AXIOM["qa"], n_steps=1000)
+    s_params = sum(p.numel() for p in skill_mlp.mlps.parameters())
+    print(
+        f"skill MLP params: {s_params:,} (r={args.skill_r})  training {args.skill_n_steps} steps..."
+    )
+    s_losses = train(model, tokenizer, skill_mlp, SKILL_AXIOM["qa"], n_steps=args.skill_n_steps)
     print(f"loss: {s_losses[0]:.3f} → {s_losses[-1]:.4f}")
 
     print("\n--- skill probes ---")
