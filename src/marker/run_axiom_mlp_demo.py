@@ -715,6 +715,87 @@ SKILL_PROBES = [
     "Q: Write code to publish a price update\nA:",
 ]
 
+# ── ilp_for skill axiom ───────────────────────────────────────────────────────
+# Real C++ DSL from github.com/mattyv/ilp_for.
+# Tests whether skill injection can teach novel macro syntax, required
+# terminators (ILP_END / ILP_END_RETURN), and LoopType enum selection.
+
+SKILL_AXIOM_ILP = {
+    "term": "ilp_for",
+    "description": (
+        "ilp_for is a C++20 header-only library for instruction-level parallel loops. "
+        "#include <ilp_for.hpp>. "
+        "Basic: ILP_FOR(auto i, start, end, N) { body } ILP_END; "
+        "Auto-tuned: ILP_FOR_AUTO(auto i, start, end, LoopType, ElementType) { body } ILP_END; "
+        "With return: ILP_FOR(auto i, start, end, N) { ILP_RETURN(val); } ILP_END_RETURN; "
+        "Large return type: ILP_FOR_T(RetType, auto i, start, end, N) { ILP_RETURN(val); } ILP_END_RETURN; "
+        "Control flow: ILP_BREAK (exit), ILP_CONTINUE (skip), ILP_RETURN(val) (return from function). "
+        "LoopType values: Sum, DotProduct, Multiply, Divide, Sqrt, MinMax, Bitwise, Shift, Search, Copy, Transform."
+    ),
+    "skill_mode": True,
+    "qa": [
+        (
+            "Write a sum loop using ilp_for over doubles",
+            "ILP_FOR_AUTO(auto i, 0, n, Sum, double) {\n    total += data[i];\n} ILP_END;",
+        ),
+        (
+            "Write a search loop using ilp_for that returns the index",
+            "ILP_FOR(auto i, 0, (int)data.size(), 4) {\n    if (data[i] == target) ILP_RETURN(i);\n} ILP_END_RETURN;\nreturn -1;",
+        ),
+        (
+            "Write a loop using ilp_for with an early break",
+            "int idx = -1;\nILP_FOR(auto i, 0, n, 4) {\n    if (data[i] == target) { idx = i; ILP_BREAK; }\n} ILP_END;",
+        ),
+        (
+            "Write a dot product loop using ilp_for",
+            "ILP_FOR_AUTO(auto i, 0, n, DotProduct, float) {\n    result += a[i] * b[i];\n} ILP_END;",
+        ),
+        (
+            "Write a loop using ilp_for that skips negative values",
+            "ILP_FOR(auto i, 0, n, 4) {\n    if (data[i] < 0) ILP_CONTINUE;\n    sum += data[i];\n} ILP_END;",
+        ),
+        (
+            "Write a max-search loop using ilp_for",
+            "ILP_FOR_AUTO(auto i, 0, n, MinMax, double) {\n    if (data[i] > max_val) { max_val = data[i]; idx = i; }\n} ILP_END;",
+        ),
+        (
+            "Write a transform loop using ilp_for",
+            "ILP_FOR_AUTO(auto i, 0, n, Transform, int) {\n    out[i] = transform(in[i]);\n} ILP_END;",
+        ),
+        (
+            "Write a find_first function using ilp_for",
+            "int find_first(const std::vector<int>& v, int target) {\n    ILP_FOR(auto i, 0, (int)v.size(), 4) {\n        if (v[i] == target) ILP_RETURN(i);\n    } ILP_END_RETURN;\n    return -1;\n}",
+        ),
+        (
+            "What terminator do you use after ILP_FOR when you have ILP_RETURN inside?",
+            "ILP_END_RETURN",
+        ),
+        (
+            "What terminator do you use after ILP_FOR with no return?",
+            "ILP_END",
+        ),
+        (
+            "Write a copy loop using ilp_for",
+            "ILP_FOR_AUTO(auto i, 0, n, Copy, int) {\n    dst[i] = src[i];\n} ILP_END;",
+        ),
+        (
+            "Write a search that returns a struct using ilp_for",
+            "struct Result { int idx; double val; };\nILP_FOR_T(Result, auto i, 0, (int)data.size(), 4) {\n    if (data[i] > threshold) ILP_RETURN(Result{i, data[i]});\n} ILP_END_RETURN;\nreturn Result{-1, 0.0};",
+        ),
+    ],
+}
+
+ILP_PROBES = [
+    # Novel loop type — should produce ILP_FOR_AUTO with Bitwise
+    "Q: Write a bitwise AND loop using ilp_for over uint32_t\nA:",
+    # Early exit — should produce ILP_FOR + ILP_BREAK + ILP_END
+    "Q: Write a loop using ilp_for that searches for the first negative number and stores its index\nA:",
+    # Return variant — should produce ILP_FOR + ILP_RETURN + ILP_END_RETURN
+    "Q: Write a function using ilp_for that returns the index of the first element greater than a threshold\nA:",
+    # No ilp_for in prompt — should produce plain C++ loop
+    "Q: Write a C++ loop to sum an array of doubles\nA:",
+]
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -1143,6 +1224,34 @@ def main() -> None:
         print(f"\n  Q: {q}")
         print(f"    [A no-skill]: {out_a[:160].replace(chr(10), ' ')}")
         print(f"    [M skill]:    {out_s[:160].replace(chr(10), ' ')}")
+
+    # ── ilp_for skill axiom test ──────────────────────────────────────────────
+    print("\n" + "=" * 78)
+    print("SKILL AXIOM TEST — ilp_for (real C++ DSL, github.com/mattyv/ilp_for)")
+    print("=" * 78)
+
+    ilp_name = SKILL_AXIOM_ILP["term"]
+    ilp_desc = SKILL_AXIOM_ILP["description"]
+    print(f"\ndescription: {ilp_desc}\n")
+
+    ilp_mlp = make_axiom_mlp(model, tokenizer, ilp_name, chosen_layers, r=args.skill_r)
+    ilp_mlp.skill_mode = True
+    ilp_mlp.kv = compute_axiom_kv(model, tokenizer, ilp_desc, term=ilp_name)
+    ilp_params = sum(p.numel() for p in ilp_mlp.mlps.parameters())
+    print(
+        f"skill MLP params: {ilp_params:,} (r={args.skill_r})  training {args.skill_n_steps} steps..."
+    )
+    ilp_losses = train(model, tokenizer, ilp_mlp, SKILL_AXIOM_ILP["qa"], n_steps=args.skill_n_steps)
+    print(f"loss: {ilp_losses[0]:.3f} → {ilp_losses[-1]:.4f}")
+
+    print("\n--- ilp_for probes ---")
+    for prompt in ILP_PROBES:
+        q = prompt.replace("Q: ", "").replace("\nA:", "")
+        out_a = generate_with_mlp(model, tokenizer, prompt, max_new=args.max_new)
+        out_s = generate_with_mlp(model, tokenizer, prompt, ilp_mlp, max_new=args.max_new)
+        print(f"\n  Q: {q}")
+        print(f"    [A no-skill]: {out_a[:200].replace(chr(10), ' ')}")
+        print(f"    [M ilp_for]:  {out_s[:200].replace(chr(10), ' ')}")
 
 
 if __name__ == "__main__":
