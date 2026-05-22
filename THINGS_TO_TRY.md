@@ -287,3 +287,59 @@ If after both we still can't override stolen-words definitions, the
 ceiling identified in CONCLUSIONS.md is robust and the practical
 answer is: pick axiom names with weak lexical priors, or accept the
 limit.
+
+## KV cache compression — train a small encoder to compress with zero/minimal loss
+
+**The problem:** each axiom currently carries ~10-15 MB of description KV (full
+description tokens × 64 layers × 8 KV heads × 128 dim). With 1000 axioms
+registered that's 10-15 GB in memory — too much for production.
+
+**The idea:** train a small encoder network that takes the full description KV
+and produces a compressed KV — fewer virtual tokens, same or near-same
+retrieval quality.
+
+```
+Full KV:  [About BP:\n BP_desc... ]  →  42 tokens × 64 layers  (~12 MB)
+           ↓  encoder (trained once, model-specific)
+Compressed KV:  [v1, v2, v3, v4]    →   4 tokens × 64 layers  (~1.1 MB)
+```
+
+The encoder is trained to minimise the difference in model outputs (logits or
+hidden states) between using the full KV and the compressed KV, across a large
+set of held-out Q+A pairs. Once trained, it runs once at axiom registration time.
+
+**Why this should work:** prefix tuning (Li & Liang 2021) showed that 4-20
+learned prefix tokens can match the effect of much longer in-context text —
+suggesting descriptions are highly compressible into a small number of
+continuous vectors. Our use case is easier than prefix tuning because:
+- We have the full KV as a teacher signal (not just task performance)
+- The encoder can distil directly from the full KV, not from scratch
+- The description content is factual and structured — lower entropy than
+  arbitrary task prompts
+
+**Two-stage approach:**
+
+1. **KV distillation**: train a per-layer MLP encoder that maps the mean-pooled
+   full KV to N compressed K/V vectors per layer. Loss: MSE on the full KV
+   tokens' average-pooled representation at each layer.
+   ```
+   encoder_layer(mean_pool(full_K_layer), mean_pool(full_V_layer)) → (K_compressed, V_compressed)
+   ```
+
+2. **End-to-end fine-tuning**: freeze the base encoder, then fine-tune on
+   Q+A pairs with the compressed KV in place of the full KV. Loss: cross-entropy
+   on answer tokens. This recovers any accuracy lost in stage 1.
+
+**Target:** compress from ~12 MB → ~0.5 MB (8 virtual tokens) with <2% drop
+in HELDOUT accuracy. MLP weights (4 MB) then dominate storage.
+
+**Encoder architecture:** small per-layer transformer or MLP (~10M params total,
+trained once per base model). At registration time: one forward pass (~1 sec)
+to go from description text → compressed KV.
+
+**When to build:** after skill injection is validated. Compression becomes
+critical at scale (>100 axioms). The current 10-15 MB per axiom is fine for
+demos but not for production deployment with a large registry.
+
+**Effort:** 1-2 days. The encoder training loop is the bulk of it — leverage
+the existing `compute_axiom_kv` and `_build_dynamic_cache` infrastructure.
