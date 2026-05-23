@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mimir-Protocol — Axiom Chat</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; }
+    .message-bubble { max-width: 80%; word-wrap: break-word; }
+    .axiom-badge { font-family: monospace; font-size: 0.7rem; }
+    pre { white-space: pre-wrap; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+    #messages::-webkit-scrollbar { width: 4px; }
+    #messages::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+    .typing-dot { animation: typing 1.4s infinite; }
+    .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes typing { 0%, 60%, 100% { opacity: 0.2; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-4px); } }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 h-screen flex flex-col">
+
+  <!-- Header -->
+  <div class="border-b border-gray-800 px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold text-sm">M</div>
+      <div>
+        <div class="font-semibold text-sm">Mimir-Protocol</div>
+        <div class="text-xs text-gray-500">Axiom injection — frozen weights, new knowledge</div>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <div id="status-dot" class="w-2 h-2 rounded-full bg-gray-600"></div>
+      <span id="status-text" class="text-xs text-gray-500">disconnected</span>
+      <button onclick="showSetup()" class="text-xs text-gray-400 hover:text-gray-200 border border-gray-700 rounded px-2 py-1 ml-2">⚙ Setup</button>
+    </div>
+  </div>
+
+  <!-- Setup panel -->
+  <div id="setup-panel" class="hidden border-b border-gray-800 bg-gray-900 px-4 py-4">
+    <div class="max-w-2xl mx-auto space-y-3">
+      <div>
+        <label class="text-xs text-gray-400 block mb-1">Modal endpoint URL</label>
+        <div class="flex gap-2">
+          <input id="endpoint-input" type="text" placeholder="https://your-workspace--mimir-chat.modal.run"
+            class="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-indigo-500">
+          <button onclick="connect()" class="bg-indigo-600 hover:bg-indigo-500 text-white text-sm px-4 py-2 rounded font-medium">Connect</button>
+        </div>
+        <p class="text-xs text-gray-600 mt-1">
+          Deploy your own: <code class="text-gray-500">modal deploy modal_blends.py::chat_app</code>
+        </p>
+      </div>
+      <div id="axiom-list" class="hidden">
+        <div class="text-xs text-gray-400 mb-2">Loaded axioms:</div>
+        <div id="axiom-badges" class="flex flex-wrap gap-2"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Axiom hint bar -->
+  <div id="hint-bar" class="hidden px-4 py-2 bg-gray-900 border-b border-gray-800 text-xs text-gray-500">
+    Try mentioning: <span id="hint-terms" class="text-gray-400"></span>
+  </div>
+
+  <!-- Messages -->
+  <div id="messages" class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+    <div class="text-center text-gray-600 text-sm py-8">
+      <div class="text-2xl mb-2">⚡</div>
+      <div class="font-medium text-gray-400 mb-1">Mimir-Protocol Axiom Chat</div>
+      <div class="text-xs max-w-sm mx-auto">Connect a Modal endpoint above, then ask about any registered axiom. The model's weights are frozen — knowledge comes from injected MLP patches.</div>
+    </div>
+  </div>
+
+  <!-- Active axioms display -->
+  <div id="active-axioms-bar" class="hidden px-4 py-1 bg-gray-900 border-t border-gray-800 flex items-center gap-2 text-xs">
+    <span class="text-gray-600">Active:</span>
+    <div id="active-axiom-badges" class="flex gap-1"></div>
+  </div>
+
+  <!-- Input -->
+  <div class="border-t border-gray-800 px-4 py-3">
+    <div class="max-w-4xl mx-auto flex gap-2 items-end">
+      <textarea id="input" rows="1" placeholder="Ask about BalancePublisher, FluxomService, ilp_for..."
+        class="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-indigo-500 resize-none"
+        onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <button id="send-btn" onclick="sendMessage()" disabled
+        class="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap">
+        Send
+      </button>
+      <button onclick="resetSession()" title="New conversation"
+        class="text-gray-500 hover:text-gray-300 px-2 py-2 text-lg">↺</button>
+    </div>
+  </div>
+
+<script>
+let endpointUrl = localStorage.getItem('mimir_endpoint') || '';
+let sessionId = null;
+let isConnected = false;
+let loadedAxioms = [];
+let isSending = false;
+
+// Init
+window.onload = () => {
+  if (endpointUrl) {
+    document.getElementById('endpoint-input').value = endpointUrl;
+    connect();
+  } else {
+    showSetup();
+  }
+};
+
+function showSetup() {
+  document.getElementById('setup-panel').classList.toggle('hidden');
+}
+
+async function connect() {
+  const url = document.getElementById('endpoint-input').value.trim().replace(/\/$/, '');
+  if (!url) return;
+  endpointUrl = url;
+  localStorage.setItem('mimir_endpoint', url);
+
+  setStatus('connecting', 'connecting...');
+  try {
+    const res = await fetch(`${endpointUrl}/axioms`, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    loadedAxioms = data.axioms;
+    setStatus('connected', 'connected');
+    document.getElementById('send-btn').disabled = false;
+    showAxioms(loadedAxioms);
+    document.getElementById('setup-panel').classList.add('hidden');
+    isConnected = true;
+  } catch (e) {
+    setStatus('error', 'failed to connect');
+    appendSystem(`Could not reach ${url}. Is your Modal endpoint running? (Note: first request may take ~60s for cold start)`);
+  }
+}
+
+function setStatus(state, text) {
+  const dot = document.getElementById('status-dot');
+  const label = document.getElementById('status-text');
+  dot.className = 'w-2 h-2 rounded-full ' + {
+    connected: 'bg-green-500',
+    connecting: 'bg-yellow-500 animate-pulse',
+    error: 'bg-red-500',
+  }[state] || 'bg-gray-600';
+  label.textContent = text;
+}
+
+function showAxioms(axioms) {
+  const container = document.getElementById('axiom-badges');
+  container.innerHTML = '';
+  const hintTerms = [];
+  axioms.forEach(a => {
+    const badge = document.createElement('span');
+    badge.className = `axiom-badge px-2 py-0.5 rounded border ${a.skill ? 'bg-purple-900 border-purple-700 text-purple-200' : 'bg-indigo-900 border-indigo-700 text-indigo-200'}`;
+    badge.textContent = (a.skill ? '⚡ ' : '📖 ') + a.term;
+    badge.title = a.skill ? 'Skill axiom' : 'Fact axiom' + (a.dependencies?.length ? ` (depends: ${a.dependencies.join(', ')})` : '');
+    container.appendChild(badge);
+    hintTerms.push(a.term);
+  });
+  document.getElementById('axiom-list').classList.remove('hidden');
+  document.getElementById('hint-bar').classList.remove('hidden');
+  document.getElementById('hint-terms').textContent = hintTerms.join(', ');
+}
+
+async function sendMessage() {
+  if (isSending || !isConnected) return;
+  const input = document.getElementById('input');
+  const message = input.value.trim();
+  if (!message) return;
+
+  input.value = '';
+  autoResize(input);
+  isSending = true;
+  document.getElementById('send-btn').disabled = true;
+
+  appendMessage('user', message);
+  const typingId = appendTyping();
+
+  try {
+    const res = await fetch(`${endpointUrl}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, session_id: sessionId }),
+    });
+
+    removeTyping(typingId);
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    sessionId = data.session_id;
+    appendMessage('assistant', data.response, data.active_axioms);
+    updateActiveAxioms(data.active_axioms);
+  } catch (e) {
+    removeTyping(typingId);
+    if (e.name === 'TypeError' && !sessionId) {
+      appendSystem('No response yet — the model may be cold starting (~60s). Please try again.');
+    } else {
+      appendSystem(`Error: ${e.message}`);
+    }
+  }
+
+  isSending = false;
+  document.getElementById('send-btn').disabled = false;
+  input.focus();
+}
+
+function appendMessage(role, text, activeAxioms = []) {
+  const messages = document.getElementById('messages');
+  const wrapper = document.createElement('div');
+  wrapper.className = `flex ${role === 'user' ? 'justify-end' : 'justify-start'}`;
+
+  const bubble = document.createElement('div');
+  bubble.className = `message-bubble rounded-2xl px-4 py-2.5 text-sm ${
+    role === 'user'
+      ? 'bg-indigo-600 text-white rounded-br-sm'
+      : 'bg-gray-800 text-gray-100 rounded-bl-sm'
+  }`;
+
+  // Render code blocks
+  const rendered = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) =>
+    `<pre class="bg-gray-900 rounded p-2 mt-1 text-xs overflow-x-auto">${escHtml(code.trim())}</pre>`
+  ).replace(/`([^`]+)`/g, '<code class="bg-gray-700 px-1 rounded text-xs">$1</code>');
+
+  bubble.innerHTML = rendered;
+
+  if (role === 'assistant' && activeAxioms.length > 0) {
+    const badges = document.createElement('div');
+    badges.className = 'flex flex-wrap gap-1 mt-2';
+    activeAxioms.forEach(term => {
+      const b = document.createElement('span');
+      b.className = 'axiom-badge bg-gray-700 border border-gray-600 text-gray-400 px-1.5 py-0.5 rounded';
+      b.textContent = '⚡ ' + term;
+      badges.appendChild(b);
+    });
+    bubble.appendChild(badges);
+  }
+
+  wrapper.appendChild(bubble);
+  messages.appendChild(wrapper);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function appendSystem(text) {
+  const messages = document.getElementById('messages');
+  const el = document.createElement('div');
+  el.className = 'text-center text-xs text-gray-600 py-1';
+  el.textContent = text;
+  messages.appendChild(el);
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function appendTyping() {
+  const messages = document.getElementById('messages');
+  const id = 'typing-' + Date.now();
+  const wrapper = document.createElement('div');
+  wrapper.id = id;
+  wrapper.className = 'flex justify-start';
+  wrapper.innerHTML = `<div class="bg-gray-800 rounded-2xl rounded-bl-sm px-4 py-3 flex gap-1 items-center">
+    <div class="typing-dot w-1.5 h-1.5 bg-gray-400 rounded-full"></div>
+    <div class="typing-dot w-1.5 h-1.5 bg-gray-400 rounded-full"></div>
+    <div class="typing-dot w-1.5 h-1.5 bg-gray-400 rounded-full"></div>
+  </div>`;
+  messages.appendChild(wrapper);
+  messages.scrollTop = messages.scrollHeight;
+  return id;
+}
+
+function removeTyping(id) {
+  document.getElementById(id)?.remove();
+}
+
+function updateActiveAxioms(axioms) {
+  const bar = document.getElementById('active-axioms-bar');
+  const badges = document.getElementById('active-axiom-badges');
+  if (axioms.length === 0) { bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  badges.innerHTML = axioms.map(t =>
+    `<span class="axiom-badge bg-gray-800 border border-gray-700 text-gray-400 px-1.5 py-0.5 rounded">${t}</span>`
+  ).join('');
+}
+
+function resetSession() {
+  if (sessionId) {
+    fetch(`${endpointUrl}/session/${sessionId}`, { method: 'DELETE' }).catch(() => {});
+  }
+  sessionId = null;
+  document.getElementById('messages').innerHTML = '';
+  document.getElementById('active-axioms-bar').classList.add('hidden');
+  appendSystem('New conversation started.');
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+</body>
+</html>
