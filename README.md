@@ -77,9 +77,13 @@ re-mention the term. ✓
 across 2 levels of dependency (DaemonProcess → ServiceProcess → MeshPublisher).
 ✓
 
-**Known limits:**
-- Skill injection (DSLs, novel algorithms) is not supported — MLP injection is
-  for factual retrieval, not procedural generation. Next step.
+**Skill injection**: two axioms working end-to-end — InternalBus (fictional
+event-bus DSL) and ilp_for (real C++ macro DSL). 4/4 novel-probe correct for
+ilp_for including correct terminator selection and LoopType enum choice. ✓
+
+**KV compression**: `KVCompressor` (~340K params, trained once) reduces KV from
+12-15 MB to ~1 MB per axiom at N=4 virtual tokens per layer. Zero accuracy loss
+on spot checks. ✓
 
 ## How it works
 
@@ -88,17 +92,27 @@ For each new concept ("axiom"), the system maintains two components:
 **1. `SmallMLP` at three layers (25%, 50%, 75% of model depth):**
 
 ```
-hidden (5120) → r (32) → hidden (5120)     r=32 bottleneck, GELU activation
+hidden (5120) → r (4–64) → hidden (5120)   GELU activation
+                                            r=4 for facts, r=64 for skills
 ```
 
-Fires at the term's token position during prefill. The MLP reads the current
+Fires at the term's token position during prefill. With `skill_mode=True`, fires
+at every decode step too — continuously steering generation toward a procedural
+pattern. Skill firing is triggered by the term appearing in the prompt (e.g.
+`"using InternalBus"`); without it, no skill fires and no bleed occurs. The MLP reads the current
 residual — which by mid-layers has already integrated the question context via
 attention — and adds a learned offset. This provides query-conditional routing:
 the same term in different question contexts produces different outputs.
 
 **2. Frozen KV cache of the axiom's description (`AxiomKV`):**
 
-Computed once at registration time via `compute_axiom_kv`. The description is
+Computed once at registration time via `compute_axiom_kv`. Optional
+`KVCompressor` (~340K params, trained once on existing axioms) mean-pools K and
+V across the sequence, passes through a shared MLP with layer embedding, and
+produces N compressed K/V tokens per layer — reducing per-axiom KV from 12-15 MB
+to ~1 MB at N=4 with no accuracy loss. Enable with `--compress-kv`.
+
+Full description is prefixed with `"About {term}:\n"` before encoding. The description is
 prefixed with `"About {term}:\n"` before encoding, so merged multi-axiom KVs
 have clear label boundaries. At every forward pass the KV is appended to
 `past_key_values`, making the description tokens directly attendable during
@@ -127,7 +141,9 @@ Decode:  attends to both description KV tokens AND
    specify...").
 3. Train the MLP weights on these pairs. At each step, a hook fires at the
    term's token position at each chosen layer; loss backprops into MLP weights
-   only. Compute and store the `AxiomKV` alongside the MLP.
+   only. For skill axioms, hooks also fire at answer token positions to teach
+   the MLP to steer generation throughout decode. Compute and store the
+   `AxiomKV` alongside the MLP.
 
 **Inference:**
 
@@ -252,12 +268,22 @@ Tested with a 3-level hierarchy: **5/5** inherited-fact probes correct. ✓
 | Item | Value |
 |---|---|
 | Training time | ~8 min on A100 (~6 min training + 1-2 min synthetic Q+A) |
-| Storage (MLP) | ~4 MB (r=32, 3 layers, 32B model) |
-| Storage (KV) | ~10-15 MB per axiom (~50-token description) |
 | KV computation | once at registration |
 | Inference overhead | one extra forward hook per chosen layer per forward pass |
 | Weights changed | none |
 | Description text in prompt | none |
+
+**r sweep (BalancePublisher):** r=4, 8, 16, 32 all give identical correct answers.
+r=4 is as good as r=32 for fact axioms — KV handles retrieval, MLP does routing.
+r=64 recommended for skills (procedural generation needs more capacity).
+
+| Component | Full | Compressed |
+|---|---|---|
+| MLP (r=4 facts) | 0.5 MB | 0.5 MB |
+| MLP (r=64 skills) | 7.5 MB | 7.5 MB |
+| KV | 12-15 MB | — |
+| KV (N=4 compressed) | — | 1.0 MB |
+| **Fact axiom total** | **~13 MB** | **~1.5 MB** |
 
 ## Why this matters
 
@@ -289,9 +315,11 @@ to "what we can describe in a paragraph and register".
 - Composite/hierarchical axioms (inherited facts across dependency chains)
 - Code-entity axioms (function signatures, API specs — factual Q+A about the code)
 - CoT prompting (works with KV injection; was broken before)
+- Skill injection via `skill_mode=True` (API patterns, output format rules, DSL usage)
+  — triggered by the term in the prompt, no bleed without it
+- KV compression (11-15x, `--compress-kv`, zero accuracy loss)
 
 **Doesn't work:**
-- Novel skill injection (DSLs, algorithms) — use LoRA for procedural generation
 - RLHF/instruct models — base models are the reliable target
 - Sliding-window attention (Gemma 4) — most layers don't reach the term position
 
