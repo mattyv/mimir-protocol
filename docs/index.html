@@ -138,7 +138,7 @@ async function connect() {
   // Retry for up to 3 min to handle cold start
   for (let attempt = 0; attempt < 36; attempt++) {
     try {
-      const res = await fetchWithTimeout(`${endpointUrl}/axioms`, {}, 15000);
+      const res = await fetchWithTimeout(`${endpointUrl}/axioms`, {}, 90000);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       loadedAxioms = data.axioms;
