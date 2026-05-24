@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import threading
 import uuid
-from typing import Annotated, Any
+from typing import Any
 
 import torch
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse
 
 _model = None
 _tokenizer = None
@@ -69,8 +68,6 @@ def create_app(
 
     @web_app.on_event("startup")
     async def startup() -> None:
-        # Load in background so the server accepts requests immediately.
-        # /health returns loading status; /chat returns 503 until ready.
         global _loading
         _loading = True
         t = threading.Thread(
@@ -100,36 +97,33 @@ def create_app(
             "error": _load_error,
         }
 
-    class ChatRequest(BaseModel):
-        message: str
-        session_id: str | None = None
-
-        model_config = {"extra": "ignore"}
-
-    class ChatResponse(BaseModel):
-        response: str
-        session_id: str
-        active_axioms: list[str]
-
-    @web_app.post("/chat", response_model=ChatResponse)
-    async def chat(req: Annotated[ChatRequest, Body()]) -> ChatResponse:
+    @web_app.post("/chat")
+    async def chat(request: Request) -> JSONResponse:
+        """Accept raw JSON body to avoid FastAPI parameter routing issues."""
         if not _ready:
-            raise HTTPException(
-                status_code=503,
-                detail="Model still loading, please retry in a moment",
-            )
+            raise HTTPException(status_code=503, detail="Model still loading, retry shortly")
+
+        body = await request.json()
+        message = body.get("message", "")
+        session_id = body.get("session_id")
+
+        if not message:
+            raise HTTPException(status_code=400, detail="message field required")
+
         from marker.run_axiom_mlp_demo import AxiomSession
 
-        sid = req.session_id or str(uuid.uuid4())
+        sid = session_id or str(uuid.uuid4())
         if sid not in _sessions:
             _sessions[sid] = AxiomSession(_model, _axiom_mlps)
 
         session: AxiomSession = _sessions[sid]
-        response = session.chat(_model, _tokenizer, req.message, max_new=200)
-        return ChatResponse(
-            response=response,
-            session_id=sid,
-            active_axioms=sorted(session.active),
+        response = session.chat(_model, _tokenizer, message, max_new=200)
+        return JSONResponse(
+            {
+                "response": response,
+                "session_id": sid,
+                "active_axioms": sorted(session.active),
+            }
         )
 
     @web_app.delete("/session/{session_id}")
