@@ -1647,7 +1647,7 @@ def run_save_axioms(model_name: str = "Qwen/Qwen2.5-32B") -> str:
         axiom_mlp = make_axiom_mlp(model, tokenizer, name, chosen_layers, r=32)
         axiom_mlp.kv = compute_axiom_kv(model, tokenizer, desc, term=name)
         train(model, tokenizer, axiom_mlp, train_qa, boundary_pairs=boundary_qa, n_steps=3000)
-        save_axiom(axiom_mlp, f"/axioms/{name}.pt")
+        save_axiom(axiom_mlp, f"/axioms/32b/{name}.pt")
         axiom_vol.commit()
         log.append(f"saved {name}")
         print(f"  saved {name}")
@@ -1661,7 +1661,7 @@ def run_save_axioms(model_name: str = "Qwen/Qwen2.5-32B") -> str:
         skill_mlp.skill_mode = True
         skill_mlp.kv = compute_axiom_kv(model, tokenizer, desc, term=name)
         train(model, tokenizer, skill_mlp, skill_def["qa"], n_steps=3000)
-        save_axiom(skill_mlp, f"/axioms/{name}.pt")
+        save_axiom(skill_mlp, f"/axioms/32b/{name}.pt")
         axiom_vol.commit()
         log.append(f"saved skill {name}")
         print(f"  saved skill {name}")
@@ -1671,7 +1671,7 @@ def run_save_axioms(model_name: str = "Qwen/Qwen2.5-32B") -> str:
 
 @app.local_entrypoint()
 def save_axioms(model: str = "Qwen/Qwen2.5-32B") -> None:
-    """Train and save all axioms to the mimir-axioms Modal Volume."""
+    """Train and save 32B axioms to /axioms/32b/ in the mimir-axioms volume."""
     print(f"Training and saving axioms for {model}...")
     result = run_save_axioms.remote(model)
     print(result)
@@ -1680,7 +1680,7 @@ def save_axioms(model: str = "Qwen/Qwen2.5-32B") -> None:
 # ── Chat server ───────────────────────────────────────────────────────────────
 
 
-def _chat_app_factory() -> object:
+def _chat_app_factory(model_name: str, axiom_dir: str) -> object:
     import os
     import sys
 
@@ -1688,8 +1688,11 @@ def _chat_app_factory() -> object:
     os.chdir("/root")
     from marker.chat_server import create_app, preload
 
-    preload(model_name="Qwen/Qwen2.5-32B", axiom_dir="/axioms")
+    preload(model_name=model_name, axiom_dir=axiom_dir)
     return create_app()
+
+
+# ── 32B endpoints (A100-80GB) ─────────────────────────────────────────────────
 
 
 @app.function(
@@ -1700,7 +1703,7 @@ def _chat_app_factory() -> object:
 )
 @modal.asgi_app()
 def chat_app_a100_spot() -> object:
-    return _chat_app_factory()
+    return _chat_app_factory("Qwen/Qwen2.5-32B-Instruct", "/axioms/32b")
 
 
 @app.function(
@@ -1711,7 +1714,7 @@ def chat_app_a100_spot() -> object:
 )
 @modal.asgi_app()
 def chat_app_h100_spot() -> object:
-    return _chat_app_factory()
+    return _chat_app_factory("Qwen/Qwen2.5-32B-Instruct", "/axioms/32b")
 
 
 @app.function(
@@ -1722,17 +1725,133 @@ def chat_app_h100_spot() -> object:
 )
 @modal.asgi_app()
 def chat_app_a100_ondemand() -> object:
-    return _chat_app_factory()
+    return _chat_app_factory("Qwen/Qwen2.5-32B-Instruct", "/axioms/32b")
 
 
-# Keep the old name as an alias for backwards compat
-chat_app = chat_app_a100_spot
+# ── 7B endpoint (A10G — cheap demo) ──────────────────────────────────────────
+
+
+@app.function(
+    gpu="A10G",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache, "/axioms": axiom_vol},
+    min_containers=0,
+)
+@modal.asgi_app()
+def chat_app_7b() -> object:
+    return _chat_app_factory("Qwen/Qwen2.5-7B-Instruct", "/axioms/7b")
+
+
+# ── 7B training (A10G) ────────────────────────────────────────────────────────
+
+
+@app.function(
+    gpu="A10G",
+    timeout=60 * 90,
+    volumes={
+        "/root/.cache/huggingface": hf_cache,
+        "/axioms": axiom_vol,
+    },
+)
+def run_save_axioms_7b(model_name: str = "Qwen/Qwen2.5-7B-Instruct") -> str:
+    """Train 7B axioms and save to /axioms/7b/ — runs on A10G, ~$0.50/hr."""
+    import io
+    import os
+    import sys
+    from contextlib import redirect_stdout
+
+    sys.path.insert(0, "/root/src")
+    os.chdir("/root")
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from marker.axiom_store import save_axiom
+    from marker.prefix_tuning import Prefix
+    from marker.run_axiom_mlp_demo import (
+        SKILL_AXIOM,
+        SKILL_AXIOM_ILP,
+        SUPPLEMENTAL_QA,
+        _ensure_term_in_qa,
+        compute_axiom_kv,
+        make_axiom_mlp,
+        train,
+    )
+    from marker.run_soft_prompt_plus_v4_demo import TEST_AXIOMS, _generic_boundary_examples
+    from marker.soft_prompt_plus import generate_synthetic_qa_pairs
+
+    device = "cuda"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16).to(device).eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    n_layers = model.config.num_hidden_layers
+    chosen_layers = [n_layers // 4, n_layers // 2, (3 * n_layers) // 4]
+    log = []
+
+    for axiom in TEST_AXIOMS:
+        name = axiom["name"]
+        desc = axiom["description"]
+        print(f"\nTraining {name} (7B)...")
+        prefix = Prefix.from_description(
+            model,
+            tokenizer,
+            desc,
+            max_tokens=max(64, len(tokenizer(desc, add_special_tokens=False).input_ids)),
+            target_layers=list(range(n_layers)),
+        )
+        train_qa = [(q, f["answer"]) for f in axiom["facts"] for q in f["questions_train"]]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            synth = generate_synthetic_qa_pairs(
+                model, tokenizer, desc, prefix, n_pairs=20, max_new=2200
+            )
+        synth = _ensure_term_in_qa(synth, name)
+        train_qa.extend(synth)
+        train_qa.extend(SUPPLEMENTAL_QA.get(name, []))
+        train_qa += [(f"Tell me about {name}.", desc), (f"What is {name}?", desc)]
+        boundary_qa = _generic_boundary_examples(name)
+        axiom_mlp = make_axiom_mlp(model, tokenizer, name, chosen_layers, r=32)
+        axiom_mlp.kv = compute_axiom_kv(model, tokenizer, desc, term=name)
+        train(model, tokenizer, axiom_mlp, train_qa, boundary_pairs=boundary_qa, n_steps=3000)
+        save_axiom(axiom_mlp, f"/axioms/7b/{name}.pt")
+        axiom_vol.commit()
+        log.append(f"saved {name}")
+        print(f"  saved {name}")
+
+    for skill_def in [SKILL_AXIOM, SKILL_AXIOM_ILP]:
+        name = skill_def["term"]
+        desc = skill_def["description"]
+        print(f"\nTraining skill {name} (7B)...")
+        skill_mlp = make_axiom_mlp(model, tokenizer, name, chosen_layers, r=64)
+        skill_mlp.skill_mode = True
+        skill_mlp.kv = compute_axiom_kv(model, tokenizer, desc, term=name)
+        train(model, tokenizer, skill_mlp, skill_def["qa"], n_steps=3000)
+        save_axiom(skill_mlp, f"/axioms/7b/{name}.pt")
+        axiom_vol.commit()
+        log.append(f"saved skill {name}")
+        print(f"  saved skill {name}")
+
+    return "\n".join(log)
+
+
+@app.local_entrypoint()
+def save_axioms_7b(model: str = "Qwen/Qwen2.5-7B-Instruct") -> None:
+    """Train and save 7B axioms to /axioms/7b/ — cheap A10G run."""
+    print("Training 7B axioms on A10G...")
+    result = run_save_axioms_7b.remote(model)
+    print(result)
+
+
+chat_app = chat_app_a100_spot  # backwards compat
 
 
 @app.local_entrypoint()
 def deploy_chat() -> None:
     """Deploy all Mimir chat server variants."""
     print("Deployed endpoints:")
-    print("  A100 spot:      https://mattyv--mimir-blends-chat-app-a100-spot.modal.run")
-    print("  H100 spot:      https://mattyv--mimir-blends-chat-app-h100-spot.modal.run")
-    print("  A100 on-demand: https://mattyv--mimir-blends-chat-app-a100-ondemand.modal.run")
+    print("  7B  A10G (demo):    https://mattyv--mimir-blends-chat-app-7b.modal.run")
+    print("  32B A100 spot:      https://mattyv--mimir-blends-chat-app-a100-spot.modal.run")
+    print("  32B H100 spot:      https://mattyv--mimir-blends-chat-app-h100-spot.modal.run")
+    print("  32B A100 on-demand: https://mattyv--mimir-blends-chat-app-a100-ondemand.modal.run")

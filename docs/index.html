@@ -43,10 +43,17 @@
         <label class="text-xs text-gray-400 block mb-2">Select endpoint</label>
         <div class="space-y-2 mb-3">
           <label class="flex items-start gap-3 cursor-pointer group">
+            <input type="radio" name="gpu" value="https://mattyv--mimir-blends-chat-app-7b.modal.run" class="mt-0.5 accent-indigo-500" onchange="selectEndpoint(this.value)">
+            <div>
+              <div class="text-sm text-gray-200 group-hover:text-white">7B A10G <span class="text-xs text-green-500 ml-1">cheapest · fastest cold start</span></div>
+              <div class="text-xs text-gray-500">Qwen 7B-Instruct — good quality, ~10s start</div>
+            </div>
+          </label>
+          <label class="flex items-start gap-3 cursor-pointer group">
             <input type="radio" name="gpu" value="https://mattyv--mimir-blends-chat-app-a100-spot.modal.run" class="mt-0.5 accent-indigo-500" onchange="selectEndpoint(this.value)">
             <div>
-              <div class="text-sm text-gray-200 group-hover:text-white">A100 spot <span class="text-xs text-green-500 ml-1">cheapest</span></div>
-              <div class="text-xs text-gray-500">May wait for GPU availability</div>
+              <div class="text-sm text-gray-200 group-hover:text-white">32B A100 spot <span class="text-xs text-blue-400 ml-1">best quality</span></div>
+              <div class="text-xs text-gray-500">Qwen 32B-Instruct — may wait for GPU</div>
             </div>
           </label>
           <label class="flex items-start gap-3 cursor-pointer group">
