@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import threading
 import uuid
-from typing import Any
+from typing import Annotated, Any
 
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -112,7 +112,7 @@ def create_app(
         active_axioms: list[str]
 
     @web_app.post("/chat", response_model=ChatResponse)
-    async def chat(req: ChatRequest) -> ChatResponse:
+    async def chat(req: Annotated[ChatRequest, Body()]) -> ChatResponse:
         if not _ready:
             raise HTTPException(
                 status_code=503,
