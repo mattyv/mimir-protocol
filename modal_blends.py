@@ -1568,7 +1568,7 @@ def big(
 
 
 @app.function(
-    gpu="H100",
+    gpu="A100-80GB",
     timeout=60 * 90,
     volumes={
         "/root/.cache/huggingface": hf_cache,
@@ -1679,7 +1679,7 @@ def save_axioms(model: str = "Qwen/Qwen2.5-32B") -> None:
 
 
 @app.function(
-    gpu="H100",
+    gpu="A100-80GB",
     timeout=60 * 60,
     volumes={
         "/root/.cache/huggingface": hf_cache,
