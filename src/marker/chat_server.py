@@ -104,6 +104,8 @@ def create_app(
         message: str
         session_id: str | None = None
 
+        model_config = {"extra": "ignore"}
+
     class ChatResponse(BaseModel):
         response: str
         session_id: str

@@ -248,7 +248,7 @@ async function sendMessage() {
     const res = await fetch(`${endpointUrl}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, session_id: sessionId }),
+      body: JSON.stringify(sessionId ? { message, session_id: sessionId } : { message }),
     });
 
     removeTyping(typingId);
