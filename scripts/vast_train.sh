@@ -109,9 +109,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 git clone https://github.com/mattyv/mimir-protocol.git
 cd mimir-protocol
-uv sync
-# Reinstall torch with CUDA 12.4 wheels (uv pulls CPU-only by default)
-uv pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+# Use system Python (Docker image already has CUDA torch)
+# Install only non-torch deps
+pip install transformers>=5.5.0 accelerate>=1.0.1 sentencepiece
 echo "Setup complete"
 SETUP
 
@@ -119,9 +119,8 @@ SETUP
 echo ""
 echo "→ Launching training (tmux session: mimir)..."
 $SSH bash << TRAIN
-export PATH="\$HOME/.local/bin:\$PATH"
 cd mimir-protocol
-tmux new-session -d -s mimir "PYTHONPATH=src uv run python -m marker.run_axiom_mlp_demo \
+tmux new-session -d -s mimir "PYTHONPATH=src python3 -m marker.run_axiom_mlp_demo \
   --model-name '$MODEL' \
   --n-steps $N_STEPS \
   --n-synthetic $N_SYNTHETIC \
