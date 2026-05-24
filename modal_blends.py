@@ -1716,7 +1716,6 @@ def chat_app_h100_spot() -> object:
     timeout=60 * 60,
     volumes={"/root/.cache/huggingface": hf_cache, "/axioms": axiom_vol},
     min_containers=0,
-    _allow_background_volume_commits=False,
 )
 @modal.asgi_app()
 def chat_app_a100_ondemand() -> object:
