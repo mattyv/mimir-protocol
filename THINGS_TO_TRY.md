@@ -343,3 +343,55 @@ demos but not for production deployment with a large registry.
 
 **Effort:** 1-2 days. The encoder training loop is the bulk of it — leverage
 the existing `compute_axiom_kv` and `_build_dynamic_cache` infrastructure.
+
+## AxiomBundle: batched MLP training across multiple axioms
+
+**The idea:** the KV cache is computed (not trained) so no batching needed there — it's
+free per axiom. The only trained component is the SmallMLP. Train one shared MLP across
+a domain of related axioms rather than separate MLPs per axiom.
+
+Each axiom's KV stays independent (computed once, merged at inference). The shared MLP
+learns routing across all axioms in the bundle using the residual stream, which already
+encodes the active term's identity by mid-layers.
+
+**Economics (10 axioms):**
+```
+Current:   10 × 8 min = 80 min training, 10 × 0.5MB = 5MB MLP storage
+Bundled:   ~20 min training,             1 × 2MB = 2MB MLP storage
+```
+Training time is the main win. Storage saving is marginal.
+
+**Key advantage over LoRA:** base model weights are never touched — no catastrophic
+forgetting. Adding axiom #1001 doesn't disturb axioms #1-1000. LoRA degrades past ~1000
+edits; Mimir bundles have no equivalent ceiling.
+
+**Natural grouping:** axioms in the same domain (microservices in a cluster, functions
+in an API) batch well — shared vocabulary makes MLP routing easier.
+
+## MLP capacity estimator: --calibrate-r
+
+**The problem:** a shared MLP for N axioms × K facts needs enough bottleneck capacity
+(r) to route correctly. Too small and routing gets fuzzy; too large and you overfit.
+
+**Theoretical estimate:**
+
+```
+r ≈ c × log₂(N × K)    where c ≈ 4-8
+
+1 axiom,   10 facts:  r ≈ 16   ✓ (matches empirical results)
+10 axioms, 10 facts:  r ≈ 40   → use r=32-64
+100 axioms, 10 facts: r ≈ 60   → use r=64
+```
+
+Scales logarithmically — large bundles need more r, but not proportionally more.
+
+**Complexity factor:** fact complexity affects required r beyond count alone. Simple
+key-value facts ("polls every 250ms") need less routing capacity than relational or
+procedural facts. Proxy metric: mean answer length or vocabulary divergence from the
+description.
+
+**Practical implementation:** add `--calibrate-r` flag that sweeps r=4, 8, 16, 32, 64
+at 100 steps each, measures heldout accuracy per axiom, returns the minimum r achieving
+>95% accuracy. Adds ~5 min before the full training run, avoids over-provisioning.
+
+**Effort:** ~2 hours. Sweep loop in train(), accuracy measurement, CLI flag.
