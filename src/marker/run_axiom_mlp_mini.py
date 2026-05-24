@@ -386,6 +386,10 @@ def main() -> None:
             compute_axiom_kv,
         )
 
+        # Patch fields the demo's AxiomSession expects but mini's dataclass lacks
+        axiom_mlp.dependencies = []
+        axiom_mlp.skill_mode = False
+        axiom_mlp.kv = None
         axiom_mlp.kv = compute_axiom_kv(model, tokenizer, DESCRIPTION, term=TERM)
         kv_mb = (
             sum(
