@@ -309,7 +309,16 @@ def main() -> None:
     parser.add_argument("--n-steps", type=int, default=300)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--max-new", type=int, default=80)
+    parser.add_argument(
+        "--hybrid", action="store_true", help="test KV+MLP hybrid pipeline (full demo code path)"
+    )
+    parser.add_argument("--instruct", action="store_true", help="use Qwen2.5-1.5B-Instruct")
     args = parser.parse_args()
+
+    if args.instruct and "Instruct" not in args.model_name:
+        args.model_name = args.model_name.replace(
+            "Qwen2.5-1.5B", "Qwen/Qwen2.5-1.5B-Instruct"
+        ).replace("Qwen/Qwen/", "Qwen/")
 
     device = (
         "mps"
@@ -368,6 +377,50 @@ def main() -> None:
     probe("TRAIN", TRAIN_QA[:3])
     probe("HELDOUT", HELDOUT_QA)
     probe("BOUNDARY", BOUNDARY_QA)
+
+    if args.hybrid:
+        print("\n─── HYBRID TEST (KV+MLP, AxiomSession) ────────────────────────")
+        # Import full pipeline and test the same code path as the Modal demo
+        from marker.run_axiom_mlp_demo import (
+            AxiomSession,
+            compute_axiom_kv,
+        )
+
+        axiom_mlp.kv = compute_axiom_kv(model, tokenizer, DESCRIPTION, term=TERM)
+        kv_mb = (
+            sum(
+                k.nbytes + v.nbytes
+                for k, v in zip(axiom_mlp.kv.keys, axiom_mlp.kv.values, strict=True)
+            )
+            / 1024**2
+        )
+        print(f"  KV: {axiom_mlp.kv.keys[0].shape[2]} tokens, {kv_mb:.1f} MB")
+
+        # Retrain with KV in cache
+        print(f"  retraining {args.n_steps} steps with KV...")
+        losses2 = train(
+            model,
+            tokenizer,
+            axiom_mlp,
+            TRAIN_QA,
+            boundary_pairs=BOUNDARY_TRAIN_QA,
+            n_steps=args.n_steps,
+            lr=args.lr,
+        )
+        print(f"  loss: {losses2[0]:.3f} → {losses2[-1]:.4f}")
+
+        session = AxiomSession(model, [axiom_mlp])
+        hybrid_probes = [
+            f"Q: {HELDOUT_QA[0][0]}\nA:",
+            f"Q: {BOUNDARY_QA[0][0]}\nA:",
+            "Q: What does it do?\nA:",  # no term — tests session persistence
+        ]
+        print("\n  session probes:")
+        for p in hybrid_probes:
+            ans = session.chat(model, tokenizer, p, max_new=args.max_new)
+            q = p.replace("Q: ", "").replace("\nA:", "")
+            print(f"    Q: {q}")
+            print(f"    A: {ans[:120]}")
 
 
 if __name__ == "__main__":
