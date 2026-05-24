@@ -25,6 +25,8 @@ image = (
         "accelerate>=1.0.1",
         "sentencepiece",  # gemma tokenizer
         "numpy<2",
+        "fastapi>=0.110.0",
+        "python-multipart",
     )
     .add_local_dir(str(PROJECT_ROOT / "src"), remote_path="/root/src")
     .add_local_dir(str(PROJECT_ROOT / "data"), remote_path="/root/data")
