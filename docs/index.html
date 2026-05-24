@@ -93,7 +93,8 @@
   </div>
 
 <script>
-let endpointUrl = localStorage.getItem('mimir_endpoint') || '';
+const DEFAULT_ENDPOINT = 'https://mattyv--mimir-blends-chat-app.modal.run';
+let endpointUrl = localStorage.getItem('mimir_endpoint') || DEFAULT_ENDPOINT;
 let sessionId = null;
 let isConnected = false;
 let loadedAxioms = [];
@@ -121,10 +122,17 @@ async function connect() {
 
   setStatus('connecting', 'connecting...');
   try {
-    const res = await fetch(`${endpointUrl}/axioms`, { signal: AbortSignal.timeout(10000) });
+    const res = await fetch(`${endpointUrl}/axioms`, { signal: AbortSignal.timeout(90000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     loadedAxioms = data.axioms;
+    if (!data.ready) {
+      setStatus('connecting', 'model loading (~60s)...');
+      appendSystem('Model is loading — this takes ~60s on first start. The page will stay connected.');
+      // Poll until ready
+      pollReady();
+      return;
+    }
     setStatus('connected', 'connected');
     document.getElementById('send-btn').disabled = false;
     showAxioms(loadedAxioms);
@@ -132,8 +140,29 @@ async function connect() {
     isConnected = true;
   } catch (e) {
     setStatus('error', 'failed to connect');
-    appendSystem(`Could not reach ${url}. Is your Modal endpoint running? (Note: first request may take ~60s for cold start)`);
+    appendSystem(`Could not reach ${url}. Check the URL and try again.`);
   }
+}
+
+async function pollReady() {
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+    try {
+      const res = await fetch(`${endpointUrl}/axioms`, { signal: AbortSignal.timeout(10000) });
+      const data = await res.json();
+      if (data.ready) {
+        loadedAxioms = data.axioms;
+        setStatus('connected', 'connected');
+        document.getElementById('send-btn').disabled = false;
+        showAxioms(loadedAxioms);
+        document.getElementById('setup-panel').classList.add('hidden');
+        isConnected = true;
+        appendSystem('Model ready — you can start chatting!');
+        return;
+      }
+    } catch (_) {}
+  }
+  setStatus('error', 'timed out waiting for model');
 }
 
 function setStatus(state, text) {
