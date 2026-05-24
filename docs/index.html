@@ -40,14 +40,45 @@
   <div id="setup-panel" class="hidden border-b border-gray-800 bg-gray-900 px-4 py-4">
     <div class="max-w-2xl mx-auto space-y-3">
       <div>
-        <label class="text-xs text-gray-400 block mb-1">Modal endpoint URL</label>
-        <div class="flex gap-2">
-          <input id="endpoint-input" type="text" placeholder="https://your-workspace--mimir-chat.modal.run"
-            class="flex-1 bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-indigo-500">
-          <button onclick="connect()" class="bg-indigo-600 hover:bg-indigo-500 text-white text-sm px-4 py-2 rounded font-medium">Connect</button>
+        <label class="text-xs text-gray-400 block mb-2">Select endpoint</label>
+        <div class="space-y-2 mb-3">
+          <label class="flex items-start gap-3 cursor-pointer group">
+            <input type="radio" name="gpu" value="https://mattyv--mimir-blends-chat-app-a100-spot.modal.run" class="mt-0.5 accent-indigo-500" onchange="selectEndpoint(this.value)">
+            <div>
+              <div class="text-sm text-gray-200 group-hover:text-white">A100 spot <span class="text-xs text-green-500 ml-1">cheapest</span></div>
+              <div class="text-xs text-gray-500">May wait for GPU availability</div>
+            </div>
+          </label>
+          <label class="flex items-start gap-3 cursor-pointer group">
+            <input type="radio" name="gpu" value="https://mattyv--mimir-blends-chat-app-h100-spot.modal.run" class="mt-0.5 accent-indigo-500" onchange="selectEndpoint(this.value)">
+            <div>
+              <div class="text-sm text-gray-200 group-hover:text-white">H100 spot <span class="text-xs text-blue-400 ml-1">faster inference</span></div>
+              <div class="text-xs text-gray-500">May wait for GPU availability</div>
+            </div>
+          </label>
+          <label class="flex items-start gap-3 cursor-pointer group">
+            <input type="radio" name="gpu" value="https://mattyv--mimir-blends-chat-app-a100-ondemand.modal.run" class="mt-0.5 accent-indigo-500" onchange="selectEndpoint(this.value)">
+            <div>
+              <div class="text-sm text-gray-200 group-hover:text-white">A100 on-demand <span class="text-xs text-yellow-500 ml-1">always available</span></div>
+              <div class="text-xs text-gray-500">~3× cost, no wait</div>
+            </div>
+          </label>
+          <label class="flex items-start gap-3 cursor-pointer group">
+            <input type="radio" name="gpu" value="custom" class="mt-0.5 accent-indigo-500" onchange="selectEndpoint('custom')">
+            <div class="flex-1">
+              <div class="text-sm text-gray-200 group-hover:text-white mb-1">Custom URL</div>
+              <input id="endpoint-input" type="text" placeholder="https://your-workspace--mimir-chat.modal.run"
+                class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-sm text-gray-100 placeholder-gray-600 focus:outline-none focus:border-indigo-500"
+                oninput="selectEndpoint('custom')">
+            </div>
+          </label>
         </div>
-        <p class="text-xs text-gray-600 mt-1">
-          Deploy your own: <code class="text-gray-500">modal deploy modal_blends.py::chat_app</code>
+        <div class="flex gap-2">
+          <button onclick="connect()" class="bg-indigo-600 hover:bg-indigo-500 text-white text-sm px-4 py-2 rounded font-medium">Connect</button>
+          <span class="text-xs text-gray-600 self-center">First connect takes ~60s (cold start)</span>
+        </div>
+        <p class="text-xs text-gray-600 mt-2">
+          Deploy your own: <code class="text-gray-500">modal deploy modal_blends.py</code>
         </p>
       </div>
       <div id="axiom-list" class="hidden">
@@ -114,6 +145,15 @@ function showSetup() {
   document.getElementById('setup-panel').classList.toggle('hidden');
 }
 
+function selectEndpoint(value) {
+  if (value !== 'custom') {
+    endpointUrl = value;
+    document.getElementById('endpoint-input').value = '';
+  } else {
+    endpointUrl = document.getElementById('endpoint-input').value.trim().replace(/\/$/, '');
+  }
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -126,10 +166,11 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
 }
 
 async function connect() {
-  const url = document.getElementById('endpoint-input').value.trim().replace(/\/$/, '');
-  if (!url) return;
-  endpointUrl = url;
-  localStorage.setItem('mimir_endpoint', url);
+  // Pick up custom input if custom radio selected
+  const customVal = document.getElementById('endpoint-input').value.trim().replace(/\/$/, '');
+  if (customVal) endpointUrl = customVal;
+  if (!endpointUrl) { appendSystem('Select an endpoint option above first.'); return; }
+  localStorage.setItem('mimir_endpoint', endpointUrl);
   document.getElementById('setup-panel').classList.add('hidden');
 
   setStatus('connecting', 'starting up (~60s on cold start)...');

@@ -1678,17 +1678,7 @@ def save_axioms(model: str = "Qwen/Qwen2.5-32B") -> None:
 # ── Chat server ───────────────────────────────────────────────────────────────
 
 
-@app.function(
-    gpu="A100-80GB",
-    timeout=60 * 60,
-    volumes={
-        "/root/.cache/huggingface": hf_cache,
-        "/axioms": axiom_vol,
-    },
-    min_containers=0,
-)
-@modal.asgi_app()
-def chat_app() -> object:
+def _chat_app_factory() -> object:
     import os
     import sys
 
@@ -1699,9 +1689,48 @@ def chat_app() -> object:
     return create_app(model_name="Qwen/Qwen2.5-32B", axiom_dir="/axioms")
 
 
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache, "/axioms": axiom_vol},
+    min_containers=0,
+)
+@modal.asgi_app()
+def chat_app_a100_spot() -> object:
+    return _chat_app_factory()
+
+
+@app.function(
+    gpu="H100",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache, "/axioms": axiom_vol},
+    min_containers=0,
+)
+@modal.asgi_app()
+def chat_app_h100_spot() -> object:
+    return _chat_app_factory()
+
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=60 * 60,
+    volumes={"/root/.cache/huggingface": hf_cache, "/axioms": axiom_vol},
+    min_containers=0,
+    _allow_background_volume_commits=False,
+)
+@modal.asgi_app()
+def chat_app_a100_ondemand() -> object:
+    return _chat_app_factory()
+
+
+# Keep the old name as an alias for backwards compat
+chat_app = chat_app_a100_spot
+
+
 @app.local_entrypoint()
 def deploy_chat() -> None:
-    """Deploy the Mimir chat server. Run once; the endpoint stays live."""
-    print("Deploying chat server...")
-    print("Once deployed, get the URL from: modal app list")
-    print("Then update docs/index.html with your endpoint URL.")
+    """Deploy all Mimir chat server variants."""
+    print("Deployed endpoints:")
+    print("  A100 spot:      https://mattyv--mimir-blends-chat-app-a100-spot.modal.run")
+    print("  H100 spot:      https://mattyv--mimir-blends-chat-app-h100-spot.modal.run")
+    print("  A100 on-demand: https://mattyv--mimir-blends-chat-app-a100-ondemand.modal.run")
