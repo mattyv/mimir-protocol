@@ -110,6 +110,8 @@ export PATH="$HOME/.local/bin:$PATH"
 git clone https://github.com/mattyv/mimir-protocol.git
 cd mimir-protocol
 uv sync
+# Reinstall torch with CUDA 12.4 wheels (uv pulls CPU-only by default)
+uv pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 echo "Setup complete"
 SETUP
 
