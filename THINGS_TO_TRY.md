@@ -395,3 +395,82 @@ at 100 steps each, measures heldout accuracy per axiom, returns the minimum r ac
 >95% accuracy. Adds ~5 min before the full training run, avoids over-provisioning.
 
 **Effort:** ~2 hours. Sweep loop in train(), accuracy measurement, CLI flag.
+
+## Deliberate ignorance as a product architecture
+
+**The core idea:** train base models with intentional domain holes, then fill those
+holes with Mimir axioms. Not missing knowledge — *designed* absence. Angles:
+
+**Liability restructuring** — if the base model is deliberately ignorant of medicine/
+law/finance, the model provider bears no liability for domain outputs. A licensed
+physician who registers medical axioms becomes the "author" of that knowledge. The
+model is infrastructure; the registrant is responsible. This maps cleanly onto
+regulated industries where AI liability is actively contested.
+
+**Adversarial robustness** — prompt injection attacks work by overriding training
+priors. A base model with no training signal for domain X has no prior to exploit.
+"BalancePublisher actually does Y" injected in-context can't override an axiom because
+the model has no independent signal to believe the injection over the KV.
+
+**GDPR / right-to-be-forgotten** — deleting an axiom is a true deletion. The base
+model genuinely doesn't know it. Currently impossible for standard LLMs; architecturally
+guaranteed with deliberate-ignorance Mimir.
+
+**Knowledge provenance** — every fact is traceable to its axiom ID, registrant,
+timestamp, and description. Complete audit trail. Currently impossible for LLMs.
+
+**Federated enterprise knowledge** — departments register their own axioms without
+sharing raw data. Finance, HR, Engineering each own their axiom pack. No cross-team
+data aggregation required. The model never sees the raw data — only trained MLP + KV.
+
+**Knowledge marketplace** — axiom packs (~1.5MB) are portable and standardized.
+Domain experts monetize knowledge by selling verified axiom packs. Medical axiom packs
+authored by licensed physicians. Legal jurisdiction packs from law firms. Base model
+and knowledge market are decoupled — like OS vs App Store.
+
+**Regulatory certification path** — certifying a 32B model trained on the internet is
+impossible. Certifying a bounded axiom (specific drug, specific regulation) is feasible.
+EU AI Act / FDA medical AI path could exist for axiom packs in a way it cannot for
+monolithic LLMs.
+
+**Temporal knowledge segmentation** — exclude all time-sensitive knowledge from base
+training. Base model = durable reasoning. Axioms = time-sensitive facts, refreshed
+cheaply. Solves stale knowledge architecturally.
+
+**The risk:** if the base model is too ignorant, it lacks surrounding domain context to
+reason well about injected facts. Right granularity: exclude *specific proprietary facts*
+but keep *domain background understanding*.
+
+## Fuzzy axiom routing via vector similarity
+
+**The idea:** instead of requiring the exact axiom term in the prompt (brittle, case-
+sensitive), compute the embedding of the incoming query and compare it against axiom
+description embeddings. If similarity > threshold, activate that axiom's KV + MLP.
+
+```
+Query: "what's the polling frequency?" (no term)
+  → embed query
+  → cosine sim against axiom description embeddings
+  → BalancePublisher description sim = 0.87 > threshold
+  → inject BalancePublisher axiom
+```
+
+**Why this matters:** overcomes the surrounding-domain-knowledge problem. The user
+doesn't need to know the exact axiom term. A question about "polling frequency" in
+a session about microservices would correctly route to BalancePublisher without the
+user having to type the exact registered term.
+
+**Also fixes:** case sensitivity, synonyms ("BalPub", "the publisher service"), and
+cross-lingual queries.
+
+**Implementation:** embed each axiom description at registration time (cheap, one-off).
+At inference, embed the query, compute similarities, activate axioms above threshold.
+A small embedding model (e.g. `text-embedding-3-small`, ~$0.0001/query) handles
+the routing layer.
+
+**Hybrid approach:** exact term match (current) fires first — zero latency. Fuzzy
+match runs in parallel as a fallback. If exact match fires, skip fuzzy. If not, use
+fuzzy results.
+
+**Effort:** ~2 hours. Embed descriptions at save_axiom() time, store alongside .pt.
+Add a router class that embeds the query and returns active axioms.
