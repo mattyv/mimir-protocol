@@ -1686,9 +1686,10 @@ def _chat_app_factory() -> object:
 
     sys.path.insert(0, "/root/src")
     os.chdir("/root")
-    from marker.chat_server import create_app
+    from marker.chat_server import create_app, preload
 
-    return create_app(model_name="Qwen/Qwen2.5-32B", axiom_dir="/axioms")
+    preload(model_name="Qwen/Qwen2.5-32B", axiom_dir="/axioms")
+    return create_app()
 
 
 @app.function(
