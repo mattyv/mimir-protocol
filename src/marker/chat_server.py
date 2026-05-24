@@ -29,11 +29,15 @@ def _load_model_and_axioms(model_name: str, axiom_dir: str) -> None:
     from marker.axiom_store import load_axiom
 
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Loading model {model_name}...")
         _tokenizer = AutoTokenizer.from_pretrained(model_name)
         _model = (
-            AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16).to(device).eval()
+            AutoModelForCausalLM.from_pretrained(
+                model_name,
+                dtype=torch.bfloat16,
+                device_map="cuda",
+                low_cpu_mem_usage=True,
+            ).eval()
         )
         for p in _model.parameters():
             p.requires_grad_(False)
