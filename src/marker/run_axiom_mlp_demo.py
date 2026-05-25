@@ -1064,6 +1064,10 @@ def main() -> None:
         )
         print(f"  compressor trained in {time.time() - t_comp_train:.1f}s")
 
+        compressed_dir = save_dir / "compressed" if save_dir is not None else None
+        if compressed_dir is not None:
+            compressed_dir.mkdir(parents=True, exist_ok=True)
+
         # Apply compression — replaces full KV with compressed version in each axiom
         for m in trained_mlps:
             t_apply = time.time()
@@ -1077,6 +1081,10 @@ def main() -> None:
             print(
                 f"  {m.term}: compress applied in {time.time() - t_apply:.2f}s → {comp_mb:.1f} MB ({m.kv.keys[0].shape[2] if m.kv else 0} tokens)"
             )
+            if compressed_dir is not None:
+                out_path = compressed_dir / f"{_slug(m.term)}.pt"
+                save_axiom(m, out_path)
+                print(f"    saved compressed → {out_path}")
 
         print("\n--- compressed KV probes (spot check) ---")
         for axiom in TEST_AXIOMS:
