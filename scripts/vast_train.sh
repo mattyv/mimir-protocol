@@ -13,7 +13,9 @@ set -euo pipefail
 MODEL="${MODEL:-Qwen/Qwen2.5-32B-Instruct}"
 N_STEPS="${N_STEPS:-3000}"
 N_SYNTHETIC="${N_SYNTHETIC:-30}"
-DISK_GB=120
+DISK_GB="${DISK_GB:-120}"
+GPU_RAM="${GPU_RAM:-79}"
+GPU_QUERY="${GPU_QUERY:-gpu_name=A100_PCIE}"
 REPO="https://github.com/mattyv/mimir-protocol.git"
 IMAGE="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
 
@@ -23,6 +25,9 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="$2"; shift 2 ;;
     --n-steps) N_STEPS="$2"; shift 2 ;;
     --n-synthetic) N_SYNTHETIC="$2"; shift 2 ;;
+    --gpu-query) GPU_QUERY="$2"; shift 2 ;;
+    --gpu-ram) GPU_RAM="$2"; shift 2 ;;
+    --disk) DISK_GB="$2"; shift 2 ;;
     *) echo "Unknown flag: $1"; exit 1 ;;
   esac
 done
@@ -36,9 +41,9 @@ echo "════════════════════════�
 
 # ── Find best A100-80GB instance ───────────────────────────────────────────
 echo ""
-echo "→ Searching for A100-80GB..."
+echo "→ Searching for GPU ($GPU_QUERY, >=${GPU_RAM}GB)..."
 OFFER_ID=$(vastai search offers \
-  'gpu_name=A100_PCIE num_gpus=1 gpu_ram>=79 cuda_vers>=12.0 disk_space>=100 reliability>=0.95' \
+  "$GPU_QUERY num_gpus=1 gpu_ram>=$GPU_RAM cuda_vers>=12.0 disk_space>=$DISK_GB reliability>=0.95" \
   --order dph_total --limit 1 --raw 2>/dev/null | \
   python3 -c "import sys,json; offers=json.load(sys.stdin); print(offers[0]['id']) if offers else exit(1)")
 
@@ -48,7 +53,7 @@ if [[ -z "$OFFER_ID" ]]; then
 fi
 
 PRICE=$(vastai search offers \
-  'gpu_name=A100_PCIE num_gpus=1 gpu_ram>=79 cuda_vers>=12.0 disk_space>=100 reliability>=0.95' \
+  "$GPU_QUERY num_gpus=1 gpu_ram>=$GPU_RAM cuda_vers>=12.0 disk_space>=$DISK_GB reliability>=0.95" \
   --order dph_total --limit 1 --raw 2>/dev/null | \
   python3 -c "import sys,json; offers=json.load(sys.stdin); print(f\"\${offers[0]['dph_total']:.2f}/hr\")")
 
@@ -124,6 +129,7 @@ tmux new-session -d -s mimir "PYTHONPATH=src python3 -m marker.run_axiom_mlp_dem
   --model-name '$MODEL' \
   --n-steps $N_STEPS \
   --n-synthetic $N_SYNTHETIC \
+  --save-dir /root/mimir-protocol/axioms_out \
   2>&1 | tee /tmp/training.log; echo DONE >> /tmp/training.log"
 echo "Training running in tmux. Attach with: ssh -p $SSH_PORT root@$SSH_HOST -t tmux attach -t mimir"
 TRAIN
@@ -134,6 +140,7 @@ echo " Training launched!"
 echo ""
 echo " Monitor:  ssh -p $SSH_PORT root@$SSH_HOST -t tmux attach -t mimir"
 echo " Logs:     ssh -p $SSH_PORT root@$SSH_HOST tail -f /tmp/training.log"
+echo " Axioms:   scp -P $SSH_PORT -r root@$SSH_HOST:/root/mimir-protocol/axioms_out ./axioms_7b"
 echo " Instance: $INSTANCE_ID (remember to destroy when done)"
 echo ""
 echo " To destroy:  vastai destroy instance $INSTANCE_ID"

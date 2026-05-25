@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -839,6 +841,12 @@ def main() -> None:
         action="store_true",
         help="compare r=4/8/16/32 on BalancePublisher after main training",
     )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+        help="if set, save each trained axiom as a .pt file in this directory",
+    )
     args = parser.parse_args()
 
     device = (
@@ -849,6 +857,17 @@ def main() -> None:
         else "cpu"
     )
     print(f"device: {device}  model: {args.model_name}\n")
+
+    save_dir = None
+    if args.save_dir:
+        from marker.axiom_store import save_axiom  # noqa: PLC0415
+
+        save_dir = Path(args.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        print(f"saving axioms to: {save_dir}\n")
+
+    def _slug(term: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_-]+", "_", term).strip("_") or "axiom"
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = (
@@ -992,6 +1011,11 @@ def main() -> None:
         print(f"\n  ── {name} total: {time.time() - t_axiom_start:.1f}s ──")
         trained_mlps.append(axiom_mlp)
         trained_prefixes.append(prefix)
+
+        if save_dir is not None:
+            out_path = save_dir / f"{_slug(name)}.pt"
+            save_axiom(axiom_mlp, out_path)
+            print(f"  saved → {out_path}")
 
     # ── Optional KV compression ───────────────────────────────────────────────
     if args.compress_kv:
@@ -1280,6 +1304,11 @@ def main() -> None:
     s_losses = train(model, tokenizer, skill_mlp, SKILL_AXIOM["qa"], n_steps=args.skill_n_steps)
     print(f"loss: {s_losses[0]:.3f} → {s_losses[-1]:.4f}")
 
+    if save_dir is not None:
+        out_path = save_dir / f"{_slug(s_name)}.pt"
+        save_axiom(skill_mlp, out_path)
+        print(f"  saved → {out_path}")
+
     print("\n--- skill probes ---")
     for prompt in SKILL_PROBES:
         q = prompt.replace("Q: ", "").replace("\nA:", "")
@@ -1307,6 +1336,11 @@ def main() -> None:
     )
     ilp_losses = train(model, tokenizer, ilp_mlp, SKILL_AXIOM_ILP["qa"], n_steps=args.skill_n_steps)
     print(f"loss: {ilp_losses[0]:.3f} → {ilp_losses[-1]:.4f}")
+
+    if save_dir is not None:
+        out_path = save_dir / f"{_slug(ilp_name)}.pt"
+        save_axiom(ilp_mlp, out_path)
+        print(f"  saved → {out_path}")
 
     print("\n--- ilp_for probes ---")
     for prompt in ILP_PROBES:
