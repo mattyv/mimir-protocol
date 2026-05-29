@@ -474,3 +474,46 @@ fuzzy results.
 
 **Effort:** ~2 hours. Embed descriptions at save_axiom() time, store alongside .pt.
 Add a router class that embeds the query and returns active axioms.
+
+## Make axiom terms behave like real vocab tokens (anchor + hypernetwork)
+
+The mental model: tokens like "France" don't *carry* knowledge — they're addresses
+into the MLP weights of every layer, which act as associative memories
+(Geva et al. 2021). The data lives in the FFNs, not the embedding. Our current
+MLP+KV is structurally the same mechanism, just bolted on at inference time per
+axiom — but the term itself is still multi-BPE and lacks a clean identity.
+
+**Three escalating levels:**
+
+**Level 1 — Anchor token (small change, keeps MLP+KV).** Add a new vocab token
+e.g. `<BalancePublisher>`, learn its layer-0 embedding so it behaves as a stable
+identity. Preprocess user input to substitute mentions into the new token. The
+MLP+KV remains the knowledge store; the token gives one unambiguous position to
+fire at, fixing the multi-BPE routing problem. No capacity loss. ~1 week of work.
+
+**Level 2 — Hypernetwork (the real version of "one vector per axiom").** The
+fundamental issue: one d_model vector (~7KB for Qwen 7B) has ~700× less capacity
+than the current MLP+KV (~5MB). To make ONE vector carry it all:
+- Train a shared decoder `f: vector → (MLP weights, KV cache)`
+- Train across many axioms; `f(v_term)` reconstructs the per-axiom MLP+KV that
+  minimizes the loss on Q+A pairs
+- At inference: store only `v_term`, materialize MLP+KV on the fly via `f`
+Axioms become tiny (KBs not MBs) and compose naturally. ~1 month of work, with
+real risk it underperforms direct training.
+
+**Level 3 — Pure learned embedding (won't work well).** Just a learnable
+embedding, no hypernetwork or MLPs. This is `run_soft_prompt_plus_v*` — already
+tried, MLP+KV beat it on quality. Capacity gap is real.
+
+**Why this matters:** Level 1 gives the UX win (clean "this is a real word"
+behaviour, easier routing, can be inserted into any prompt). Level 2 gives the
+storage win (tiny axioms, hypernetwork generalizes to new terms from
+description alone — potentially zero-shot axioms from text). Level 3 is a
+documented dead end worth noting so we don't reinvent it.
+
+**Recommended order:** Level 1 first (low risk, clear UX gain). Level 2 only if
+we have research time to spend on it.
+
+**Connection to existing work:** This complements the "deliberate ignorance"
+product framing — the axioms ARE the equivalent of pretrained knowledge for that
+term, just externalized. Making them feel like real tokens closes the last UX gap.

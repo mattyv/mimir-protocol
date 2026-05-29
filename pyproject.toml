@@ -44,5 +44,8 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not slow'"
 pythonpath = ["src"]
+markers = [
+    "slow: tests that take more than a few seconds (CPU training smoke runs); run explicitly with '-m slow'",
+]
