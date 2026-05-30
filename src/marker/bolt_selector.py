@@ -48,14 +48,14 @@ class BoltSelector:
     """Per-layer adapter bank, gated on seed-token presence in the current
     forward pass.
 
-    ``adapters[i]`` runs at every position on the output of
-    ``model.model.layers[i]`` when ``_fire_this_pass`` is set (which the
-    embedding pre-hook sets to True whenever the seed token id appears in
-    the input ids being looked up).
+    ``adapters[i]`` fires at ``fire_layers[i]``. Defaults to all layers but
+    can be restricted to a subset (e.g. a single mid-stack layer for facts,
+    mirroring ROME-style single-site writes).
     """
 
     seed: SeedToken
     adapters: nn.ModuleList
+    fire_layers: list
     r: int
     skill_mode: bool = False
     _fire_this_pass: bool = False
@@ -66,20 +66,23 @@ def make_bolt_selector(
     seed: SeedToken,
     r: int = 16,
     skill_mode: bool = False,
+    layers: list | None = None,
 ) -> BoltSelector:
-    """Allocate one adapter per transformer block, sized to ``model``'s
-    hidden_size, with zero-initialized up projections.
+    """Allocate one adapter per entry in ``layers`` (defaults to all blocks).
 
-    ``skill_mode=True`` makes the bolt-on keep firing across single-token
-    decode steps once the seed has been seen in a prefill pass — needed so a
-    procedural skill keeps steering generation, not just at the term position.
+    Pass ``layers=[14]`` to restrict to a single mid-stack layer (ROME-style),
+    or ``layers=[12, 13, 14]`` for a narrow band. Facts benefit from a small
+    targeted set; skills can stay all-layers.
     """
     n_layers = model.config.num_hidden_layers
+    fire_layers = list(layers) if layers is not None else list(range(n_layers))
     hidden = model.config.hidden_size
     device = next(model.parameters()).device
-    adapters = nn.ModuleList([_Adapter(hidden, r) for _ in range(n_layers)])
+    adapters = nn.ModuleList([_Adapter(hidden, r) for _ in fire_layers])
     adapters = adapters.to(device=device, dtype=torch.float32)
-    return BoltSelector(seed=seed, adapters=adapters, r=r, skill_mode=skill_mode)
+    return BoltSelector(
+        seed=seed, adapters=adapters, fire_layers=fire_layers, r=r, skill_mode=skill_mode
+    )
 
 
 def _make_embedding_pre_hook(bolt: BoltSelector):
@@ -138,8 +141,10 @@ def install_bolt_hooks(model, bolt: BoltSelector) -> list:  # noqa: ANN001
     handles: list = []
     embed = model.get_input_embeddings()
     handles.append(embed.register_forward_pre_hook(_make_embedding_pre_hook(bolt)))
-    for i in range(len(bolt.adapters)):
-        handles.append(model.model.layers[i].register_forward_hook(_make_layer_hook(bolt, i)))
+    for adapter_idx, layer_idx in enumerate(bolt.fire_layers):
+        handles.append(
+            model.model.layers[layer_idx].register_forward_hook(_make_layer_hook(bolt, adapter_idx))
+        )
     return handles
 
 
