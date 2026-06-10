@@ -50,6 +50,15 @@ Same model, byte-for-byte unchanged weights. No description text in the prompt.
 
 ## Current results (v10, Qwen 2.5-32B, 2026-05)
 
+> **⚠ Results below are invalid pending re-run.** The v10 training set
+> (`SUPPLEMENTAL_QA`) contained five HELDOUT questions verbatim — they were
+> added as gap-fills after analysing run results, which means the HELDOUT
+> scores measured memorization, not generalization. The training set has been
+> decontaminated (enforced by `tests/test_heldout_leakage.py`) and the demo
+> now also prints a `[K kv-only]` ablation (description KV with the MLP hooks
+> disabled) to isolate what the trained MLP actually contributes. Numbers
+> will be updated after the next full run.
+
 **32/32** across TRAIN / HELDOUT / BOUNDARY / TELL_ME for both BalancePublisher
 and FluxomService test axioms:
 
@@ -112,11 +121,18 @@ V across the sequence, passes through a shared MLP with layer embedding, and
 produces N compressed K/V tokens per layer — reducing per-axiom KV from 12-15 MB
 to ~1 MB at N=4 with no accuracy loss. Enable with `--compress-kv`.
 
-Full description is prefixed with `"About {term}:\n"` before encoding. The description is
-prefixed with `"About {term}:\n"` before encoding, so merged multi-axiom KVs
-have clear label boundaries. At every forward pass the KV is appended to
-`past_key_values`, making the description tokens directly attendable during
-decode. This fixes the passive-retrieval problem that caused CoT degradation.
+The description is prefixed with `"About {term}:\n"` before encoding, so
+merged multi-axiom KVs have clear label boundaries. At every forward pass the
+KV is appended to `past_key_values`, making the description tokens directly
+attendable during decode. This fixes the passive-retrieval problem that caused
+CoT degradation.
+
+Honest framing: injecting the description's frozen KV is attention-equivalent
+to having the description text at the start of the prompt — it occupies the
+same sequence positions and is attended to the same way. The win over plain
+RAG is that the prefill is computed once at registration (and compressible
+11-15x), not re-encoded per query, plus the trained MLP for routing/boundary
+behaviour. It is not "knowledge without context cost".
 
 ```
 Prompt:  "Q: How often does BalancePublisher poll?\nA:"
@@ -289,14 +305,14 @@ r=64 recommended for skills (procedural generation needs more capacity).
 
 | | RAG | Fine-tuning | **Mimir-Protocol** |
 |---|---|---|---|
-| Adds description to user prompt? | **yes** | no | no |
+| Adds description tokens to context? | yes (re-encoded per query) | no | yes (KV cached once, compressible 11-15x) |
 | Changes model weights? | no | **yes** | no |
 | Per-concept registration cost | free (store text) | hours of GPU | **~8 min** |
 | Works for post-cutoff knowledge? | yes | yes | yes |
-| Scales to many concepts? | context-window bound | retrain time bound | **yes** |
-| Boundary discipline (decline out-of-scope)? | depends on prompt | yes | **yes** |
-| Multi-turn without re-injecting? | no | no | **yes** |
-| Composite/hierarchical concepts? | no | no | **yes** |
+| Scales to many concepts? | context-window bound | retrain time bound | context-window bound (only mentioned axioms injected) |
+| Boundary discipline (decline out-of-scope)? | depends on prompt | yes | **yes** (trained MLP) |
+| Multi-turn without re-injecting? | no | n/a | **yes** (KV persists in session) |
+| Composite/hierarchical concepts? | manual doc linking | no | **yes** (dependency graph) |
 
 The strategic shape: a frozen base model plus a cheap, hot-loadable layer of
 new concepts, no weight changes. New understanding is added in minutes, not

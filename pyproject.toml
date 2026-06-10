@@ -1,7 +1,7 @@
 [project]
 name = "mimir-axiom-poc"
 version = "0.0.1"
-description = "GPT-2 small POC for the Mimir-Axiom thesis: residual-stream injection of axiom key vectors."
+description = "Mimir-Protocol: hybrid per-axiom MLP + frozen-KV injection to give a frozen LLM new concepts without weight changes."
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.2",
