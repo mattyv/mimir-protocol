@@ -29,31 +29,31 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from marker.prefix_tuning import Prefix, generate_with_prefixes
+from marker.prefix_tuning import Prefix, _get_rope_theta, _rope_offset, generate_with_prefixes
 from marker.run_soft_prompt_plus_v4_demo import TEST_AXIOMS, _generic_boundary_examples
 from marker.soft_prompt_plus import generate_synthetic_qa_pairs
 
 TEMPLATE = "Q: {q}\nA:"
 
-# ── Gap-filling Q+A for known heldout misses ───────────────────────────────────
-# Added after analysing run results: each entry is a phrasing that the
-# synthetic generator didn't cover and the MLP was getting wrong.
+# ── Gap-filling Q+A for vocabulary/phrasing patterns ──────────────────────────
+# Extra phrasings the synthetic generator tends not to cover (cadence/rate/
+# endpoint-type/land-data vocabulary). RULE: no entry may match a heldout
+# question after normalization — heldout must stay genuinely held out.
+# Enforced by tests/test_heldout_leakage.py. (An earlier version of this dict
+# contained five heldout questions verbatim, which invalidated the v10
+# HELDOUT scores.)
 SUPPLEMENTAL_QA: dict[str, list[tuple[str, str]]] = {
     "BalancePublisher": [
         (
-            "How fast is BalancePublisher's poll cycle?",
-            "BalancePublisher's poll cycle is every 250 milliseconds.",
+            "How quick is BalancePublisher's polling loop?",
+            "BalancePublisher polls every 250 milliseconds.",
         ),
         (
             "What's the speed of BalancePublisher's polling?",
             "BalancePublisher polls every 250 milliseconds.",
         ),
         (
-            "What's BalancePublisher's polling cadence?",
-            "BalancePublisher's polling cadence is every 250 milliseconds.",
-        ),
-        (
-            "What is BalancePublisher's polling cadence?",
+            "At what cadence does BalancePublisher poll the exchange?",
             "BalancePublisher polls every 250 milliseconds.",
         ),
         (
@@ -61,7 +61,7 @@ SUPPLEMENTAL_QA: dict[str, list[tuple[str, str]]] = {
             "BalancePublisher polls every 250 milliseconds.",
         ),
         (
-            "What endpoint type does BalancePublisher hit?",
+            "Does BalancePublisher hit a REST or websocket endpoint?",
             "BalancePublisher hits a REST API endpoint.",
         ),
         ("What kind of API does BalancePublisher call?", "BalancePublisher calls a REST API."),
@@ -76,7 +76,7 @@ SUPPLEMENTAL_QA: dict[str, list[tuple[str, str]]] = {
     ],
     "FluxomService": [
         (
-            "Where does FluxomService land its data?",
+            "What's the landing destination for FluxomService's data?",
             "FluxomService lands its data in the Iceberg table warehouse.fluxom_ingested.",
         ),
         (
@@ -84,8 +84,8 @@ SUPPLEMENTAL_QA: dict[str, list[tuple[str, str]]] = {
             "FluxomService deposits output to the Iceberg table warehouse.fluxom_ingested.",
         ),
         (
-            "What table does FluxomService populate?",
-            "FluxomService populates the Iceberg table warehouse.fluxom_ingested.",
+            "Which Iceberg table does FluxomService write into?",
+            "FluxomService writes into the Iceberg table warehouse.fluxom_ingested.",
         ),
         (
             "Where does FluxomService store the transformed records?",
@@ -223,14 +223,32 @@ def compute_axiom_kv(model, tokenizer, description: str, term: str = "") -> Axio
     return AxiomKV(n_layers=len(keys), keys=keys, values=values)
 
 
-def merge_axiom_kvs(axiom_kvs: list[AxiomKV]) -> AxiomKV:
-    """Concatenate per-axiom KVs along the sequence dimension for multi-axiom inference."""
+def merge_axiom_kvs(axiom_kvs: list[AxiomKV], rope_theta: float, base_offset: int = 0) -> AxiomKV:
+    """Concatenate per-axiom KVs along the sequence dimension for multi-axiom inference.
+
+    Each KV was captured at positions 0..n-1, so its keys carry RoPE rotations
+    for those positions. When placed at cache slot `offset`, the keys must be
+    re-rotated by `offset` so their phases match the slot — otherwise multiple
+    KVs overlap at the same geometric positions and the model can't
+    disambiguate them (the multi-prefix concatenation failure documented in
+    CONCLUSIONS.md). `base_offset` covers mid-session injection where the
+    cache already holds `base_offset` tokens.
+    """
     n = axiom_kvs[0].n_layers
-    return AxiomKV(
-        n_layers=n,
-        keys=[torch.cat([kv.keys[i] for kv in axiom_kvs], dim=2) for i in range(n)],
-        values=[torch.cat([kv.values[i] for kv in axiom_kvs], dim=2) for i in range(n)],
-    )
+    keys: list[torch.Tensor] = []
+    values: list[torch.Tensor] = []
+    for layer in range(n):
+        layer_keys = []
+        offset = base_offset
+        for kv in axiom_kvs:
+            k = kv.keys[layer]
+            if offset > 0:
+                k = _rope_offset(k, offset, rope_theta, k.shape[-1])
+            layer_keys.append(k)
+            offset += kv.keys[layer].shape[2]
+        keys.append(torch.cat(layer_keys, dim=2))
+        values.append(torch.cat([kv.values[layer] for kv in axiom_kvs], dim=2))
+    return AxiomKV(n_layers=n, keys=keys, values=values)
 
 
 def _build_dynamic_cache(axiom_kv: AxiomKV, device: torch.device):  # noqa: ANN201
@@ -339,6 +357,11 @@ def train(
 
     if skipped:
         print(f"  WARNING: skipped {skipped} steps (term not found in prompt)")
+    if not losses:
+        raise RuntimeError(
+            f"all {n_steps} training steps skipped — term {axiom_mlp.term!r} "
+            "never found in any training prompt"
+        )
     return losses
 
 
@@ -352,7 +375,13 @@ def generate_with_mlp(
     prompt: str,
     axiom_mlp: AxiomMLP | None = None,
     max_new: int = 120,
+    use_hooks: bool = True,
 ) -> str:
+    """Greedy decode with an axiom's MLP hooks + description KV.
+
+    `use_hooks=False` keeps the KV injection but skips the MLP hooks — the
+    KV-only ablation that isolates what the trained MLP actually contributes.
+    """
     device = next(model.parameters()).device
     ids = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
@@ -361,7 +390,7 @@ def generate_with_mlp(
     if axiom_mlp is not None:
         positions = _find_term_positions(ids, axiom_mlp.term_token_ids)
         term_found = bool(positions)
-        if positions:
+        if positions and use_hooks:
             handles = install_hooks(model, axiom_mlp, positions)
 
     # For skill axioms, only inject KV when the term is present — skill is explicitly triggered.
@@ -380,7 +409,9 @@ def generate_with_mlp(
             h.remove()
 
     skill_axiom = (
-        axiom_mlp if (axiom_mlp is not None and axiom_mlp.skill_mode and term_found) else None
+        axiom_mlp
+        if (axiom_mlp is not None and axiom_mlp.skill_mode and term_found and use_hooks)
+        else None
     )
     out_ids = [next_tok]
     for _ in range(max_new - 1):
@@ -421,7 +452,9 @@ def generate_with_mlps(
         a.kv for a in axiom_mlps if a.kv is not None and _find_term_positions(ids, a.term_token_ids)
     ]
     merged_kv = (
-        _build_dynamic_cache(merge_axiom_kvs(available_kvs), device) if available_kvs else None
+        _build_dynamic_cache(merge_axiom_kvs(available_kvs, _get_rope_theta(model)), device)
+        if available_kvs
+        else None
     )
 
     handles = []
@@ -497,13 +530,28 @@ class AxiomSession:
             result |= self._resolve_dependencies(dep)
         return result
 
+    def _session_length(self) -> int:
+        if self.past is None:
+            return 0
+        if hasattr(self.past, "get_seq_length"):
+            return int(self.past.get_seq_length())
+        return int(self.past[0][0].shape[2])
+
     def _inject_kvs(self, terms: set[str]) -> None:
-        """Append description KVs for the given terms to the session tail."""
+        """Append description KVs for the given terms to the session tail.
+
+        Injected keys are RoPE-rotated by the current session length so they
+        occupy their actual cache-slot positions instead of overlapping the
+        existing conversation at positions 0..n-1.
+        """
         device = next(self._model_ref.parameters()).device
         new_kvs = [a.kv for a in self.axiom_mlps if a.term in terms and a.kv is not None]
         if not new_kvs:
             return
-        new_cache = _build_dynamic_cache(merge_axiom_kvs(new_kvs), device)
+        merged = merge_axiom_kvs(
+            new_kvs, _get_rope_theta(self._model_ref), base_offset=self._session_length()
+        )
+        new_cache = _build_dynamic_cache(merged, device)
         self.past = new_cache if self.past is None else _concat_kv_caches(self.past, new_cache)
         self.injected.update(terms)
 
@@ -995,10 +1043,14 @@ def main() -> None:
                 prompt = f"Q: {q}\nLet's think step by step.\nA:" if cot else TEMPLATE.format(q=q)
                 out_a = generate_with_mlp(model, tokenizer, prompt, max_new=args.max_new)
                 out_p = generate_with_prefixes(model, tokenizer, prompt, [_prefix], args.max_new)
+                out_k = generate_with_mlp(
+                    model, tokenizer, prompt, _mlp, max_new=args.max_new, use_hooks=False
+                )
                 out_m = generate_with_mlp(model, tokenizer, prompt, _mlp, max_new=args.max_new)
                 print(f"  Q: {q}")
                 print(f"    [A no-axiom]:  {out_a[:200].replace(chr(10), ' ')}")
                 print(f"    [P prefix]:    {out_p[:200].replace(chr(10), ' ')}")
+                print(f"    [K kv-only]:   {out_k[:200].replace(chr(10), ' ')}")
                 print(f"    [M mlp+kv]:    {out_m[:200].replace(chr(10), ' ')}")
 
         train_qs = [q for f in axiom["facts"] for q in f["questions_train"][:1]]
