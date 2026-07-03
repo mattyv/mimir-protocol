@@ -117,19 +117,24 @@ def init_subsample(real_kv: AxiomKV, n_tokens: int, term: str, seed: int = 0) ->
 # ── Cache building ──────────────────────────────────────────────────────────────
 
 
-def build_prefix_cache(prefix: AxiomPrefix, dtype: torch.dtype):  # noqa: ANN201
+def build_prefix_cache(prefix: AxiomPrefix, dtype: torch.dtype, batch: int = 1):  # noqa: ANN201
     """Fresh DynamicCache from the prefix's params, cast to model dtype.
 
     Cast, not detach — during training this must stay attached to the graph
-    so gradients flow from the loss back into the fp32 params.
+    so gradients flow from the loss back into the fp32 params. With batch > 1
+    the single stored prefix is expanded (a view — gradients sum across the
+    batch dim, which is exactly the batched-SGD semantics we want).
     """
     from transformers import DynamicCache  # noqa: PLC0415
 
     cache = DynamicCache()
     for layer_idx in range(prefix.n_layers):
-        cache.update(
-            prefix.keys[layer_idx].to(dtype), prefix.values[layer_idx].to(dtype), layer_idx
-        )
+        k = prefix.keys[layer_idx].to(dtype)
+        v = prefix.values[layer_idx].to(dtype)
+        if batch > 1:
+            k = k.expand(batch, -1, -1, -1)
+            v = v.expand(batch, -1, -1, -1)
+        cache.update(k, v, layer_idx)
     return cache
 
 
@@ -152,6 +157,46 @@ def sample_qa(
     return rng.choice(qa_pairs)
 
 
+def _encode_batch(
+    tokenizer,  # noqa: ANN001
+    pairs_with_templates: list[tuple[str, str, str]],  # (template, q, a)
+    prefix_n_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Right-pad a batch of QA pairs into (input_ids, attention_mask, labels).
+
+    attention_mask covers prefix positions + real tokens (padding masked);
+    labels are -100 on prompt tokens and padding, answer tokens elsewhere.
+    """
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (eos_id or 0)
+
+    enc = []
+    for template, q, a in pairs_with_templates:
+        q_text = template.format(q=q)
+        q_ids = tokenizer(q_text, add_special_tokens=False).input_ids
+        full_ids = tokenizer(q_text + " " + a, add_special_tokens=False).input_ids
+        if eos_id is not None:
+            full_ids = [*full_ids, eos_id]
+        enc.append((q_ids, full_ids))
+
+    b = len(enc)
+    max_len = max(len(full) for _, full in enc)
+    input_ids = torch.full((b, max_len), pad_id, dtype=torch.long)
+    labels = torch.full((b, max_len), -100, dtype=torch.long)
+    token_mask = torch.zeros((b, max_len), dtype=torch.long)
+    for i, (q_ids, full_ids) in enumerate(enc):
+        n = len(full_ids)
+        input_ids[i, :n] = torch.tensor(full_ids)
+        token_mask[i, :n] = 1
+        labels[i, len(q_ids) : n] = torch.tensor(full_ids[len(q_ids) :])
+
+    attention_mask = torch.cat(
+        [torch.ones((b, prefix_n_tokens), dtype=torch.long), token_mask], dim=1
+    )
+    return input_ids.to(device), attention_mask.to(device), labels.to(device)
+
+
 def train_prefix(
     model,  # noqa: ANN001
     tokenizer,  # noqa: ANN001
@@ -164,6 +209,7 @@ def train_prefix(
     seed: int = 42,
     qa_groups: list[list[tuple[str, str]]] | None = None,
     templates: list[str] | None = None,
+    batch_size: int = 1,
 ) -> list[float]:
     """Train prefix.keys/values directly against Q+A cross-entropy.
 
@@ -174,6 +220,13 @@ def train_prefix(
     qa_groups (one list per fact) enables fact-balanced sampling; templates
     (prompt formats containing "{q}") are sampled per step so the prefix
     doesn't overfit to a single question framing.
+
+    batch_size > 1 samples that many pairs per optimizer step (fact-balanced
+    per sample) and takes one joint gradient. For many-fact axioms this is
+    the difference between fitting the joint problem and batch-1 thrash —
+    each single-sample step nails the fact it just saw while perturbing the
+    others (observed in the first crowding run: last-step loss ~1e-3 with
+    TRAIN-probe recall near zero).
     """
     for p in model.parameters():
         p.requires_grad_(False)
@@ -189,25 +242,43 @@ def train_prefix(
     templates = templates or [TEMPLATE]
 
     for _ in range(n_steps):
-        q, a = sample_qa(rng, qa_pairs, qa_groups)
-        q_text = rng.choice(templates).format(q=q)
-        full_text = q_text + " " + a
+        if batch_size > 1:
+            batch = []
+            for _i in range(batch_size):
+                q, a = sample_qa(rng, qa_pairs, qa_groups)
+                batch.append((rng.choice(templates), q, a))
+            input_ids, attention_mask, labels = _encode_batch(
+                tokenizer, batch, prefix.n_tokens, device
+            )
+            kv_cache = build_prefix_cache(prefix, dtype, batch=batch_size)
+            optim.zero_grad()
+            loss = model(
+                input_ids,
+                attention_mask=attention_mask,
+                past_key_values=kv_cache,
+                labels=labels,
+            ).loss
+        else:
+            q, a = sample_qa(rng, qa_pairs, qa_groups)
+            q_text = rng.choice(templates).format(q=q)
+            full_text = q_text + " " + a
 
-        q_ids = tokenizer(q_text, add_special_tokens=False, return_tensors="pt").input_ids.to(
-            device
-        )
-        full_ids = tokenizer(full_text, add_special_tokens=False, return_tensors="pt").input_ids.to(
-            device
-        )
-        if eos_id is not None:
-            full_ids = torch.cat([full_ids, torch.tensor([[eos_id]], device=device)], dim=1)
+            q_ids = tokenizer(q_text, add_special_tokens=False, return_tensors="pt").input_ids.to(
+                device
+            )
+            full_ids = tokenizer(
+                full_text, add_special_tokens=False, return_tensors="pt"
+            ).input_ids.to(device)
+            if eos_id is not None:
+                full_ids = torch.cat([full_ids, torch.tensor([[eos_id]], device=device)], dim=1)
 
-        labels = torch.full_like(full_ids, -100)
-        labels[0, q_ids.shape[1] :] = full_ids[0, q_ids.shape[1] :]
+            labels = torch.full_like(full_ids, -100)
+            labels[0, q_ids.shape[1] :] = full_ids[0, q_ids.shape[1] :]
 
-        kv_cache = build_prefix_cache(prefix, dtype)
-        optim.zero_grad()
-        loss = model(full_ids, past_key_values=kv_cache, labels=labels).loss
+            kv_cache = build_prefix_cache(prefix, dtype)
+            optim.zero_grad()
+            loss = model(full_ids, past_key_values=kv_cache, labels=labels).loss
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
         optim.step()
@@ -217,6 +288,46 @@ def train_prefix(
     if not losses:
         raise RuntimeError("no training steps ran")
     return losses
+
+
+@torch.no_grad()
+def mean_teacher_forced_loss(
+    model,  # noqa: ANN001
+    tokenizer,  # noqa: ANN001
+    prefix: AxiomPrefix,
+    qa_groups: list[list[tuple[str, str]]],
+    template: str = TEMPLATE,
+) -> float:
+    """Average teacher-forced loss over ALL training pairs, canonical template.
+
+    The diagnostic the first crowding run lacked: train_prefix's reported
+    losses are single sampled steps, which look converged the moment the most
+    recently visited fact is fit. This is the honest joint-fit number —
+    low mean here + low TRAIN-probe recall would mean generation drift;
+    high mean here means the joint problem simply isn't fit yet.
+    """
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    eos_id = tokenizer.eos_token_id
+    total = 0.0
+    count = 0
+    for group in qa_groups:
+        for q, a in group:
+            q_text = template.format(q=q)
+            q_ids = tokenizer(q_text, add_special_tokens=False, return_tensors="pt").input_ids.to(
+                device
+            )
+            full_ids = tokenizer(
+                q_text + " " + a, add_special_tokens=False, return_tensors="pt"
+            ).input_ids.to(device)
+            if eos_id is not None:
+                full_ids = torch.cat([full_ids, torch.tensor([[eos_id]], device=device)], dim=1)
+            labels = torch.full_like(full_ids, -100)
+            labels[0, q_ids.shape[1] :] = full_ids[0, q_ids.shape[1] :]
+            kv_cache = build_prefix_cache(prefix, dtype)
+            total += float(model(full_ids, past_key_values=kv_cache, labels=labels).loss.item())
+            count += 1
+    return total / max(count, 1)
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────

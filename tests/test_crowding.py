@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 
 from marker.crowding import ATTRIBUTE_CATALOG, make_axiom
-from marker.run_crowding import STEPS_BY_F, _contains, _count_confusions
+from marker.run_crowding import STEPS_BY_F, _count_confusions, _matches
 
 _CONTRACTIONS = {"what's": "what is", "can you": "can you"}
 
@@ -110,9 +110,24 @@ def test_fact_text_contains_every_value():
 # ── Scoring helpers ───────────────────────────────────────────────────────────
 
 
-def test_contains_case_insensitive():
-    assert _contains("The value is 300 Seconds.", "300 seconds")
-    assert not _contains("nothing relevant here", "300 seconds")
+def test_matches_case_insensitive():
+    assert _matches("The value is 300 Seconds.", "300 seconds")
+    assert not _matches("nothing relevant here", "300 seconds")
+
+
+def test_matches_rejects_digit_run_false_positives():
+    # The run-1 bug: gold "10" scored correct against degenerate output.
+    assert not _matches("priority is 100000.0.0.0.0Q", "10")
+    assert not _matches("the count is 210 today", "10")
+    assert _matches("priority is 10.", "10")
+    assert _matches("set to 10 exactly", "10")
+
+
+def test_matches_unit_suffixed_and_identifier_golds():
+    assert _matches("the limit is 38%.", "38%")
+    assert _matches("backoff is 989ms today", "989ms")
+    assert _matches("topic orders.vx7 receives it", "orders.vx7")
+    assert not _matches("backoff is 1989ms today", "989ms")  # embedded in longer number
 
 
 def test_confusion_counts_only_sibling_values_in_wrong_answers():
@@ -124,16 +139,24 @@ def test_confusion_counts_only_sibling_values_in_wrong_answers():
         ]
     }
     records = [
-        ("q0", "the answer is 111ms", True),  # correct -> never counted
-        ("q1", "the answer is 333KB", False),  # wrong, contains fact 2's value
-        ("q2", "no idea", False),  # wrong, no sibling value present
+        (0, "q0", "the answer is 111ms", True),  # correct -> never counted
+        (1, "q1", "the answer is 333KB", False),  # wrong, contains fact 2's value
+        (2, "q2", "no idea", False),  # wrong, no sibling value present
     ]
     assert _count_confusions(axiom, records) == 1
 
 
+def test_confusion_own_value_not_counted_as_sibling():
+    # A wrong answer that repeats its OWN fact's value (e.g. wrong framing but
+    # right number failing the matcher elsewhere) must not count as confusion.
+    axiom = {"facts": [{"value": "111ms"}, {"value": "222s"}]}
+    records = [(0, "q0", "it is about 111ms give or take", False)]
+    assert _count_confusions(axiom, records) == 0
+
+
 def test_confusion_zero_when_all_correct():
-    axiom = {"facts": [{"value": "a"}, {"value": "b"}]}
-    records = [("q0", "a", True), ("q1", "b", True)]
+    axiom = {"facts": [{"value": "77ms"}, {"value": "88s"}]}
+    records = [(0, "q0", "77ms", True), (1, "q1", "88s", True)]
     assert _count_confusions(axiom, records) == 0
 
 
@@ -141,6 +164,16 @@ def test_steps_by_f_covers_default_f_list():
     for f in (2, 4, 8, 16, 32):
         assert f in STEPS_BY_F
         assert STEPS_BY_F[f] > 0
+
+
+def test_steps_hold_samples_per_fact_roughly_constant():
+    # The run-1 failure: samples/fact collapsed from ~1000 (F=2) to ~156
+    # (F=32). At batch 8, steps*8/F must stay in the validated 800-1600 band.
+    for f, steps in STEPS_BY_F.items():
+        samples_per_fact = steps * 8 / f
+        assert 800 <= samples_per_fact <= 1700, (
+            f"F={f}: {samples_per_fact:.0f} samples/fact outside validated band"
+        )
 
 
 def test_steps_by_f_nondecreasing():

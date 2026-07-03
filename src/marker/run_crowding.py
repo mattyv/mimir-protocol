@@ -8,10 +8,22 @@ prefix per (F, N) cell. ZERO/FACTS baselines are computed once per F (they
 don't depend on N) and reused across the N columns.
 
 Per cell, two scored buckets per fact: TRAIN (one verbatim training question
-per fact — the undertrained-vs-crowded control) and TEST (unseen phrasings,
-the headline metric). Confusion is scored on wrong TEST answers: does the
-generated text contain a SIBLING fact's value (cross-fact confusion) rather
-than nothing recognizable (plain miss)?
+per fact — the undertrained-vs-crowded control) and UNSEEN (the dev + test
+held-out templates, 2 probes/fact, the headline metric). Confusion is scored
+on wrong UNSEEN answers: does the generated text contain a SIBLING fact's
+value (cross-fact confusion) rather than nothing recognizable (plain miss)?
+
+Run-2 amendments (after the first run's F>=4 cells failed their own TRAIN
+control — see the run-1 postmortem in CROWDING_PLAN.md):
+  - batched training (--batch-size 8): run 1 was batch-1 with last-step loss
+    ~1e-3 yet TRAIN recall ~10% — single-sample steps fit the fact just
+    visited while perturbing the rest; the joint problem was never fit.
+  - digit-boundary scoring (_matches): plain substring let gold "10" match
+    degenerate "100000.0.0.0" output, inflating garbage cells.
+  - joint teacher-forced mean loss reported per cell — the diagnostic that
+    separates "not fit" from "fit but drifts at generation".
+  - steps hold samples/fact at ~800-1600 across F (run 1 collapsed to ~156
+    at F=32).
 
 Run (GPU):
     PYTHONPATH=src python -m marker.run_crowding --model-name Qwen/Qwen2.5-7B
@@ -22,6 +34,7 @@ Smoke (must pass locally before any Vast launch):
 from __future__ import annotations
 
 import argparse
+import re
 import time
 
 import torch
@@ -32,21 +45,32 @@ from marker.prefix_poc import (
     build_prefix_cache,
     generate_with_cache,
     init_stat_matched,
+    mean_teacher_forced_loss,
     train_prefix,
 )
 from marker.run_axiom_mlp_demo import TEMPLATE, _build_dynamic_cache, compute_axiom_kv
 
 TRAIN_TEMPLATES = ["Q: {q}\nA:", "{q}\n", "Question: {q}\nAnswer:"]
 
-# Steps scale with F (the workload the prefix must fit), not N.
-STEPS_BY_F = {2: 2000, 4: 2000, 8: 2500, 16: 3500, 32: 5000}
+# Optimizer steps per F at batch_size 8 — samples/fact = steps * batch / F,
+# held at ~800-1600 across F (the regime the tuned run validated). The first
+# crowding run's schedule collapsed to ~156 batch-1 samples/fact at F=32.
+STEPS_BY_F = {2: 400, 4: 600, 8: 1000, 16: 2000, 32: 3200}
 
 
-def _contains(answer: str, gold: str) -> bool:
-    return gold.lower() in answer.lower()
+def _matches(answer: str, gold: str) -> bool:
+    """Digit-boundary substring match.
+
+    Plain substring scoring false-positived in the first crowding run: gold
+    "10" matched inside degenerate "100000.0.0.0" output. Requiring no digit
+    adjacent to the match kills that class ("10" no longer matches "100000"
+    or "210") while leaving text golds and unit-suffixed golds ("38%",
+    "989ms", "orders.vx7") unaffected.
+    """
+    return re.search(rf"(?<!\d){re.escape(gold.lower())}(?!\d)", answer.lower()) is not None
 
 
-def _score_test_bucket(
+def _score_unseen(
     model,  # noqa: ANN001
     tokenizer,  # noqa: ANN001
     axiom: dict,
@@ -54,24 +78,25 @@ def _score_test_bucket(
     max_new: int,
     print_detail: bool,
     label: str,
-) -> tuple[int, int, list[tuple[str, str, bool]]]:
-    """Score the TEST bucket (one probe per fact, in fact order) for one
-    condition. Returns (correct, total, records) where records[i] corresponds
-    to axiom["facts"][i] — the confusion metric relies on this ordering.
+) -> tuple[int, int, list[tuple[int, str, str, bool]]]:
+    """Score BOTH unseen buckets (dev + test — 2 probes per fact; for the
+    synthetic axioms they're symmetric held-out templates, and combining
+    doubles statistical power). Records carry the owning fact index for the
+    confusion metric.
     """
     correct = 0
     total = 0
-    records: list[tuple[str, str, bool]] = []
-    for fact in axiom["facts"]:
-        (q, gold) = fact["test"][0]
-        prompt = TEMPLATE.format(q=q)
-        out = generate_with_cache(model, tokenizer, prompt, kv_cache, max_new)
-        ok = _contains(out, gold)
-        correct += int(ok)
-        total += 1
-        records.append((q, out, ok))
-        if print_detail:
-            print(f"    [{label:11}] {'v' if ok else 'x'} {out[:80].replace(chr(10), ' ')}")
+    records: list[tuple[int, str, str, bool]] = []
+    for fact_idx, fact in enumerate(axiom["facts"]):
+        for q, gold in [*fact["dev"], *fact["test"]]:
+            prompt = TEMPLATE.format(q=q)
+            out = generate_with_cache(model, tokenizer, prompt, kv_cache, max_new)
+            ok = _matches(out, gold)
+            correct += int(ok)
+            total += 1
+            records.append((fact_idx, q, out, ok))
+            if print_detail:
+                print(f"    [{label:11}] {'v' if ok else 'x'} {out[:80].replace(chr(10), ' ')}")
     return correct, total, records
 
 
@@ -93,23 +118,23 @@ def _score_train_control(
         gold = fact["value"]
         prompt = TEMPLATE.format(q=q)
         out = generate_with_cache(model, tokenizer, prompt, kv_cache, max_new)
-        correct += int(_contains(out, gold))
+        correct += int(_matches(out, gold))
         total += 1
     return correct, total
 
 
-def _count_confusions(axiom: dict, records: list[tuple[str, str, bool]]) -> int:
-    """records[i] must correspond to axiom["facts"][i] (one probe per fact).
-    Among wrong answers, count those containing a DIFFERENT fact's value.
+def _count_confusions(axiom: dict, records: list[tuple[int, str, str, bool]]) -> int:
+    """Among wrong answers, count those containing a DIFFERENT fact's value.
+    Each record carries its owning fact index so sibling values are checked
+    with the same digit-boundary matcher used for scoring.
     """
     facts = axiom["facts"]
-    assert len(records) == len(facts), "confusion metric assumes one probe per fact"
     confused = 0
-    for i, (_q, out, ok) in enumerate(records):
+    for fact_idx, _q, out, ok in records:
         if ok:
             continue
-        sibling_values = [f["value"].lower() for j, f in enumerate(facts) if j != i]
-        if any(v in out.lower() for v in sibling_values):
+        sibling_values = [f["value"] for j, f in enumerate(facts) if j != fact_idx]
+        if any(_matches(out, v) for v in sibling_values):
             confused += 1
     return confused
 
@@ -117,11 +142,14 @@ def _count_confusions(axiom: dict, records: list[tuple[str, str, bool]]) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-7B")
-    parser.add_argument("--f-list", type=int, nargs="+", default=[2, 4, 8, 16, 32])
+    # Rerun default: F=2/4 already had adequate samples/fact in run 1; the
+    # interpretable-if-fixed cells are 8/16/32.
+    parser.add_argument("--f-list", type=int, nargs="+", default=[8, 16, 32])
     parser.add_argument("--n-list", type=int, nargs="+", default=[4, 8, 16, 32])
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lr-end", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-new", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--smoke", action="store_true")
@@ -131,12 +159,13 @@ def main() -> None:
     if args.smoke:
         args.model_name = "Qwen/Qwen2.5-0.5B"
         f_list, n_list = [2], [4]
+        args.batch_size = 4  # exercise the padded-batch path, not batch-1
         args.max_new = min(args.max_new, 20)
         print("=== SMOKE MODE ===")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}  model: {args.model_name}")
-    print(f"F list: {f_list}  N list: {n_list}\n")
+    print(f"F list: {f_list}  N list: {n_list}  batch: {args.batch_size}\n")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = (
@@ -153,24 +182,28 @@ def main() -> None:
     baseline: dict[int, dict] = {}
 
     for f in f_list:
-        n_steps = STEPS_BY_F.get(f, 2000) if not args.smoke else 10
+        n_steps = STEPS_BY_F.get(f, 1000) if not args.smoke else 10
+        samples_per_fact = n_steps * args.batch_size // f
         axiom = make_axiom(f"CrowdAxiom{f}", f, seed=args.seed)
-        print(f"\n{'=' * 70}\n### F={f}  ({n_steps} steps/cell)")
+        print(
+            f"\n{'=' * 70}\n### F={f}  ({n_steps} steps/cell x batch {args.batch_size} "
+            f"= ~{samples_per_fact} samples/fact)"
+        )
         print(f"  fact_text: {axiom['fact_text'][:120]}")
 
         real_kv = compute_axiom_kv(model, tokenizer, axiom["fact_text"], term=axiom["name"])
         facts_positions = real_kv.keys[0].shape[2]
         print(f"  FACTS cache positions: {facts_positions}")
 
-        zero_c, zero_t, _ = _score_test_bucket(
+        zero_c, zero_t, _ = _score_unseen(
             model, tokenizer, axiom, None, args.max_new, False, "ZERO"
         )
         facts_cache = _build_dynamic_cache(real_kv, model_device)
-        facts_c, facts_t, _ = _score_test_bucket(
+        facts_c, facts_t, _ = _score_unseen(
             model, tokenizer, axiom, facts_cache, args.max_new, False, "FACTS"
         )
-        print(f"  ZERO  TEST: {zero_c}/{zero_t}")
-        print(f"  FACTS TEST: {facts_c}/{facts_t}")
+        print(f"  ZERO  UNSEEN: {zero_c}/{zero_t}")
+        print(f"  FACTS UNSEEN: {facts_c}/{facts_t}")
         baseline[f] = {
             "facts_test": (facts_c, facts_t),
             "zero_test": (zero_c, zero_t),
@@ -192,9 +225,16 @@ def main() -> None:
                 weight_decay=args.weight_decay,
                 qa_groups=qa_groups,
                 templates=TRAIN_TEMPLATES,
+                batch_size=args.batch_size,
             )
             elapsed = time.time() - t0
-            print(f"  N={n}: loss {losses[0]:.3f} -> {losses[-1]:.4f}  ({elapsed:.0f}s)")
+            tail = losses[-100:]
+            tail_mean = sum(tail) / len(tail)
+            joint_loss = mean_teacher_forced_loss(model, tokenizer, prefix, qa_groups)
+            print(
+                f"  N={n}: loss(last-100 mean) {tail_mean:.4f}  "
+                f"joint teacher-forced mean {joint_loss:.4f}  ({elapsed:.0f}s)"
+            )
 
             with torch.no_grad():
                 train_cache = build_prefix_cache(prefix, dtype)
@@ -202,25 +242,26 @@ def main() -> None:
                     model, tokenizer, axiom, train_cache, args.max_new
                 )
                 test_cache = build_prefix_cache(prefix, dtype)
-                test_c, test_t, test_records = _score_test_bucket(
-                    model, tokenizer, axiom, test_cache, args.max_new, True, f"N={n} TEST"
+                test_c, test_t, test_records = _score_unseen(
+                    model, tokenizer, axiom, test_cache, args.max_new, True, f"N={n} UNSEEN"
                 )
                 confused = _count_confusions(axiom, test_records)
                 wrong_total = sum(1 for *_r, ok in test_records if not ok)
 
             print(
-                f"    TRAIN(control): {train_c}/{train_t}   TEST: {test_c}/{test_t}   "
+                f"    TRAIN(control): {train_c}/{train_t}   UNSEEN: {test_c}/{test_t}   "
                 f"confused(of {wrong_total} wrong): {confused}"
             )
             results[f][n] = {
                 "test": (test_c, test_t),
                 "train": (train_c, train_t),
                 "confusion": (confused, wrong_total),
+                "joint_loss": joint_loss,
             }
 
     # ── Summary surfaces ────────────────────────────────────────────────────
     print("\n" + "=" * 78)
-    print("TEST ACCURACY SURFACE (rows F, cols N) + FACTS baseline")
+    print("UNSEEN ACCURACY SURFACE (rows F, cols N) + FACTS baseline")
     print("=" * 78)
     header = (
         "  F  " + "".join(f"{'N=' + str(n):>10}" for n in n_list) + f"{'FACTS':>12}{'ZERO':>10}"
@@ -248,7 +289,7 @@ def main() -> None:
         print(row)
 
     print("\n" + "=" * 78)
-    print("CONFUSION SURFACE — wrong TEST answers containing a sibling fact's value")
+    print("CONFUSION SURFACE — wrong UNSEEN answers containing a sibling fact's value")
     print("=" * 78)
     print("  F  " + "".join(f"{'N=' + str(n):>10}" for n in n_list))
     for f in f_list:
@@ -259,7 +300,17 @@ def main() -> None:
         print(row)
 
     print("\n" + "=" * 78)
-    print("SIZING RULE — smallest N with TEST >= 90% of FACTS")
+    print("JOINT TEACHER-FORCED LOSS SURFACE — high = joint fit not reached")
+    print("=" * 78)
+    print("  F  " + "".join(f"{'N=' + str(n):>10}" for n in n_list))
+    for f in f_list:
+        row = f"  {f:<3}"
+        for n in n_list:
+            row += f"{results[f][n]['joint_loss']:>10.4f}"
+        print(row)
+
+    print("\n" + "=" * 78)
+    print("SIZING RULE — smallest N with UNSEEN >= 90% of FACTS")
     print("=" * 78)
     for f in f_list:
         fc, ft = baseline[f]["facts_test"]

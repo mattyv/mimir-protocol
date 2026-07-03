@@ -90,6 +90,32 @@ Unchanged: onstart clones the branch, pins `transformers>=4.45,<5`, runs
 poll over HTTPS with the stuck-loading bailout; destroy node immediately
 after log capture.
 
+## Run 1 postmortem (2026-07) and run-2 amendments
+
+Run 1 (batch-1, steps 2000→5000, plain substring scoring) failed its own
+TRAIN control at F≥4: TRAIN-probe recall ~10-25%, flat across N. Not
+reported as crowding, per the pre-registered rule. Three defects found:
+
+1. **Batch-1 interference, not step deficit.** Final single-step losses were
+   ~1e-3 while TRAIN recall was near zero — each step fit the fact just
+   sampled while perturbing the rest; the joint problem was never fit and
+   the single-sample loss print masked it. Fix: `--batch-size 8` (joint
+   gradient per step) + a per-cell **joint teacher-forced mean loss** over
+   all training pairs, which distinguishes "not fit" from "fit but drifts".
+2. **Substring scoring false positives.** Gold "10" matched inside
+   degenerate "100000.0.0.0" output, crediting garbage cells. Fix:
+   digit-boundary matcher (`_matches`), also used for the confusion metric.
+3. **Samples/fact collapsed with F** (~1000 at F=2 → ~156 at F=32, far below
+   the ~600-1000 the tuned run validated). Fix: steps hold samples/fact at
+   ~800-1600 across F (pinned by a test).
+
+Run 2 defaults: F ∈ {8,16,32} only (F=2/4 had adequate budgets in run 1),
+batch 8, steps {8:1000, 16:2000, 32:3200}, UNSEEN bucket = dev+test
+(2 probes/fact, doubled statistical power). Genuine run-1 findings that
+stand: severe undercapacity (F=32, N=4) produces *degenerate* repeated text,
+and essentially all wrong answers at high F contained a sibling fact's value
+— though both need re-measuring with honest scoring.
+
 ## Known risks
 
 - Template-generated paraphrases are narrower than human ones → results may

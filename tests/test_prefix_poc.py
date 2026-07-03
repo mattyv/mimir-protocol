@@ -189,3 +189,14 @@ def test_train_probe_golds_match_eval_gold_style():
         for _q, gold in axiom["train_probes"]:
             assert gold == gold.strip()
             assert len(gold) < 30, "train_probes golds should be short substrings, not sentences"
+
+
+def test_build_prefix_cache_batched_expand_keeps_grad():
+    real_kv = _fake_kv()
+    prefix = init_stat_matched(real_kv, n_tokens=4, term="Foo")
+    cache = build_prefix_cache(prefix, dtype=torch.float32, batch=3)
+    k0 = _cache_layer0_key(cache)
+    assert k0.shape[0] == 3  # expanded batch dim
+    assert k0.requires_grad
+    # expanded rows are views of the same params, not copies with broken grads
+    assert torch.equal(k0[0].detach(), k0[2].detach())
