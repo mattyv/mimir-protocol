@@ -136,22 +136,44 @@ def build_prefix_cache(prefix: AxiomPrefix, dtype: torch.dtype):  # noqa: ANN201
 # ── Training ──────────────────────────────────────────────────────────────────
 
 
+def sample_qa(
+    rng: random.Random,
+    qa_pairs: list[tuple[str, str]] | None,
+    qa_groups: list[list[tuple[str, str]]] | None = None,
+) -> tuple[str, str]:
+    """Pick a training pair. With qa_groups (one group per fact), sample the
+    group uniformly first, then a pair within it — otherwise axioms whose
+    facts have uneven paraphrase counts under-train the sparse facts.
+    """
+    if qa_groups:
+        return rng.choice(rng.choice(qa_groups))
+    if not qa_pairs:
+        raise ValueError("need qa_pairs or qa_groups")
+    return rng.choice(qa_pairs)
+
+
 def train_prefix(
     model,  # noqa: ANN001
     tokenizer,  # noqa: ANN001
     prefix: AxiomPrefix,
-    qa_pairs: list[tuple[str, str]],
+    qa_pairs: list[tuple[str, str]] | None = None,
     n_steps: int = 800,
     lr: float = 5e-3,
     lr_end: float = 5e-4,
     weight_decay: float = 0.0,
     seed: int = 42,
+    qa_groups: list[list[tuple[str, str]]] | None = None,
+    templates: list[str] | None = None,
 ) -> list[float]:
     """Train prefix.keys/values directly against Q+A cross-entropy.
 
     Model weights are frozen. A fresh DynamicCache is built from the prefix
     params each step (the cache is stateful and gets extended by the forward
     pass, so it can't be reused across steps).
+
+    qa_groups (one list per fact) enables fact-balanced sampling; templates
+    (prompt formats containing "{q}") are sampled per step so the prefix
+    doesn't overfit to a single question framing.
     """
     for p in model.parameters():
         p.requires_grad_(False)
@@ -164,10 +186,11 @@ def train_prefix(
     eos_id = tokenizer.eos_token_id
     rng = random.Random(seed)
     losses: list[float] = []
+    templates = templates or [TEMPLATE]
 
     for _ in range(n_steps):
-        q, a = rng.choice(qa_pairs)
-        q_text = TEMPLATE.format(q=q)
+        q, a = sample_qa(rng, qa_pairs, qa_groups)
+        q_text = rng.choice(templates).format(q=q)
         full_text = q_text + " " + a
 
         q_ids = tokenizer(q_text, add_special_tokens=False, return_tensors="pt").input_ids.to(
