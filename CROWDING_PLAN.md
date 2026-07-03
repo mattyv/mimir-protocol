@@ -116,6 +116,33 @@ stand: severe undercapacity (F=32, N=4) produces *degenerate* repeated text,
 and essentially all wrong answers at high F contained a sibling fact's value
 — though both need re-measuring with honest scoring.
 
+## Run 2 postmortem (2026-07) — eval harness bug; crowding STILL unmeasured
+
+Run 2's fixes worked as designed (joint teacher-forced loss 2e-4..2e-3 in
+every cell — the prefixes DO fit the joint problem, even 32 facts in 4
+tokens), yet TRAIN-probe recall stayed at 1-2/F at every N. That combination
+is mathematically impossible as a real effect: loss ~2e-4 means ~99.98% mass
+on the gold token at every position, so greedy decode on those same prompts
+must reproduce the answers. The instrument was broken, not the prefix:
+
+**The scorers received ONE DynamicCache and looped all probes through it.
+The model mutates the cache in place, so every probe after the first ran
+against prefix + all previous Q&As — an uncontrolled multi-turn conversation.**
+Fingerprints in the logs: fact 1 correct in nearly every cell (only clean-
+cache probe), answers prefixed "Yes, ..." (dialogue continuation), degeneracy
+compounding down the probe list, FACTS immune (real-text context tolerates
+appended turns). Run 1 had the same bug (plus its own), so BOTH crowding
+surfaces to date measured cache pollution, not crowding. The flagship
+prefix results (POC 16/18, tuned 21/24) are unaffected — those runners
+rebuilt the cache per probe.
+
+Fix (run 3): scorers take a make_cache() builder called per probe, pinned by
+a regression test. Run-2 interpretations withdrawn: "generation-time
+retrieval failure" and "mode collapse to a favored fact" were both artifacts.
+The run-1 "degenerate text at F=32,N=4" observation is also suspect for the
+same reason. Rerun with the same config; the joint-loss table suggests the
+real surface may be far better than anything reported so far.
+
 ## Known risks
 
 - Template-generated paraphrases are narrower than human ones → results may

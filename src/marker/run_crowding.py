@@ -74,7 +74,7 @@ def _score_unseen(
     model,  # noqa: ANN001
     tokenizer,  # noqa: ANN001
     axiom: dict,
-    kv_cache,  # noqa: ANN001
+    make_cache,  # noqa: ANN001  — zero-arg callable returning a FRESH cache (or None)
     max_new: int,
     print_detail: bool,
     label: str,
@@ -83,6 +83,14 @@ def _score_unseen(
     synthetic axioms they're symmetric held-out templates, and combining
     doubles statistical power). Records carry the owning fact index for the
     confusion metric.
+
+    make_cache is called PER PROBE. Runs 1 and 2 passed a single DynamicCache
+    in here; the model mutates it in place, so every probe after the first
+    ran against prefix + all previous Q&As — an uncontrolled multi-turn
+    conversation, not the injected prefix. (Fingerprints: fact 1 always
+    correct, "Yes, ..." dialogue-continuation answers, degeneracy compounding
+    down the probe list, all while joint teacher-forced loss was ~2e-4.)
+    Both runs' F>=4 surfaces measured this bug, not crowding.
     """
     correct = 0
     total = 0
@@ -90,7 +98,7 @@ def _score_unseen(
     for fact_idx, fact in enumerate(axiom["facts"]):
         for q, gold in [*fact["dev"], *fact["test"]]:
             prompt = TEMPLATE.format(q=q)
-            out = generate_with_cache(model, tokenizer, prompt, kv_cache, max_new)
+            out = generate_with_cache(model, tokenizer, prompt, make_cache(), max_new)
             ok = _matches(out, gold)
             correct += int(ok)
             total += 1
@@ -104,12 +112,12 @@ def _score_train_control(
     model,  # noqa: ANN001
     tokenizer,  # noqa: ANN001
     axiom: dict,
-    kv_cache,  # noqa: ANN001
+    make_cache,  # noqa: ANN001  — zero-arg callable returning a FRESH cache
     max_new: int,
 ) -> tuple[int, int]:
     """One verbatim training question per fact — checks undertraining, not
     the headline metric, so results aren't printed per-question (log-size
-    control at F=32).
+    control at F=32). make_cache is called per probe (see _score_unseen).
     """
     correct = 0
     total = 0
@@ -117,7 +125,7 @@ def _score_train_control(
         q, _answer = fact["train"][0]
         gold = fact["value"]
         prompt = TEMPLATE.format(q=q)
-        out = generate_with_cache(model, tokenizer, prompt, kv_cache, max_new)
+        out = generate_with_cache(model, tokenizer, prompt, make_cache(), max_new)
         correct += int(_matches(out, gold))
         total += 1
     return correct, total
@@ -195,12 +203,14 @@ def main() -> None:
         facts_positions = real_kv.keys[0].shape[2]
         print(f"  FACTS cache positions: {facts_positions}")
 
+        def _fresh_facts_cache(kv=real_kv):  # noqa: ANN001, ANN202
+            return _build_dynamic_cache(kv, model_device)
+
         zero_c, zero_t, _ = _score_unseen(
-            model, tokenizer, axiom, None, args.max_new, False, "ZERO"
+            model, tokenizer, axiom, lambda: None, args.max_new, False, "ZERO"
         )
-        facts_cache = _build_dynamic_cache(real_kv, model_device)
         facts_c, facts_t, _ = _score_unseen(
-            model, tokenizer, axiom, facts_cache, args.max_new, False, "FACTS"
+            model, tokenizer, axiom, _fresh_facts_cache, args.max_new, False, "FACTS"
         )
         print(f"  ZERO  UNSEEN: {zero_c}/{zero_t}")
         print(f"  FACTS UNSEEN: {facts_c}/{facts_t}")
@@ -237,13 +247,21 @@ def main() -> None:
             )
 
             with torch.no_grad():
-                train_cache = build_prefix_cache(prefix, dtype)
+
+                def _fresh_prefix_cache(p=prefix):  # noqa: ANN001, ANN202
+                    return build_prefix_cache(p, dtype)
+
                 train_c, train_t = _score_train_control(
-                    model, tokenizer, axiom, train_cache, args.max_new
+                    model, tokenizer, axiom, _fresh_prefix_cache, args.max_new
                 )
-                test_cache = build_prefix_cache(prefix, dtype)
                 test_c, test_t, test_records = _score_unseen(
-                    model, tokenizer, axiom, test_cache, args.max_new, True, f"N={n} UNSEEN"
+                    model,
+                    tokenizer,
+                    axiom,
+                    _fresh_prefix_cache,
+                    args.max_new,
+                    True,
+                    f"N={n} UNSEEN",
                 )
                 confused = _count_confusions(axiom, test_records)
                 wrong_total = sum(1 for *_r, ok in test_records if not ok)

@@ -180,3 +180,42 @@ def test_steps_by_f_nondecreasing():
     fs = sorted(STEPS_BY_F)
     for f1, f2 in zip(fs, fs[1:], strict=False):
         assert STEPS_BY_F[f2] >= STEPS_BY_F[f1]
+
+
+def test_scorers_build_fresh_cache_per_probe(monkeypatch):
+    # Runs 1 and 2 passed one DynamicCache into the scorers; the model mutates
+    # it in place, so every probe after the first ran against prefix + all
+    # previous Q&As. This pins the fix: make_cache must be called once per probe.
+    import marker.run_crowding as rc
+
+    monkeypatch.setattr(rc, "generate_with_cache", lambda *a, **k: "the answer is 42")
+    axiom = {
+        "facts": [
+            {
+                "value": "42",
+                "train": [("q1?", "a")],
+                "dev": [("d1?", "42")],
+                "test": [("t1?", "42")],
+            },
+            {
+                "value": "77",
+                "train": [("q2?", "a")],
+                "dev": [("d2?", "77")],
+                "test": [("t2?", "77")],
+            },
+        ]
+    }
+    calls = {"n": 0}
+
+    def make_cache():
+        calls["n"] += 1
+        return object()
+
+    _c, total, _r = rc._score_unseen(None, None, axiom, make_cache, 10, False, "X")
+    assert total == 4
+    assert calls["n"] == 4, "one fresh cache per unseen probe"
+
+    calls["n"] = 0
+    _c, total = rc._score_train_control(None, None, axiom, make_cache, 10)
+    assert total == 2
+    assert calls["n"] == 2, "one fresh cache per train-control probe"
