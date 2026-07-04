@@ -8,6 +8,28 @@ current scale and method.
 
 ## Architecture-level approaches that were abandoned
 
+### Hypernetwork KV codec (falsified 2026-07)
+
+Per-axiom latent z (512 floats) + a shared encoder/decoder trained once;
+decode(z) regenerates a "scaffold" KV, verbatim facts ride alongside as
+text. Goal: ~1000x per-axiom storage compression with realtime add
+(encode = one forward pass, no training).
+
+**Why rejected:** the FACTS-only ablation (8 axioms, 6 domains,
+auto-scored) showed the codec adds nothing and slightly hurts: FACTS
+(prefill the ~150-byte fact string, no codec) scored 17/18 vs HYPER
+16/18 vs FULL 18/18; SCAFFOLD-only (decode(z) without facts) scored
+0/18 — the latent carries zero facts, and the decoded scaffold actively
+corrupted two answers (warehouse.fluxom_ingested -> "warehouse.flxom_ing",
+retries 3 -> 1). Deeper point: the description text is already the
+optimal compressed code — the frozen model itself is its decoder (one
+prefill). A learned codec can only be lossier and model-coupled. The
+honest fix for storage cost is "store the text, prefill on demand".
+Fairness caveats: trained on only 4-6 axioms with the facts-KV always
+attached (near-zero residual gradient), so the verdict is *unnecessary*,
+not *impossible*. Code kept for reference: `kv_hypernet.py`,
+`run_hypernet_demo.py`, `run_ablation_demo.py`.
+
 ### Sentinel-LoRA fallback (abandoned 2026-04-25)
 
 A LoRA fine-tuned to recognise `<sentinel>...</sentinel>` blocks as
