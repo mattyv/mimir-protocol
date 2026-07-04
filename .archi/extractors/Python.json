@@ -1,0 +1,42 @@
+{
+  "language": "Python",
+  "extensions": [
+    ".py"
+  ],
+  "patterns": [
+    {
+      "field": "imports",
+      "re": "^(from\\s+[\\w.]+\\s+import\\s+.+|import\\s+[\\w.]+(\\s+as\\s+\\w+)?(\\s*,\\s*[\\w.]+(\\s+as\\s+\\w+)?)*)"
+    },
+    {
+      "field": "symbols",
+      "re": "^class\\s+\\w+[\\w\\[\\], ]*(\\([^)]*\\))?\\s*:"
+    },
+    {
+      "field": "symbols",
+      "re": "^(async\\s+)?def\\s+\\w+\\s*\\("
+    },
+    {
+      "field": "symbols",
+      "re": "^@[\\w.]+(\\([^)]*\\))?"
+    },
+    {
+      "field": "symbols",
+      "re": "^type\\s+\\w+(\\[[^\\]]*\\])?\\s*="
+    },
+    {
+      "field": "symbols",
+      "re": "^\\w+\\s*:\\s*TypeAlias\\s*="
+    },
+    {
+      "field": "symbols",
+      "re": "^\\w+\\s*=\\s*(TypeVar|NewType|NamedTuple|Enum|Protocol)\\s*\\("
+    }
+  ],
+  "caps": {
+    "imports": 60,
+    "symbols": 300,
+    "sigLen": 160
+  },
+  "version": 1
+}
