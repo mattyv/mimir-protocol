@@ -4,6 +4,120 @@ What the project actually found, after exhaustively testing
 single-vector activation injection as a way to teach a frozen LLM new
 specialist terms.
 
+## 2026-07 update — trained virtual-KV prefixes: facts in N tokens, and where the real wall is
+
+A month-long series (Qwen 2.5-7B, Vast.ai, ~$3.80 total GPU spend across
+~10 runs) that (a) invalidated and re-established the v10 headline
+results, (b) killed the hypernet-codec idea, (c) validated *from-scratch
+trained virtual-KV prefixes* as a fact carrier, and (d) mapped the
+facts-per-prefix crowding surface — after fixing two instrument bugs
+that the experiments' own pre-registered controls caught.
+
+Vocabulary for this section: **F** = facts per axiom. **N** = trained
+virtual tokens per prefix (free K/V parameters per layer, learned
+against Q+A cross-entropy — never derived from text; no MLP, no hooks).
+**FACTS** = baseline that prefills the fact list as plain text (~8
+tokens/fact). **ZERO** = no injection. **N\*** = smallest N matching
+90% of FACTS.
+
+### Housekeeping that preceded everything (and why v10 was invalid)
+
+- The v10 "32/32" HELDOUT result was contaminated: five heldout
+  questions appeared verbatim in `SUPPLEMENTAL_QA` training data.
+  Decontaminated; now enforced by `tests/test_heldout_leakage.py`.
+- The multi-prefix RoPE correction from 2026-04-29 had been dropped in
+  the MLP+KV rewrite; `merge_axiom_kvs` and `AxiomSession` naive-concatenated.
+  Re-fixed, with mechanical tests.
+- KV-only ablation (7B): the description KV alone retrieves the facts;
+  the per-axiom MLP's real contribution is terseness + boundary
+  discipline (declining out-of-scope), NOT fact routing. It also
+  over-declines unseen phrasings — the failure the contaminated eval
+  had been hiding. README claims corrected accordingly: the honest
+  frame is "facts ride in the attention cache; steering shapes
+  behaviour".
+
+### Hypernet codec: built, ablated, killed (see FAILED_IDEAS.md)
+
+FACTS-only (prefill the ~150-byte fact string) matched everything the
+latent+decoder pipeline did: FULL 18/18, FACTS 17/18, HYPER 16/18,
+SCAFFOLD-only 0/18. The text *is* the optimal code; the frozen model is
+its decoder. Killed.
+
+### Trained prefixes work (the positive result of the series)
+
+Train N K/V tokens per layer from scratch on Q+A pairs (stat-matched
+random init — match the real KV's per-layer/head/channel mean+std or
+attention breaks; lr 1e-3, wd 0.01, fact-balanced sampling, 3 prompt
+templates, ~2k steps ≈ 2-3 min/axiom on L40):
+
+| run | eval | PREFIX best | FACTS | positions |
+| --- | --- | --- | --- | --- |
+| POC (8 axioms, 6 domains) | unseen phrasings | 16/18 @ N=8 | 17/18 | 8 vs ~32 |
+| Tuned (dev/test split; test touched once) | brand-new phrasings | 21/24 @ N=8 | 22/24 | 8 vs ~32 |
+
+No gibberish/looping in any run; misses are plausible-but-wrong values.
+Notable: on one probe the trained prefix beat FACTS (exact "78F" vs the
+text baseline hedging "70-80F") — optimizing against the target string
+can be *more* precise than prose. Recurring failure mode: cross-fact
+confusion inside an axiom (answering the sibling fact's value).
+
+**Readability:** the prefix is NOT readable — the parameters are raw
+per-layer K/V vectors in attention-head space, with no text stage and
+no mapping back to vocabulary (nearest-token tricks yield gibberish
+even for prompt-space soft tokens; these live deeper). Mental model:
+fact text = source code, prefix = compiled bytecode. Product
+consequence: the text fact store remains the auditable source of
+truth; prefixes are opaque, regenerable build artifacts.
+
+### Crowding: three runs, two instrument bugs, one clean surface
+
+Synthetic axioms (38-attribute catalog, seeded arbitrary values so ZERO
+is a true floor), grid F ∈ {8,16,32} × N ∈ {4,8,16,32}.
+
+- **Run 1 bug:** batch-1 training + single-step loss reporting masked
+  interference; plus plain-substring scoring credited degenerate output
+  (gold "10" inside "100000.0.0.0"). Caught by the pre-registered
+  TRAIN-probe control.
+- **Run 2 bug:** the eval reused ONE DynamicCache across all probes —
+  the model mutates it in place, so probe k ran against prefix + all
+  previous Q&As (an accidental multi-turn conversation; the model
+  literally began answers with "Yes, ..."). Caught by the joint
+  teacher-forced-loss diagnostic: loss ~2e-4 with 3% recall is
+  mathematically impossible as a real effect. Both runs' surfaces were
+  artifacts. Fix: fresh cache per probe, pinned by a regression test.
+- **Run 3 (clean):** TRAIN recall perfect in every cell — **even 32
+  facts memorize losslessly into a 4-token prefix** (~115K params).
+  Storage is essentially free. UNSEEN accuracy:
+
+| F | N=4 | N=8 | N=16 | N=32 | FACTS |
+| --- | --- | --- | --- | --- | --- |
+| 8 | 8/16 | 13/16 | 14/16 | **16/16** | 16/16 |
+| 16 | 14/32 | 13/32 | 18/32 | 21/32 | 30/32 |
+| 32 | 29/64 | 34/64 | 40/64 | 36/64 | 60/64 |
+
+  F=8 reaches full FACTS parity at N=32 (N\*/F = 4 tokens/fact).
+  **But the aggregate hides the real structure.** Splitting unseen
+  probes into near-template vs far-template phrasings: near-template
+  accuracy climbs with N (F=32: 15→26/32); far-template accuracy is
+  FLAT in N (F=32: 14→13→14→14/32). More tokens buy robustness to
+  nearby phrasings, not to restructured questions.
+
+**The takeaway that redirects the roadmap:** the binding constraint on
+many-fact prefixes is *question-routing robustness*, not storage. Two
+levers, neither of which is "more tokens": (1) canonicalize incoming
+questions toward the trained phrasing family before the model sees them
+(the Mimir runtime knows the attribute labels — deterministic rewrite);
+(2) train with much wider phrasing variety. If canonicalization
+recovers TRAIN-level recall, the practical rule collapses from "4
+tokens/fact" toward "~1 token per several facts + a rewriter".
+
+Caveats attached to all of the above: single seed, one synthetic axiom
+per F, template-level (not human) paraphrase variety in the crowding
+runs, 7B base model, gold-substring scoring. Code:
+`prefix_poc.py`, `run_prefix_poc.py`, `run_prefix_tuned.py`,
+`crowding.py`, `run_crowding.py`; plans + postmortems in
+`PREFIX_POC_PLAN.md`, `CROWDING_PLAN.md`.
+
 > **2026-04-29 update — ceiling broken: prefix tuning gives fact
 > injection on 10/10 axioms.** Per-axiom learnable K/V prefix
 > tensors injected into the model's attention cache at top-half
