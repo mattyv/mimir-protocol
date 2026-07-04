@@ -111,12 +111,60 @@ questions toward the trained phrasing family before the model sees them
 recovers TRAIN-level recall, the practical rule collapses from "4
 tokens/fact" toward "~1 token per several facts + a rewriter".
 
+### Skill axioms learn to disengage ("learned silence", 2026-07)
+
+Problem: `skill_mode` fires the skill MLP at every decode step from
+trigger to EOS. On mixed requests ("write the call, then explain in
+plain English") the code-pattern MLP steers the whole explanation — or,
+as it turned out, prevents it entirely. Chosen fix (over runtime
+string-gating, rejected as hacky): change the training distribution, not
+the runtime — the MLP is already input-conditional, it just never saw a
+moment where near-zero offset was correct.
+
+Three arms per skill (InternalBus + ilp_for), same hyperparams as
+existing skill training: C = current recipe (pure-code pairs);
+A = + mixed code-then-prose pairs + pure-prose pairs; B = A + an explicit
+penalty λ·mean‖offset‖² over prose-labelled answer positions (λ=0.1).
+Star diagnostic: per-generated-token offset-norm trace during decode.
+
+Results:
+
+- **Only the explicit penalty produces silence.** Arm B's offset norm
+  collapses at the code→prose boundary — InternalBus tails of 0.03–0.10
+  against code-segment norms of 5–10 (raw-trace ratio ~100×; the printed
+  summaries use a half-split approximation and understate it). Arm A
+  (data alone) not only fails to quiet the MLP, it *amplifies* it —
+  norms 14–23 everywhere vs C's 9–15. Silence never emerges from data;
+  it must be a stated objective.
+- **Two distinct failure modes fixed.** Arm C mostly *omitted* the
+  explanation entirely (learned EOS-after-pattern) — so the mixed
+  training data (A/B) is what makes the model follow the two-part
+  instruction at all, and the penalty (B) additionally disengages the
+  MLP during the prose. C's "0 contamination" is vacuous: no prose, no
+  contamination. The pre-registered less-contamination-than-C criterion
+  was therefore only genuinely met on ilp_for (6→3).
+- **Zero regression cost at λ=0.1**: skill-regression probes identical
+  across arms (InternalBus 4/4; ilp_for 3/4 in every arm — the constant
+  miss expects ILP_BREAK where the model gives a valid ILP_RETURN
+  implementation, i.e. a miscalibrated gold, not a model failure).
+- Honest limits: ilp_for's collapse verified on 3/4 bleed probes (the
+  4th's trace was truncated pre-collapse in the log); the ilp
+  contamination regex (`ILP_[A-Z_]+`) also counts legitimate API
+  *mentions* in prose, so the norm traces — not the contamination
+  counts — are the evidence. B's code-segment norms are ~half of C's,
+  so λ has no free headroom upward; λ=0.1 kept as-is, untuned.
+
+Verdict: PASS. Skills now both engage (term-triggered) and disengage
+(learned, penalty-trained), with the on/off visible as a measurable
+internal signal rather than inferred from output style.
+
 Caveats attached to all of the above: single seed, one synthetic axiom
 per F, template-level (not human) paraphrase variety in the crowding
 runs, 7B base model, gold-substring scoring. Code:
 `prefix_poc.py`, `run_prefix_poc.py`, `run_prefix_tuned.py`,
-`crowding.py`, `run_crowding.py`; plans + postmortems in
-`PREFIX_POC_PLAN.md`, `CROWDING_PLAN.md`.
+`crowding.py`, `run_crowding.py`, `skill_quiet.py`,
+`run_skill_quiet.py`; plans + postmortems in `PREFIX_POC_PLAN.md`,
+`CROWDING_PLAN.md`, `SKILL_QUIET_PLAN.md`.
 
 > **2026-04-29 update — ceiling broken: prefix tuning gives fact
 > injection on 10/10 axioms.** Per-axiom learnable K/V prefix
