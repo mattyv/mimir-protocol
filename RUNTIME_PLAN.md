@@ -1,5 +1,9 @@
 # Plan: MimirSession runtime (v1)
 
+**STATUS: PARKED — gated on CALIBRATION_PLAN.md (F1/F2/S1) and INSTRUCT_PLAN.md
+(instruct-model portability). Build the runtime once the capability envelopes
+exist AND the deployment target model class is confirmed to work.**
+
 ## Goal
 
 Convert the validated research findings into the product spine: a runtime
