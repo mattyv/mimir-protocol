@@ -19,6 +19,9 @@ OFFER_ID=$(vastai search offers \
 echo "  offer $OFFER_ID"
 
 read -r -d '' ONSTART <<'EOS' || true
+# Route onstart output to PID 1's stdout so `vastai logs` surfaces it (the
+# default onstart.log is not returned by the logs API).
+exec > /proc/1/fd/1 2>&1
 cd /root
 echo "=== clone ==="
 git clone --branch claude/project-review-6rx97z --single-branch https://github.com/mattyv/mimir-protocol.git 2>&1 | tail -3
