@@ -98,6 +98,53 @@ def base_axiom_kv(model, tokenizer, term: str, description: str) -> AxiomKV:  # 
     return compute_axiom_kv(model, tokenizer, description, term=term)
 
 
+# ── Skill KV (Phase 3: DSL description + few-shot worked examples) ───────────────
+
+
+def _examples_block(examples: list[tuple[str, str]]) -> str:
+    """Render worked examples as few-shot demos to bake into the KV. Zero
+    visible-prompt cost — the model attends to them from the cache. Empty
+    list -> empty string (the description-only baseline)."""
+    return "".join(f"\nExample:\nQ: {q}\nA: {a}\n" for q, a in examples)
+
+
+def chat_skill_system_prefix(term: str, description: str, examples: list[tuple[str, str]]) -> str:
+    """Open chat system block for a skill: the DSL description plus 0-3 worked
+    examples encoded into the injected KV. Sink first, block left open (the
+    live tokens continue it), exactly like chat_system_prefix for facts.
+    examples=[] gives the description-only baseline (the 'do skills fail on a
+    chat model?' failure case)."""
+    return f"{IM_START}system\nAbout {term}:\n{description}\n{_examples_block(examples)}"
+
+
+def encode_chat_skill_kv(  # noqa: ANN001
+    model, tokenizer, term: str, description: str, examples: list[tuple[str, str]]
+) -> AxiomKV:
+    """KV for the open chat skill block (Phase 3 carrier, skill MLP disabled)."""
+    return compute_axiom_kv(
+        model, tokenizer, chat_skill_system_prefix(term, description, examples), term=""
+    )
+
+
+def base_skill_axiom_kv(  # noqa: ANN001
+    model, tokenizer, term: str, description: str, examples: list[tuple[str, str]]
+) -> AxiomKV:
+    """Base-model skill reference: description + the same worked examples as
+    'About {term}:' plain text (no chat template), MLP disabled — isolates
+    whether a chat model's procedural-following does the job the skill MLP did
+    on base."""
+    return compute_axiom_kv(model, tokenizer, description + _examples_block(examples), term=term)
+
+
+def skill_correct(answer: str, gold: str | None, api_re: re.Pattern) -> bool:
+    """Score a skill probe. gold is a required substring (positive case:
+    the skill must engage); gold=None is the no-term control (negative case:
+    the DSL API must be ABSENT — no bleed)."""
+    if gold is None:
+        return api_re.search(answer) is None
+    return gold.lower() in answer.lower()
+
+
 # ── Decode (fresh cache per call — run-3 discipline) ─────────────────────────────
 
 

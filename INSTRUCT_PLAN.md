@@ -106,6 +106,26 @@ the frozen KV at zero prompt cost), and run `ilp_for` novel probes
 **GATE**: novel probes pass ⇒ skill MLPs optional on chat models (facts: KV;
 skills: KV-with-examples). If close-but-imperfect, re-enable the MLP on top.
 
+**Built (2026-07, `run_instruct_skills.py` + `instruct.py` skill helpers +
+`test_instruct_skills.py`).** Decoupled from the P2 gate so we get an early
+read (P1 already showed facts don't need P2's meta-KV). Grid, all MLP-disabled:
+- `base-ref` — base-7B, desc+examples KV, no MLP (does base do skills WITHOUT
+  the MLP? expected fail — the MLP was doing real work on base).
+- `instruct-desconly` — chat, **description-only** KV: the failure baseline.
+  This is where the hypothesized refusal ("I don't know anything about
+  ilp_for") would show.
+- `instruct-examples` — chat, desc+worked-examples KV: the fix.
+- `instruct-examples-preamble` — + the anti-drift preamble.
+
+Two failure modes scored separately on the positive probes: **REFUSED**
+(entity-unfamiliarity, `_refused()`) vs **drift** (wrong/plain code). Skill
+BOUNDARY = the no-term control (DSL must be ABSENT — a skill that fires
+unconditionally is broken). Novelty is pinned by test (Bitwise / ILP_BREAK
+absent from the encoded examples, so a pass is generalization not recall).
+GATE: `instruct-examples` POSITIVE >> `instruct-desconly` POSITIVE AND the
+no-term control stays clean. If desc-only already passes, skills — like facts
+— "just work" on chat and examples/MLP are both optional.
+
 ### Phase 4 — skill MLP retraining [GATED on P3 failing]
 
 Only if Phase 3 fails. Base-calibrated offsets aren't expected to transfer
