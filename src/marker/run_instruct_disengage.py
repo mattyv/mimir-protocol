@@ -1,30 +1,35 @@
-"""Multi-turn skill DISENGAGEMENT on a chat model (hardening run).
+"""Multi-turn skill DISENGAGEMENT on a chat model — strict vs sticky gating.
 
-Phase 3 showed skills ENGAGE for free on 7B-Instruct (5/6 from the description
-alone, no MLP) but OVER-APPLY: a no-term request still emits the DSL. The first
-multi-turn run confirmed the real bleed (persistent NO-BLEED 2/4) and that a
-one-sentence STANCE clause fixed it (2/2 / 2/2 / 4/4). This run hardens that
-result: 4 single-skill sessions (a bleedy general-purpose DSL + a narrow one
-added) with diversified off-topic turns, plus an INTERLEAVED two-skill session
-that tests cross-skill routing (naming skill B mid-session must switch off
-skill A, not fire both).
+Runs 1-2 (see CONCLUSIONS.md) established: skills bleed under persistent
+injection; a stance clause alone doesn't reliably stop it (a bleedy DSL whose
+method name collides with the off-topic verb still leaked). Fable's review of
+those runs flagged three eval flaws (asymmetric scoring, no syntax-fidelity
+check, truncated/uncapturable outputs) and named the real open question this
+run answers: term-gating disengages perfectly on a same-turn off-topic
+request, but does it also correctly evict a skill needed by a LATER, term-less
+follow-up that arrives after a distraction turn?
 
-Each session is a chat played turn-by-turn:
-    engage    — names a skill, must ENGAGE that skill's DSL
-    followup  — no term, continues the topic, must STAY ENGAGED
-    offtopic  — no term, unrelated request, must NOT bleed ANY session skill
+Mechanisms:
+    strict-gated       — skill's KV present only on turns naming it this turn.
+    sticky-gated-k2     — KV persists STICKY_K turns after the last mention
+                          (a decaying counter, reset to K on each mention).
+    sticky-gated-k2-stance — same presence rule as sticky, + the STANCE clause
+                          appended whenever any skill is active (tests whether
+                          stance reduces bleed DURING the sticky window without
+                          losing the follow-up benefit).
 
-Mechanisms (what sits in the injected system block each turn):
-    persistent  — every skill seen so far in the session (today's behavior)
-    term-gated  — only skills named in the current turn (bare system otherwise)
-    stance      — all-seen skills + a one-sentence "use only when asked" clause
+Every session is shaped: engage (names the term) -> offtopic (distraction,
+inside the sticky window) -> followup (term-less, tests re-engagement after
+the distraction) -> offtopic (after; sticky should have evicted by now).
+This directly measures the strict-miss / sticky-bleed tradeoff Fable named,
+using the SAME api-pattern instrument for both engagement and bleed (no more
+asymmetric scoring), plus a syntax-fidelity gold on engage/followup turns so a
+degraded from-history re-engagement can't pass on a loose substring alone.
 
-Metrics: ENGAGE / FOLLOWUP (want the target DSL) ; NO-BLEED (offtopic: no
-session DSL present) ; MISROUTE (on an engage/followup turn, a NON-target
-session skill's DSL leaked — only interleaved sessions can misroute).
-
-Faithful behavioral proxy: each turn is re-prefilled with the full conversation
-(system KV + replayed history + current turn), fresh cache. Instruct-only.
+Full, UNTRUNCATED per-turn outputs are dumped as one-line JSON (TURNJSON ...)
+so a reviewer can inspect every generation from the captured log — the first
+two runs printed 52-char previews and the node was gone before anyone could
+check whether a "MISS" was verbosity or a wrong API.
 
 Run (GPU):
     PYTHONPATH=src python -m marker.run_instruct_disengage \
@@ -36,6 +41,7 @@ Smoke (local):
 from __future__ import annotations
 
 import argparse
+import json
 import re
 
 import torch
@@ -46,7 +52,6 @@ from marker.instruct import (
     decode_with_kv,
     encode_chat_system_kv,
     im_end_id,
-    skill_correct,
 )
 from marker.run_axiom_mlp_demo import SKILL_AXIOM, SKILL_AXIOM_ILP
 from marker.run_skill_quiet import ILP_API_RE, INTERNALBUS_API_RE
@@ -56,11 +61,12 @@ STANCE = (
     "about them; for unrelated requests, write ordinary code."
 )
 
-MECHANISMS = ["persistent", "term-gated", "stance"]
+STICKY_K = 2
+MECHANISMS = ["strict-gated", "sticky-gated-k2", "sticky-gated-k2-stance"]
 
-# ── Two new skills for the hardening run ────────────────────────────────────────
-# FluentSeq: a BLEEDY general-purpose collection DSL — map/filter/reduce fit
-# almost any data task, so it is the acid test for over-application.
+# ── Skill registry (InternalBus/ilp_for from Phase 3; FluentSeq/Chronos added
+# in the hardening run — FluentSeq is the bleedy general-purpose acid test) ──────
+
 FLUENTSEQ_DESC = (
     "FluentSeq is a fictional fluent collection library. Wrap any iterable with "
     "seq(x), then chain: .map(fn), .filter(pred), .reduce(fn, init), .reverse(), "
@@ -69,8 +75,6 @@ FLUENTSEQ_DESC = (
 )
 FLUENTSEQ_API_RE = re.compile(r"seq\([^)]*\)\.\w+")
 
-# Chronos: a NARROW scheduling DSL — should rarely bleed (few tasks look like
-# scheduling), the counterpart to InternalBus.
 CHRONOS_DESC = (
     "Chronos is a fictional job scheduler. Recurring: chronos.every(seconds, task). "
     "One-shot at a Unix timestamp: chronos.at(ts, task). Cancel by handle: "
@@ -85,9 +89,13 @@ SKILLS: dict[str, dict] = {
     "Chronos": {"desc": CHRONOS_DESC, "api_re": CHRONOS_API_RE},
 }
 
+# Each session: engage -> offtopic (distraction, inside sticky window) ->
+# followup (term-less, tests re-engagement) -> offtopic (after, should be
+# clean under any mechanism). gold = loose API substring; fidelity = a
+# stricter syntax requirement that a degraded from-history answer might miss.
 SESSIONS: list[dict] = [
     {
-        "name": "internalbus",
+        "name": "internalbus_gap",
         "skills": ["InternalBus"],
         "turns": [
             {
@@ -95,59 +103,67 @@ SESSIONS: list[dict] = [
                 "term": "InternalBus",
                 "q": "Write code using InternalBus to publish a price update.",
                 "gold": "client.emit(",
-            },
-            {
-                "kind": "followup",
-                "term": "InternalBus",
-                "q": "Now also publish an order event the same way.",
-                "gold": "client.emit(",
-            },
-            {
-                "kind": "offtopic",
-                "term": None,
-                "q": "Write a function to reverse a string.",
-                "gold": None,
+                "fidelity": "ttl=",
             },
             {
                 "kind": "offtopic",
                 "term": None,
                 "q": "Write a function to validate an email address.",
                 "gold": None,
+                "fidelity": None,
+            },
+            {
+                "kind": "followup",
+                "term": "InternalBus",
+                "q": "Now do the same thing but for an order event instead.",
+                "gold": "client.emit(",
+                "fidelity": "ttl=",
+            },
+            {
+                "kind": "offtopic",
+                "term": None,
+                "q": "Write a function to compute the factorial of n.",
+                "gold": None,
+                "fidelity": None,
             },
         ],
     },
     {
-        "name": "ilp_for",
+        "name": "ilp_for_gap",
         "skills": ["ilp_for"],
         "turns": [
             {
                 "kind": "engage",
                 "term": "ilp_for",
                 "q": "Write a sum loop using ilp_for over doubles.",
-                "gold": "ILP_",
-            },
-            {
-                "kind": "followup",
-                "term": "ilp_for",
-                "q": "Now make a version that skips negative values.",
-                "gold": "ILP_",
+                "gold": "ILP_FOR",
+                "fidelity": "ILP_END",
             },
             {
                 "kind": "offtopic",
                 "term": None,
                 "q": "Write a function to check whether a number is prime.",
                 "gold": None,
+                "fidelity": None,
+            },
+            {
+                "kind": "followup",
+                "term": "ilp_for",
+                "q": "Go back and change that loop to skip negative values.",
+                "gold": "ILP_FOR",
+                "fidelity": "ILP_END",
             },
             {
                 "kind": "offtopic",
                 "term": None,
-                "q": "Write a function to parse an ISO date string into year, month, day.",
+                "q": "Write a function to parse an ISO date string.",
                 "gold": None,
+                "fidelity": None,
             },
         ],
     },
     {
-        "name": "fluentseq",
+        "name": "fluentseq_gap",
         "skills": ["FluentSeq"],
         "turns": [
             {
@@ -155,29 +171,33 @@ SESSIONS: list[dict] = [
                 "term": "FluentSeq",
                 "q": "Using FluentSeq, filter a list of numbers to the even ones then square them.",
                 "gold": "seq(",
-            },
-            {
-                "kind": "followup",
-                "term": "FluentSeq",
-                "q": "Now also sum the squared values.",
-                "gold": "seq(",
+                "fidelity": ".collect()",
             },
             {
                 "kind": "offtopic",
                 "term": None,
                 "q": "Write a function to reverse a string.",
                 "gold": None,
+                "fidelity": None,
+            },
+            {
+                "kind": "followup",
+                "term": "FluentSeq",
+                "q": "Now change that to also sum the squared values instead of collecting a list.",
+                "gold": "seq(",
+                "fidelity": None,
             },
             {
                 "kind": "offtopic",
                 "term": None,
                 "q": "Write a function that returns the factorial of n.",
                 "gold": None,
+                "fidelity": None,
             },
         ],
     },
     {
-        "name": "chronos",
+        "name": "chronos_gap",
         "skills": ["Chronos"],
         "turns": [
             {
@@ -185,65 +205,91 @@ SESSIONS: list[dict] = [
                 "term": "Chronos",
                 "q": "Using Chronos, schedule a cleanup task to run every 60 seconds.",
                 "gold": "chronos.every(",
-            },
-            {
-                "kind": "followup",
-                "term": "Chronos",
-                "q": "Now also schedule a one-off report to run at a given timestamp.",
-                "gold": "chronos.",
+                "fidelity": None,
             },
             {
                 "kind": "offtopic",
                 "term": None,
-                "q": "Write a function to sort a list of integers in ascending order.",
+                "q": "Write a function to sort a list of integers.",
                 "gold": None,
+                "fidelity": None,
+            },
+            {
+                "kind": "followup",
+                "term": "Chronos",
+                "q": "Now change that to run once at a specific timestamp instead of recurring.",
+                "gold": "chronos.at(",
+                "fidelity": None,
             },
             {
                 "kind": "offtopic",
                 "term": None,
                 "q": "Write a function to count the vowels in a string.",
                 "gold": None,
+                "fidelity": None,
             },
         ],
     },
     {
-        # Cross-skill routing: skill A (ilp_for) then skill B (InternalBus) in one
-        # conversation. Naming B must switch to B without firing A, and vice versa.
-        "name": "interleaved",
+        # Cross-skill: engaging B is the "distraction" for A's follow-up —
+        # tests re-engagement AND routing (must not misroute to B) together.
+        "name": "interleaved_gap",
         "skills": ["ilp_for", "InternalBus"],
         "turns": [
             {
                 "kind": "engage",
                 "term": "ilp_for",
                 "q": "Write a sum loop using ilp_for over doubles.",
-                "gold": "ILP_",
+                "gold": "ILP_FOR",
+                "fidelity": "ILP_END",
             },
             {
                 "kind": "engage",
                 "term": "InternalBus",
-                "q": "Now publish the resulting sum using InternalBus.",
+                "q": "Separately, write code using InternalBus to publish a price update.",
                 "gold": "client.emit(",
+                "fidelity": "ttl=",
             },
             {
                 "kind": "followup",
                 "term": "ilp_for",
-                "q": "Go back and make the loop skip negative values.",
-                "gold": "ILP_",
+                "q": "Go back to that loop and make it skip negative values.",
+                "gold": "ILP_FOR",
+                "fidelity": "ILP_END",
             },
             {
                 "kind": "offtopic",
                 "term": None,
                 "q": "Write a function to validate an email address.",
                 "gold": None,
+                "fidelity": None,
             },
         ],
     },
 ]
 
 
+def update_sticky_counters(
+    counters: dict[str, int], session_skills: list[str], current: set[str], k: int
+) -> dict[str, int]:
+    """Decay every skill's counter by 1, but reset to k for any skill named
+    this turn (reset, not additive — re-mention doesn't stack)."""
+    return {s: (k if s in current else max(0, counters.get(s, 0) - 1)) for s in session_skills}
+
+
+def active_terms_for_turn(
+    mechanism: str, session_skills: list[str], counters: dict[str, int], current: set[str]
+) -> tuple[list[str], dict[str, int]]:
+    """Which skills sit in the system block this turn, and the updated sticky
+    counters (unused/zero for strict-gated, which has no persistence state)."""
+    if mechanism == "strict-gated":
+        return [s for s in session_skills if s in current], counters
+    new_counters = update_sticky_counters(counters, session_skills, current, STICKY_K)
+    active = [s for s in session_skills if new_counters.get(s, 0) > 0]
+    return active, new_counters
+
+
 def build_system_body(terms: list[str], stance: bool) -> str:
-    """System-block body carrying each active skill's description, plus the
-    stance clause when requested. Empty -> a bare assistant system."""
     if not terms:
         return "You are a helpful coding assistant."
     body = "\n\n".join(f"About {t}:\n{SKILLS[t]['desc']}" for t in terms)
@@ -252,68 +298,89 @@ def build_system_body(terms: list[str], stance: bool) -> str:
     return body
 
 
-def active_terms_for_turn(
-    mechanism: str, session_skills: list[str], seen: set[str], current: set[str]
-) -> list[str]:
-    """Which skills' descriptions sit in the system block this turn.
-    term-gated: only those named this turn; persistent/stance: all seen so far.
-    Order follows session_skills for determinism."""
-    keep = current if mechanism == "term-gated" else seen
-    return [t for t in session_skills if t in keep]
+def _matched_skills(output: str, skills: list[str]) -> set[str]:
+    return {s for s in skills if SKILLS[s]["api_re"].search(output)}
 
 
-def _terms_named(q: str, session_skills: list[str]) -> set[str]:
-    low = q.lower()
-    return {t for t in session_skills if t.lower() in low}
+def score_turn(
+    output: str, t: dict, skills: list[str], skill_registry: dict
+) -> tuple[bool, str, set[str]]:
+    """Symmetric scoring: the same api_re match drives both engagement and
+    bleed detection, for every skill in the session. Returns (ok, tag, matched)."""
+    matched = {s for s in skills if skill_registry[s]["api_re"].search(output)}
 
+    if t["kind"] == "offtopic":
+        ok = not matched
+        tag = "clean" if ok else f"BLED:{','.join(sorted(matched))}"
+        return ok, tag, matched
 
-def _bled_skills(out: str, terms: list[str]) -> list[str]:
-    return [t for t in terms if SKILLS[t]["api_re"].search(out)]
+    target = t["term"]
+    gold_ok = t["gold"].lower() in output.lower()
+    fidelity_ok = t.get("fidelity") is None or t["fidelity"].lower() in output.lower()
+    api_ok = target in matched
+    misrouted = matched - {target}
+    ok = gold_ok and fidelity_ok and api_ok and not misrouted
+
+    if ok:
+        tag = "engaged"
+    elif misrouted:
+        tag = f"MISROUTE:{','.join(sorted(misrouted))}"
+    elif not fidelity_ok:
+        tag = "MISS(fidelity)"
+    else:
+        tag = "MISS"
+    return ok, tag, matched
 
 
 def _run_mechanism(model, tokenizer, mechanism: str, max_new: int) -> dict[str, tuple[int, int]]:  # noqa: ANN001
-    """Play every session under `mechanism`; return per-metric (correct, total)."""
     stop = im_end_id(tokenizer)
     tally = {k: [0, 0] for k in ("engage", "followup", "nobleed", "misroute")}
-    stance = mechanism == "stance"
+    stance = mechanism == "sticky-gated-k2-stance"
 
     print(f"\n--- {mechanism} ---")
     for sess in SESSIONS:
         skills = sess["skills"]
-        seen: set[str] = set()
+        counters: dict[str, int] = {}
         history: list[tuple[str, str]] = []
-        for t in sess["turns"]:
-            current = _terms_named(t["q"], skills)
-            seen |= current
-            body = build_system_body(
-                active_terms_for_turn(mechanism, skills, seen, current), stance
-            )
+        for turn_idx, t in enumerate(sess["turns"]):
+            current = {s for s in skills if s.lower() in t["q"].lower()}
+            active, counters = active_terms_for_turn(mechanism, skills, counters, current)
+            body = build_system_body(active, stance)
             kv = encode_chat_system_kv(model, tokenizer, body)
-            out = decode_with_kv(
-                model, tokenizer, kv, chat_multiturn_suffix(history, t["q"]), max_new, stop
-            )
+            live = chat_multiturn_suffix(history, t["q"])
+            out = decode_with_kv(model, tokenizer, kv, live, max_new, stop)
 
+            ok, tag, matched = score_turn(out, t, skills, SKILLS)
             if t["kind"] == "offtopic":
-                bled = _bled_skills(out, skills)
-                ok = not bled
                 tally["nobleed"][0] += int(ok)
                 tally["nobleed"][1] += 1
-                tag = "clean" if ok else f"BLED:{','.join(bled)}"
             else:
-                ok = skill_correct(out, t["gold"], SKILLS[t["term"]]["api_re"])
                 tally[t["kind"]][0] += int(ok)
                 tally[t["kind"]][1] += 1
-                others = [s for s in skills if s != t["term"]]
-                misrouted = _bled_skills(out, others)
-                tally["misroute"][0] += int(not misrouted)
+                tally["misroute"][0] += int(not (matched - {t["term"]}))
                 tally["misroute"][1] += 1
-                tag = ("engaged" if ok else "MISS") + (
-                    f" +MISROUTE:{','.join(misrouted)}" if misrouted else ""
-                )
 
             print(
-                f"    [{sess['name']:11} {t['kind']:8}] {tag:20} {out[:52].replace(chr(10), ' ')}"
+                f"    [{sess['name']:16} t{turn_idx} {t['kind']:8}] {tag:20} "
+                f"{out[:50].replace(chr(10), ' ')}"
             )
+            print(
+                "TURNJSON "
+                + json.dumps(
+                    {
+                        "mechanism": mechanism,
+                        "session": sess["name"],
+                        "turn": turn_idx,
+                        "kind": t["kind"],
+                        "active_skills": active,
+                        "ok": ok,
+                        "tag": tag,
+                        "matched": sorted(matched),
+                        "output": out,
+                    }
+                )
+            )
+
             history.append(("user", t["q"]))
             history.append(("assistant", out))
 
@@ -333,7 +400,7 @@ def main() -> None:
         print("=== SMOKE MODE ===")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {device}  model: {args.instruct_name}")
+    print(f"device: {device}  model: {args.instruct_name}  sticky_k: {STICKY_K}")
     print(f"sessions: {[s['name'] for s in SESSIONS]}\n")
 
     tokenizer = AutoTokenizer.from_pretrained(args.instruct_name)
@@ -348,15 +415,15 @@ def main() -> None:
     print("\n" + "=" * 78)
     print("SUMMARY  (engage/followup want the DSL; nobleed & misroute want it ABSENT)")
     print("=" * 78)
-    print(f"  {'mechanism':14} {'ENGAGE':>9} {'FOLLOWUP':>9} {'NO-BLEED':>9} {'MISROUTE-ok':>12}")
+    print(f"  {'mechanism':22} {'ENGAGE':>9} {'FOLLOWUP':>9} {'NO-BLEED':>9} {'MISROUTE-ok':>12}")
     for m in MECHANISMS:
         r = results[m]
         cells = " ".join(f"{f'{r[k][0]}/{r[k][1]}':>9}" for k in ("engage", "followup", "nobleed"))
         mr = r["misroute"]
-        print(f"  {m:14} {cells} {f'{mr[0]}/{mr[1]}':>12}")
+        print(f"  {m:22} {cells} {f'{mr[0]}/{mr[1]}':>12}")
 
-    print("\nGATE: a mechanism WINS if ENGAGE/FOLLOWUP stay high AND NO-BLEED + MISROUTE")
-    print("      are full. If none does, retrain learned-silence (Phase 4).")
+    print("\nGATE: a mechanism WINS if FOLLOWUP recovers (the strict-gating risk) AND")
+    print("      NO-BLEED/MISROUTE stay full (the sticky/stance risk).")
 
 
 if __name__ == "__main__":
