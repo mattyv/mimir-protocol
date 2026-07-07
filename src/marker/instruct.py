@@ -85,6 +85,34 @@ def chat_live_suffix(question: str, preamble: str | None) -> str:
     return f"{pre}{IM_END}\n{IM_START}user\n{question}{IM_END}\n{IM_START}assistant\n"
 
 
+def chat_multiturn_suffix(
+    history: list[tuple[str, str]], question: str, preamble: str | None = None
+) -> str:
+    """Live tokens for a multi-turn session continuing the open system block:
+    close the system (optionally after a preamble), replay prior turns as
+    user/assistant messages, then the current user turn + assistant generation
+    prompt. `history` is [(role, text), ...] with role in {'user','assistant'}
+    for turns that already happened."""
+    pre = f"\n{preamble}" if preamble else ""
+    parts = [f"{pre}{IM_END}\n"]
+    for role, text in history:
+        parts.append(f"{IM_START}{role}\n{text}{IM_END}\n")
+    parts.append(f"{IM_START}user\n{question}{IM_END}\n{IM_START}assistant\n")
+    return "".join(parts)
+
+
+def chat_system_open(body: str) -> str:
+    """A generic open chat system block carrying arbitrary `body` text (sink
+    first, left unclosed). Lets a caller build the disengagement variants
+    (skill / skill+stance / bare) without a bespoke prefix helper each."""
+    return f"{IM_START}system\n{body}\n"
+
+
+def encode_chat_system_kv(model, tokenizer, body: str) -> AxiomKV:  # noqa: ANN001
+    """KV for an open chat system block with arbitrary body text."""
+    return compute_axiom_kv(model, tokenizer, chat_system_open(body), term="")
+
+
 def encode_chat_axiom_kv(model, tokenizer, term: str, description: str) -> AxiomKV:  # noqa: ANN001
     """Compute the KV for the open chat system block (Phase 1 axiom carrier).
     term='' path of compute_axiom_kv encodes the text verbatim (no 'About X'
