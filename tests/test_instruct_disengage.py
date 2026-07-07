@@ -2,9 +2,8 @@
 
 The failure this eval targets: once a skill term appears in a chat session, its
 injected KV persists and the model over-applies the DSL on later, off-topic
-turns (the bleed we measured single-turn as NEGATIVE 0/2). These tests pin the
-multi-turn chat layout, the session shape (engage / follow-up / off-topic), and
-the per-mechanism system-text logic — no model needed.
+turns. These tests pin the multi-turn chat layout, the (now multi-skill)
+session shape, and the per-mechanism system-body logic — no model needed.
 """
 
 from __future__ import annotations
@@ -17,8 +16,10 @@ from marker.instruct import (
 )
 from marker.run_instruct_disengage import (
     SESSIONS,
+    SKILLS,
     STANCE,
-    disengage_system_text,
+    active_terms_for_turn,
+    build_system_body,
 )
 
 # ── Multi-turn chat layout ──────────────────────────────────────────────────────
@@ -29,7 +30,6 @@ def test_multiturn_suffix_closes_system_replays_history_and_adds_turn():
     assert s.startswith(f"{IM_END}\n")  # closes the open system block first
     assert f"{IM_START}user\nhi{IM_END}" in s
     assert f"{IM_START}assistant\nhello{IM_END}" in s
-    # current turn is last, ending on the assistant generation prompt
     assert s.rstrip().endswith(f"{IM_START}assistant")
     assert s.index("next?") > s.index("hello")  # current turn after history
 
@@ -47,52 +47,80 @@ def test_system_open_has_sink_and_is_left_open():
     assert IM_END not in p
 
 
-# ── Per-mechanism system text ───────────────────────────────────────────────────
+# ── System body construction ────────────────────────────────────────────────────
 
 
-def test_persistent_always_has_skill():
-    on = disengage_system_text("persistent", "ilp_for", "DESC", term_present=True)
-    off = disengage_system_text("persistent", "ilp_for", "DESC", term_present=False)
-    assert "DESC" in on and "DESC" in off  # skill present regardless of the turn
+def test_build_body_empty_is_bare_assistant():
+    b = build_system_body([], stance=False)
+    assert "About" not in b
+    assert STANCE not in b
 
 
-def test_term_gated_drops_skill_when_term_absent():
-    on = disengage_system_text("term-gated", "ilp_for", "DESC", term_present=True)
-    off = disengage_system_text("term-gated", "ilp_for", "DESC", term_present=False)
-    assert "DESC" in on
-    assert "DESC" not in off  # skill removed on a no-term turn
+def test_build_body_includes_each_active_skill_desc():
+    b = build_system_body(["ilp_for", "InternalBus"], stance=False)
+    assert "About ilp_for:" in b and "About InternalBus:" in b
+    assert STANCE not in b
 
 
-def test_stance_keeps_skill_and_adds_the_clause():
-    on = disengage_system_text("stance", "ilp_for", "DESC", term_present=True)
-    off = disengage_system_text("stance", "ilp_for", "DESC", term_present=False)
-    for body in (on, off):
-        assert "DESC" in body  # skill always present (like persistent)
-        assert STANCE in body  # + the "only when asked" clause
+def test_build_body_stance_appends_clause():
+    b = build_system_body(["ilp_for"], stance=True)
+    assert "About ilp_for:" in b
+    assert STANCE in b
+
+
+# ── Per-mechanism active-term selection ─────────────────────────────────────────
+
+
+def test_persistent_and_stance_use_all_seen_terms():
+    for mech in ("persistent", "stance"):
+        got = active_terms_for_turn(mech, session_skills=["A", "B"], seen={"A"}, current=set())
+        assert got == ["A"]  # seen so far, even though not named this turn
+
+
+def test_term_gated_uses_only_current_turn_terms():
+    got = active_terms_for_turn(
+        "term-gated", session_skills=["A", "B"], seen={"A", "B"}, current={"B"}
+    )
+    assert got == ["B"]  # only what the current turn names
+    off = active_terms_for_turn(
+        "term-gated", session_skills=["A", "B"], seen={"A", "B"}, current=set()
+    )
+    assert off == []  # no term this turn -> bare system
 
 
 # ── Session data hygiene ────────────────────────────────────────────────────────
 
 
-def test_sessions_have_engage_followup_and_offtopic_turns():
+def test_every_session_skill_is_registered_with_an_api_re():
     for sess in SESSIONS:
-        turns = sess["turns"]
-        kinds = [t["kind"] for t in turns]
-        assert "engage" in kinds and "followup" in kinds and "offtopic" in kinds
-        # engage turn names the term; followup and offtopic do NOT.
-        term = sess["term"].lower()
-        for t in turns:
-            named = term in t["q"].lower()
-            if t["kind"] == "engage":
-                assert named, f"{sess['term']}: engage turn must name the term"
-            else:
-                assert not named, f"{sess['term']}: {t['kind']} turn must not name the term"
+        for term in sess["skills"]:
+            assert term in SKILLS, f"{sess['name']}: unknown skill {term}"
+            assert SKILLS[term]["api_re"] is not None
 
 
-def test_engage_and_followup_want_the_dsl_offtopic_forbids_it():
+def test_sessions_have_engage_and_offtopic_turns():
+    for sess in SESSIONS:
+        kinds = {t["kind"] for t in sess["turns"]}
+        assert "engage" in kinds and "offtopic" in kinds, sess["name"]
+
+
+def test_engage_followup_name_their_target_offtopic_names_nothing():
     for sess in SESSIONS:
         for t in sess["turns"]:
             if t["kind"] in ("engage", "followup"):
-                assert t["gold"] is not None, "engage/followup must have a DSL gold"
-            else:
-                assert t["gold"] is None, "offtopic must be a no-bleed (gold=None) turn"
+                assert t["term"] in sess["skills"], f"{sess['name']}: bad target"
+                assert t["gold"] is not None
+                if t["kind"] == "engage":
+                    # an engage turn must name its target skill
+                    assert t["term"].lower() in t["q"].lower(), sess["name"]
+            else:  # offtopic
+                assert t["term"] is None and t["gold"] is None
+                # off-topic turns must not name ANY of the session's skills
+                for term in sess["skills"]:
+                    assert term.lower() not in t["q"].lower(), (
+                        f"{sess['name']}: offtopic names {term}"
+                    )
+
+
+def test_there_is_an_interleaved_two_skill_session():
+    assert any(len(s["skills"]) >= 2 for s in SESSIONS), "need a cross-skill routing session"

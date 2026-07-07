@@ -1,33 +1,30 @@
-"""Multi-turn skill DISENGAGEMENT on a chat model.
+"""Multi-turn skill DISENGAGEMENT on a chat model (hardening run).
 
 Phase 3 showed skills ENGAGE for free on 7B-Instruct (5/6 from the description
-alone, no MLP) but OVER-APPLY: a no-term request still emits the DSL (NEGATIVE
-0/2). Single-turn that's a proxy; the real blocker is multi-turn — once a skill
-term appears its injected KV persists, and later off-topic turns bleed the DSL.
+alone, no MLP) but OVER-APPLY: a no-term request still emits the DSL. The first
+multi-turn run confirmed the real bleed (persistent NO-BLEED 2/4) and that a
+one-sentence STANCE clause fixed it (2/2 / 2/2 / 4/4). This run hardens that
+result: 4 single-skill sessions (a bleedy general-purpose DSL + a narrow one
+added) with diversified off-topic turns, plus an INTERLEAVED two-skill session
+that tests cross-skill routing (naming skill B mid-session must switch off
+skill A, not fire both).
 
-This eval reproduces the real failure and pits three ZERO-TRAINING mechanisms
-against it. Each session is a 4-turn chat:
-    engage    — names the term, must ENGAGE the DSL
+Each session is a chat played turn-by-turn:
+    engage    — names a skill, must ENGAGE that skill's DSL
     followup  — no term, continues the topic, must STAY ENGAGED
-    offtopic  — no term, unrelated request, must NOT bleed the DSL (x2)
+    offtopic  — no term, unrelated request, must NOT bleed ANY session skill
 
 Mechanisms (what sits in the injected system block each turn):
-    persistent  — skill description always present (today's behavior; bleeds)
-    term-gated  — skill present only on turns naming the term (kills bleed but
-                  risks killing the follow-up — history still carries the DSL)
-    stance      — skill always present + a one-sentence "use only when asked"
-                  clause (the cheap hoped-for fix)
+    persistent  — every skill seen so far in the session (today's behavior)
+    term-gated  — only skills named in the current turn (bare system otherwise)
+    stance      — all-seen skills + a one-sentence "use only when asked" clause
 
-The crux: term-gating and stance both must hold FOLLOWUP (engaged) and OFFTOPIC
-(clean) apart. If stance does, disengagement is solved with no training — same
-shape as the fact result. If nothing does, that's the signal to retrain the
-learned-silence MLP against the chat model (Phase 4).
+Metrics: ENGAGE / FOLLOWUP (want the target DSL) ; NO-BLEED (offtopic: no
+session DSL present) ; MISROUTE (on an engage/followup turn, a NON-target
+session skill's DSL leaked — only interleaved sessions can misroute).
 
 Faithful behavioral proxy: each turn is re-prefilled with the full conversation
-(system KV + replayed history + current turn), fresh cache. That captures
-whether the skill is in-context for the turn, which is all that drives
-engage-vs-bleed — the session-cache persistence/RoPE mechanics are a runtime
-optimization, not a behavioral factor. Instruct-only (chat is the target).
+(system KV + replayed history + current turn), fresh cache. Instruct-only.
 
 Run (GPU):
     PYTHONPATH=src python -m marker.run_instruct_disengage \
@@ -39,6 +36,7 @@ Smoke (local):
 from __future__ import annotations
 
 import argparse
+import re
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -60,49 +58,182 @@ STANCE = (
 
 MECHANISMS = ["persistent", "term-gated", "stance"]
 
+# ── Two new skills for the hardening run ────────────────────────────────────────
+# FluentSeq: a BLEEDY general-purpose collection DSL — map/filter/reduce fit
+# almost any data task, so it is the acid test for over-application.
+FLUENTSEQ_DESC = (
+    "FluentSeq is a fictional fluent collection library. Wrap any iterable with "
+    "seq(x), then chain: .map(fn), .filter(pred), .reduce(fn, init), .reverse(), "
+    ".take(n); terminal .collect() materializes a list. "
+    "Example: seq(nums).filter(is_even).map(square).collect()."
+)
+FLUENTSEQ_API_RE = re.compile(r"seq\([^)]*\)\.\w+")
+
+# Chronos: a NARROW scheduling DSL — should rarely bleed (few tasks look like
+# scheduling), the counterpart to InternalBus.
+CHRONOS_DESC = (
+    "Chronos is a fictional job scheduler. Recurring: chronos.every(seconds, task). "
+    "One-shot at a Unix timestamp: chronos.at(ts, task). Cancel by handle: "
+    "chronos.cancel(handle). Tasks are zero-arg callables."
+)
+CHRONOS_API_RE = re.compile(r"chronos\.(every|at|cancel)\(")
+
+SKILLS: dict[str, dict] = {
+    "InternalBus": {"desc": SKILL_AXIOM["description"], "api_re": INTERNALBUS_API_RE},
+    "ilp_for": {"desc": SKILL_AXIOM_ILP["description"], "api_re": ILP_API_RE},
+    "FluentSeq": {"desc": FLUENTSEQ_DESC, "api_re": FLUENTSEQ_API_RE},
+    "Chronos": {"desc": CHRONOS_DESC, "api_re": CHRONOS_API_RE},
+}
+
 SESSIONS: list[dict] = [
     {
-        "term": "InternalBus",
-        "desc": SKILL_AXIOM["description"],
-        "api_re": INTERNALBUS_API_RE,
+        "name": "internalbus",
+        "skills": ["InternalBus"],
         "turns": [
             {
                 "kind": "engage",
+                "term": "InternalBus",
                 "q": "Write code using InternalBus to publish a price update.",
                 "gold": "client.emit(",
             },
             {
                 "kind": "followup",
+                "term": "InternalBus",
                 "q": "Now also publish an order event the same way.",
                 "gold": "client.emit(",
             },
-            {"kind": "offtopic", "q": "Write a function to reverse a string.", "gold": None},
             {
                 "kind": "offtopic",
-                "q": "Write a function to compute the factorial of n.",
+                "term": None,
+                "q": "Write a function to reverse a string.",
+                "gold": None,
+            },
+            {
+                "kind": "offtopic",
+                "term": None,
+                "q": "Write a function to validate an email address.",
                 "gold": None,
             },
         ],
     },
     {
-        "term": "ilp_for",
-        "desc": SKILL_AXIOM_ILP["description"],
-        "api_re": ILP_API_RE,
+        "name": "ilp_for",
+        "skills": ["ilp_for"],
         "turns": [
             {
                 "kind": "engage",
+                "term": "ilp_for",
                 "q": "Write a sum loop using ilp_for over doubles.",
                 "gold": "ILP_",
             },
             {
                 "kind": "followup",
+                "term": "ilp_for",
                 "q": "Now make a version that skips negative values.",
                 "gold": "ILP_",
             },
-            {"kind": "offtopic", "q": "Write a function to reverse a string.", "gold": None},
             {
                 "kind": "offtopic",
+                "term": None,
                 "q": "Write a function to check whether a number is prime.",
+                "gold": None,
+            },
+            {
+                "kind": "offtopic",
+                "term": None,
+                "q": "Write a function to parse an ISO date string into year, month, day.",
+                "gold": None,
+            },
+        ],
+    },
+    {
+        "name": "fluentseq",
+        "skills": ["FluentSeq"],
+        "turns": [
+            {
+                "kind": "engage",
+                "term": "FluentSeq",
+                "q": "Using FluentSeq, filter a list of numbers to the even ones then square them.",
+                "gold": "seq(",
+            },
+            {
+                "kind": "followup",
+                "term": "FluentSeq",
+                "q": "Now also sum the squared values.",
+                "gold": "seq(",
+            },
+            {
+                "kind": "offtopic",
+                "term": None,
+                "q": "Write a function to reverse a string.",
+                "gold": None,
+            },
+            {
+                "kind": "offtopic",
+                "term": None,
+                "q": "Write a function that returns the factorial of n.",
+                "gold": None,
+            },
+        ],
+    },
+    {
+        "name": "chronos",
+        "skills": ["Chronos"],
+        "turns": [
+            {
+                "kind": "engage",
+                "term": "Chronos",
+                "q": "Using Chronos, schedule a cleanup task to run every 60 seconds.",
+                "gold": "chronos.every(",
+            },
+            {
+                "kind": "followup",
+                "term": "Chronos",
+                "q": "Now also schedule a one-off report to run at a given timestamp.",
+                "gold": "chronos.",
+            },
+            {
+                "kind": "offtopic",
+                "term": None,
+                "q": "Write a function to sort a list of integers in ascending order.",
+                "gold": None,
+            },
+            {
+                "kind": "offtopic",
+                "term": None,
+                "q": "Write a function to count the vowels in a string.",
+                "gold": None,
+            },
+        ],
+    },
+    {
+        # Cross-skill routing: skill A (ilp_for) then skill B (InternalBus) in one
+        # conversation. Naming B must switch to B without firing A, and vice versa.
+        "name": "interleaved",
+        "skills": ["ilp_for", "InternalBus"],
+        "turns": [
+            {
+                "kind": "engage",
+                "term": "ilp_for",
+                "q": "Write a sum loop using ilp_for over doubles.",
+                "gold": "ILP_",
+            },
+            {
+                "kind": "engage",
+                "term": "InternalBus",
+                "q": "Now publish the resulting sum using InternalBus.",
+                "gold": "client.emit(",
+            },
+            {
+                "kind": "followup",
+                "term": "ilp_for",
+                "q": "Go back and make the loop skip negative values.",
+                "gold": "ILP_",
+            },
+            {
+                "kind": "offtopic",
+                "term": None,
+                "q": "Write a function to validate an email address.",
                 "gold": None,
             },
         ],
@@ -110,52 +241,79 @@ SESSIONS: list[dict] = [
 ]
 
 
-def disengage_system_text(mechanism: str, term: str, desc: str, term_present: bool) -> str:
-    """The system-block body for a turn under `mechanism`. `term_present` is
-    whether the current user message names the skill term."""
-    skill = f"About {term}:\n{desc}"
-    bare = "You are a helpful coding assistant."
-    if mechanism == "persistent":
-        return skill
-    if mechanism == "term-gated":
-        return skill if term_present else bare
-    if mechanism == "stance":
-        return f"{skill}\n{STANCE}"
-    raise ValueError(f"unknown mechanism {mechanism!r}")
+def build_system_body(terms: list[str], stance: bool) -> str:
+    """System-block body carrying each active skill's description, plus the
+    stance clause when requested. Empty -> a bare assistant system."""
+    if not terms:
+        return "You are a helpful coding assistant."
+    body = "\n\n".join(f"About {t}:\n{SKILLS[t]['desc']}" for t in terms)
+    if stance:
+        body += "\n" + STANCE
+    return body
 
 
-def _run_mechanism(
-    model,  # noqa: ANN001
-    tokenizer,  # noqa: ANN001
-    mechanism: str,
-    max_new: int,
-) -> dict[str, tuple[int, int]]:
-    """Play every session turn-by-turn under `mechanism`; return
-    {'engage': (c,t), 'followup': (c,t), 'nobleed': (c,t)}."""
+def active_terms_for_turn(
+    mechanism: str, session_skills: list[str], seen: set[str], current: set[str]
+) -> list[str]:
+    """Which skills' descriptions sit in the system block this turn.
+    term-gated: only those named this turn; persistent/stance: all seen so far.
+    Order follows session_skills for determinism."""
+    keep = current if mechanism == "term-gated" else seen
+    return [t for t in session_skills if t in keep]
+
+
+def _terms_named(q: str, session_skills: list[str]) -> set[str]:
+    low = q.lower()
+    return {t for t in session_skills if t.lower() in low}
+
+
+def _bled_skills(out: str, terms: list[str]) -> list[str]:
+    return [t for t in terms if SKILLS[t]["api_re"].search(out)]
+
+
+def _run_mechanism(model, tokenizer, mechanism: str, max_new: int) -> dict[str, tuple[int, int]]:  # noqa: ANN001
+    """Play every session under `mechanism`; return per-metric (correct, total)."""
     stop = im_end_id(tokenizer)
-    tally = {"engage": [0, 0], "followup": [0, 0], "nobleed": [0, 0]}
+    tally = {k: [0, 0] for k in ("engage", "followup", "nobleed", "misroute")}
+    stance = mechanism == "stance"
 
     print(f"\n--- {mechanism} ---")
     for sess in SESSIONS:
-        term, desc, api_re = sess["term"], sess["desc"], sess["api_re"]
+        skills = sess["skills"]
+        seen: set[str] = set()
         history: list[tuple[str, str]] = []
         for t in sess["turns"]:
-            term_present = term.lower() in t["q"].lower()
-            body = disengage_system_text(mechanism, term, desc, term_present)
+            current = _terms_named(t["q"], skills)
+            seen |= current
+            body = build_system_body(
+                active_terms_for_turn(mechanism, skills, seen, current), stance
+            )
             kv = encode_chat_system_kv(model, tokenizer, body)
-            live = chat_multiturn_suffix(history, t["q"])
-            out = decode_with_kv(model, tokenizer, kv, live, max_new, stop)
+            out = decode_with_kv(
+                model, tokenizer, kv, chat_multiturn_suffix(history, t["q"]), max_new, stop
+            )
 
-            ok = skill_correct(out, t["gold"], api_re)
-            metric = "nobleed" if t["kind"] == "offtopic" else t["kind"]
-            tally[metric][0] += int(ok)
-            tally[metric][1] += 1
             if t["kind"] == "offtopic":
-                tag = "clean" if ok else "BLED"
+                bled = _bled_skills(out, skills)
+                ok = not bled
+                tally["nobleed"][0] += int(ok)
+                tally["nobleed"][1] += 1
+                tag = "clean" if ok else f"BLED:{','.join(bled)}"
             else:
-                tag = "engaged" if ok else "MISS"
-            print(f"    [{term:11} {t['kind']:8}] {tag:8} {out[:60].replace(chr(10), ' ')}")
+                ok = skill_correct(out, t["gold"], SKILLS[t["term"]]["api_re"])
+                tally[t["kind"]][0] += int(ok)
+                tally[t["kind"]][1] += 1
+                others = [s for s in skills if s != t["term"]]
+                misrouted = _bled_skills(out, others)
+                tally["misroute"][0] += int(not misrouted)
+                tally["misroute"][1] += 1
+                tag = ("engaged" if ok else "MISS") + (
+                    f" +MISROUTE:{','.join(misrouted)}" if misrouted else ""
+                )
 
+            print(
+                f"    [{sess['name']:11} {t['kind']:8}] {tag:20} {out[:52].replace(chr(10), ' ')}"
+            )
             history.append(("user", t["q"]))
             history.append(("assistant", out))
 
@@ -176,7 +334,7 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}  model: {args.instruct_name}")
-    print(f"sessions: {[s['term'] for s in SESSIONS]}\n")
+    print(f"sessions: {[s['name'] for s in SESSIONS]}\n")
 
     tokenizer = AutoTokenizer.from_pretrained(args.instruct_name)
     model = (
@@ -187,16 +345,18 @@ def main() -> None:
 
     results = {m: _run_mechanism(model, tokenizer, m, args.max_new) for m in MECHANISMS}
 
-    print("\n" + "=" * 70)
-    print("SUMMARY  (engage/followup want the DSL; nobleed wants it ABSENT)")
-    print("=" * 70)
-    print(f"  {'mechanism':14} {'ENGAGE':>10} {'FOLLOWUP':>10} {'NO-BLEED':>10}")
+    print("\n" + "=" * 78)
+    print("SUMMARY  (engage/followup want the DSL; nobleed & misroute want it ABSENT)")
+    print("=" * 78)
+    print(f"  {'mechanism':14} {'ENGAGE':>9} {'FOLLOWUP':>9} {'NO-BLEED':>9} {'MISROUTE-ok':>12}")
     for m in MECHANISMS:
-        e, f, n = results[m]["engage"], results[m]["followup"], results[m]["nobleed"]
-        print(f"  {m:14} {f'{e[0]}/{e[1]}':>10} {f'{f[0]}/{f[1]}':>10} {f'{n[0]}/{n[1]}':>10}")
+        r = results[m]
+        cells = " ".join(f"{f'{r[k][0]}/{r[k][1]}':>9}" for k in ("engage", "followup", "nobleed"))
+        mr = r["misroute"]
+        print(f"  {m:14} {cells} {f'{mr[0]}/{mr[1]}':>12}")
 
-    print("\nGATE: a mechanism WINS if ENGAGE and FOLLOWUP stay high AND NO-BLEED")
-    print("      recovers to full. If none does, retrain learned-silence (Phase 4).")
+    print("\nGATE: a mechanism WINS if ENGAGE/FOLLOWUP stay high AND NO-BLEED + MISROUTE")
+    print("      are full. If none does, retrain learned-silence (Phase 4).")
 
 
 if __name__ == "__main__":
