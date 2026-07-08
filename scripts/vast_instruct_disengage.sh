@@ -30,9 +30,9 @@ echo "=== pip ==="
 pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' sentencepiece 2>&1 | tail -3
 python -c "import torch,transformers; print('CUDA', torch.cuda.is_available(), 'tf', transformers.__version__)"
 echo "=== run ==="
-PYTHONPATH=src python -m marker.run_instruct_disengage \
+PYTHONPATH=src python -u -m marker.run_instruct_disengage \
   --instruct-name Qwen/Qwen2.5-7B-Instruct \
-  --max-new 200 2>&1 | tee /root/disengage.log
+  --max-new 150 2>&1 | tee /root/disengage.log
 echo "EXITRC=${PIPESTATUS[0]}" | tee -a /root/disengage.log
 echo "ALLDONE" | tee -a /root/disengage.log
 EOS
