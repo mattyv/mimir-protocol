@@ -269,24 +269,35 @@ SESSIONS: list[dict] = [
 ]
 
 
-def update_sticky_counters(
-    counters: dict[str, int], session_skills: list[str], current: set[str], k: int
-) -> dict[str, int]:
-    """Decay every skill's counter by 1, but reset to k for any skill named
-    this turn (reset, not additive — re-mention doesn't stack)."""
-    return {s: (k if s in current else max(0, counters.get(s, 0) - 1)) for s in session_skills}
-
-
 def active_terms_for_turn(
-    mechanism: str, session_skills: list[str], counters: dict[str, int], current: set[str]
+    mechanism: str,
+    session_skills: list[str],
+    last_seen: dict[str, int],
+    turn_idx: int,
+    current: set[str],
 ) -> tuple[list[str], dict[str, int]]:
-    """Which skills sit in the system block this turn, and the updated sticky
-    counters (unused/zero for strict-gated, which has no persistence state)."""
+    """Which skills sit in the system block this turn, and the updated
+    last-seen turn-index map (unused for strict-gated, which has no
+    persistence state).
+
+    Sticky activity is distance-since-last-mention (turn_idx - last_seen[s]
+    <= STICKY_K), not a decrementing counter — a decrement-then-check counter
+    consumes one unit of "grace" on the very turn it's meant to cover, so
+    K=2 only ever survives 1 silent turn, not 2 (an off-by-one that made a
+    real run indistinguishable from strict-gated at the turn that mattered).
+    Distance-based has no such boundary error: K=2 means active for turns at
+    distance 0, 1, AND 2 from the mention, evicted only at distance K+1."""
+    new_last_seen = dict(last_seen)
+    for s in current:
+        new_last_seen[s] = turn_idx
+
     if mechanism == "strict-gated":
-        return [s for s in session_skills if s in current], counters
-    new_counters = update_sticky_counters(counters, session_skills, current, STICKY_K)
-    active = [s for s in session_skills if new_counters.get(s, 0) > 0]
-    return active, new_counters
+        return [s for s in session_skills if s in current], new_last_seen
+
+    active = [
+        s for s in session_skills if s in new_last_seen and turn_idx - new_last_seen[s] <= STICKY_K
+    ]
+    return active, new_last_seen
 
 
 def build_system_body(terms: list[str], stance: bool) -> str:
@@ -340,11 +351,13 @@ def _run_mechanism(model, tokenizer, mechanism: str, max_new: int) -> dict[str, 
     print(f"\n--- {mechanism} ---")
     for sess in SESSIONS:
         skills = sess["skills"]
-        counters: dict[str, int] = {}
+        last_seen: dict[str, int] = {}
         history: list[tuple[str, str]] = []
         for turn_idx, t in enumerate(sess["turns"]):
             current = {s for s in skills if s.lower() in t["q"].lower()}
-            active, counters = active_terms_for_turn(mechanism, skills, counters, current)
+            active, last_seen = active_terms_for_turn(
+                mechanism, skills, last_seen, turn_idx, current
+            )
             body = build_system_body(active, stance)
             kv = encode_chat_system_kv(model, tokenizer, body)
             live = chat_multiturn_suffix(history, t["q"])
@@ -364,6 +377,11 @@ def _run_mechanism(model, tokenizer, mechanism: str, max_new: int) -> dict[str, 
                 f"    [{sess['name']:16} t{turn_idx} {t['kind']:8}] {tag:20} "
                 f"{out[:50].replace(chr(10), ' ')}"
             )
+            # Capped at 400 chars: the vastai-logs capture channel hard-wraps
+            # around col ~490 (a pty artifact), which corrupts a JSON string
+            # mid-escape when the full untruncated text is dumped. 400 stays
+            # safely under that while still showing far more than the 50-char
+            # preview — enough to see whether a fidelity marker appears.
             print(
                 "TURNJSON "
                 + json.dumps(
@@ -376,7 +394,7 @@ def _run_mechanism(model, tokenizer, mechanism: str, max_new: int) -> dict[str, 
                         "ok": ok,
                         "tag": tag,
                         "matched": sorted(matched),
-                        "output": out,
+                        "output": out[:400],
                     }
                 )
             )

@@ -28,7 +28,6 @@ from marker.run_instruct_disengage import (
     active_terms_for_turn,
     build_system_body,
     score_turn,
-    update_sticky_counters,
 )
 
 # ── Multi-turn chat layout (unchanged machinery) ────────────────────────────────
@@ -49,66 +48,64 @@ def test_system_open_has_sink_and_is_left_open():
     assert IM_END not in p
 
 
-# ── Sticky counter logic (the new mechanism) ────────────────────────────────────
-
-
-def test_mention_resets_counter_to_k():
-    counters = update_sticky_counters({}, ["A", "B"], {"A"}, k=STICKY_K)
-    assert counters["A"] == STICKY_K
-    assert counters["B"] == 0
-
-
-def test_counter_decays_by_one_when_not_mentioned():
-    counters = update_sticky_counters({"A": 2, "B": 0}, ["A", "B"], set(), k=2)
-    assert counters["A"] == 1
-    assert counters["B"] == 0  # can't go negative
-
-
-def test_counter_refreshes_to_k_on_re_mention_not_incremented():
-    counters = update_sticky_counters({"A": 1}, ["A"], {"A"}, k=2)
-    assert counters["A"] == 2  # reset, not 1+1
-
-
-# ── Active-term selection per mechanism ─────────────────────────────────────────
+# ── Sticky activation: distance-since-last-mention (no decrementing counter,
+# so there is no off-by-one between "K turns of grace" and "K decrements") ──────
 
 
 def test_strict_gated_only_current_turn_terms():
-    active, counters = active_terms_for_turn(
-        "strict-gated", session_skills=["A", "B"], counters={"A": 2}, current={"B"}
+    active, last_seen = active_terms_for_turn(
+        "strict-gated", session_skills=["A", "B"], last_seen={"A": 0}, turn_idx=3, current={"B"}
     )
     assert active == ["B"]  # A's leftover sticky state (if any) is irrelevant to strict
 
 
-def test_sticky_gated_active_while_counter_positive():
-    active, counters = active_terms_for_turn(
-        "sticky-gated-k2", session_skills=["A", "B"], counters={}, current={"A"}
+def test_sticky_gated_active_on_mention_turn():
+    active, last_seen = active_terms_for_turn(
+        "sticky-gated-k2", session_skills=["A"], last_seen={}, turn_idx=0, current={"A"}
     )
-    assert active == ["A"] and counters["A"] == STICKY_K
-
-    # one turn later, not mentioned: still active (counter decayed but > 0)
-    active2, counters2 = active_terms_for_turn(
-        "sticky-gated-k2", session_skills=["A", "B"], counters=counters, current=set()
-    )
-    assert active2 == ["A"] and counters2["A"] == STICKY_K - 1
+    assert active == ["A"] and last_seen["A"] == 0
 
 
-def test_sticky_gated_evicts_after_k_silent_turns():
-    counters = {"A": 1}
-    for _ in range(1):
-        active, counters = active_terms_for_turn(
-            "sticky-gated-k2", session_skills=["A"], counters=counters, current=set()
+def test_sticky_gated_survives_k_silent_turns_after_mention():
+    # Mentioned at turn 0 with K=2: must stay active through turns 1 AND 2
+    # (distance 1 and 2, both <= K), evicted only at turn 3 (distance 3 > K).
+    last_seen = {"A": 0}
+    for turn_idx in (1, 2):
+        active, last_seen = active_terms_for_turn(
+            "sticky-gated-k2",
+            session_skills=["A"],
+            last_seen=last_seen,
+            turn_idx=turn_idx,
+            current=set(),
         )
-    assert active == []  # counter hit 0 -> evicted
+        assert active == ["A"], f"turn {turn_idx}: expected still active within K={STICKY_K}"
+
+    active, last_seen = active_terms_for_turn(
+        "sticky-gated-k2", session_skills=["A"], last_seen=last_seen, turn_idx=3, current=set()
+    )
+    assert active == []  # distance 3 > K=2 -> evicted
+
+
+def test_re_mention_resets_the_distance():
+    last_seen = {"A": 0}
+    active, last_seen = active_terms_for_turn(
+        "sticky-gated-k2", session_skills=["A"], last_seen=last_seen, turn_idx=2, current={"A"}
+    )
+    assert active == ["A"] and last_seen["A"] == 2  # distance reset to 0 as of turn 2
+    active2, _ = active_terms_for_turn(
+        "sticky-gated-k2", session_skills=["A"], last_seen=last_seen, turn_idx=4, current=set()
+    )
+    assert active2 == ["A"]  # distance from the re-mention (2) is only 2, still <= K
 
 
 def test_sticky_with_stance_uses_the_same_active_set_as_sticky():
-    a1, c1 = active_terms_for_turn(
-        "sticky-gated-k2", session_skills=["A"], counters={}, current={"A"}
+    a1, ls1 = active_terms_for_turn(
+        "sticky-gated-k2", session_skills=["A"], last_seen={}, turn_idx=0, current={"A"}
     )
-    a2, c2 = active_terms_for_turn(
-        "sticky-gated-k2-stance", session_skills=["A"], counters={}, current={"A"}
+    a2, ls2 = active_terms_for_turn(
+        "sticky-gated-k2-stance", session_skills=["A"], last_seen={}, turn_idx=0, current={"A"}
     )
-    assert a1 == a2 and c1 == c2
+    assert a1 == a2 and ls1 == ls2
 
 
 # ── System body ──────────────────────────────────────────────────────────────────

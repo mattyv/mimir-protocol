@@ -32,7 +32,7 @@ python -c "import torch,transformers; print('CUDA', torch.cuda.is_available(), '
 echo "=== run ==="
 PYTHONPATH=src python -u -m marker.run_instruct_disengage \
   --instruct-name Qwen/Qwen2.5-7B-Instruct \
-  --max-new 150 2>&1 | tee /root/disengage.log
+  --max-new 200 2>&1 | tee /root/disengage.log
 echo "EXITRC=${PIPESTATUS[0]}" | tee -a /root/disengage.log
 echo "ALLDONE" | tee -a /root/disengage.log
 EOS
