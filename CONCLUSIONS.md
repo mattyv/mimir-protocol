@@ -729,3 +729,68 @@ frozen LLM." For that, the practical answer remains a hybrid: vector
 injection where it works (operational queries, novel-name axioms),
 weight-level adaptation (LoRA) where it doesn't, and structural
 prompt design as a third lever.
+
+## 2026-07 update — instruct-model portability: facts free, skills need symmetric engage/disengage
+
+Phase 1 (facts) inverted the working hypothesis: Qwen2.5-7B-Instruct recalls
+injected facts perfectly (20/20 HELDOUT) with zero preamble and zero
+training. RLHF refusal, feared as the failure mode, turned out to be a
+BOUNDARY asset (instruct declines out-of-scope 5-6/6; base hallucinates 0/6).
+
+Phase 3 (skills) showed the same free-engagement pattern — a chat model
+picks up an injected DSL from the description alone, no worked examples, no
+MLP — but single-turn testing surfaced a new failure: **over-application**.
+A no-term request still emitted the DSL (bleed). Multi-turn testing showed
+this is a real, persistent-session problem: once a skill's KV is injected it
+doesn't know when to leave.
+
+**The fix is symmetric with how the skill engages: control KV *presence*, not
+prompt wording.** A stance clause ("use only when asked") alone was
+unreliable — a bleedy DSL whose method name collided with the off-topic verb
+(`FluentSeq.reverse()` vs "reverse a string") still leaked even with the
+clause present, because the KV was still in-context regardless of what the
+system prompt said about it.
+
+Two presence-control mechanisms, tested on a battery of engage -> offtopic
+(distraction) -> followup (term-less) -> offtopic sessions, 7B-Instruct:
+
+- **strict-gated** — skill KV present only on turns naming it. Zero bleed
+  risk (NO-BLEED 9/9) but can miss a term-less follow-up if the model can't
+  recover purely from conversation history.
+- **sticky-gated(K=2)** — KV persists for K turns after the last mention
+  (distance-since-mention, not a decrementing counter — a decrement-based
+  counter has an off-by-one that evicts one turn too early; caught by a
+  failing test before the second Vast run, not after).
+
+Confirmed empirically: `chronos_gap`'s term-less follow-up ("now run it once
+at a timestamp instead of recurring") succeeded under sticky-gated but
+**missed under strict-gated** — the clean positive case for persistence.
+`fluentseq_gap` and `chronos_gap` both **bled during the sticky retention
+window** (the offtopic turn right after engaging) — the clean positive case
+for the risk. Adding the stance clause on top of sticky recovered one more
+follow-up (2/5 vs 1/5) without closing the bleed gap.
+
+**Read for the runtime:** skill disengagement is a presence/eviction
+problem, not a prompting problem — the same mechanism that decides when to
+hydrate an axiom's KV also decides when to evict it. A stance clause is a
+cheap secondary aid, not a substitute. Net-new primitive needed: eviction
+(facts never needed it, since a fact stays true all session; skills need to
+turn off). Open, unresolved: a session-wide "strict-only" policy has a
+recovery gap on returning follow-ups; sticky closes it at the cost of a
+bleed window; the right default (and whether K should vary by DSL
+bleediness) is unmeasured beyond this one battery.
+
+**Caveats:** 7B not 32B; small n (5 sessions); two probes (InternalBus
+`ttl=`, ilp_for-follow-up `ILP_END`) missed their syntax-fidelity gold under
+every mechanism, including strict-gated turn 0 — a verbosity/probe-design
+issue independent of the gating mechanism, not evidence against any
+mechanism. `interleaved_gap`'s follow-up failed under both sticky variants
+despite the target skill being nominally active — plausibly multi-skill
+crowding (two skills simultaneously warm) interfering with exact syntax at
+the moment of re-engagement; unconfirmed, would need a dedicated probe.
+Infra note: the `vastai logs` capture channel hard-wraps around column
+~490, corrupting attempts to dump full untruncated generations as one-line
+JSON; short (<50 char) preview lines survive intact and were the basis for
+the per-turn read above — full-fidelity output capture from a Vast run
+needs a different channel (e.g. write results to a file and fetch it some
+other way) if ever required again.
