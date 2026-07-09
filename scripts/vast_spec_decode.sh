@@ -24,8 +24,10 @@ echo "=== clone ==="
 git clone --branch claude/project-review-6rx97z --single-branch https://github.com/mattyv/mimir-protocol.git 2>&1 | tail -3
 cd /root/mimir-protocol
 echo "=== pip ==="
-pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' sentencepiece 2>&1 | tail -3
-python -c "import torch,transformers; print('CUDA', torch.cuda.is_available(), 'tf', transformers.__version__)"
+pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' sentencepiece 2>&1 | tail -3 \
+  || { sleep 20; pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' sentencepiece 2>&1 | tail -3; }
+python -c "import torch,transformers; print('CUDA', torch.cuda.is_available(), 'tf', transformers.__version__)" \
+  || { echo "SETUPFAIL"; echo "ALLDONE"; exit 1; }
 echo "=== run ==="
 PYTHONPATH=src python -u -m marker.run_spec_decode \
   --verifier Qwen/Qwen2.5-7B --drafter Qwen/Qwen2.5-0.5B \
