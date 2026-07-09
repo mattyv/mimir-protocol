@@ -46,8 +46,15 @@ echo "XCHECK_RC=${PIPESTATUS[0]}" | tee -a /root/stage0.log
 echo "ALLDONE" | tee -a /root/stage0.log
 EOS
 
-echo "→ Creating instance..."
+# HF_TOKEN (if set in the launching shell) is injected as a container env var
+# so huggingface_hub authenticates downloads (higher rate limits than anon).
+# Read from the environment ONLY — never hardcoded here. Fine-grained,
+# repo-scoped, disposable; revoke after the campaign.
+ENV_ARG=""
+[ -n "${HF_TOKEN:-}" ] && ENV_ARG="-e HF_TOKEN=${HF_TOKEN}"
+
+echo "→ Creating instance...${HF_TOKEN:+ (HF auth on)}"
 INSTANCE_ID=$(vastai create instance "$OFFER_ID" \
-  --image "$IMAGE" --disk "$DISK_GB" --onstart-cmd "$ONSTART" --raw 2>/dev/null | \
+  --image "$IMAGE" --disk "$DISK_GB" --onstart-cmd "$ONSTART" --env "$ENV_ARG" --raw 2>/dev/null | \
   python3 -c "import sys,json; print(json.load(sys.stdin)['new_contract'])")
 echo "INSTANCE $INSTANCE_ID"
