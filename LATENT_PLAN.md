@@ -28,10 +28,10 @@ training, multi-day runs) — those need a top-up and different infra.
 
 | # | step | mechanism | cost | gate |
 |---|------|-----------|------|------|
-| 1 | Spec-decode baseline | specdec.py, 0.5B drafts / 7B verifies, gamma sweep | ~$0.25 | mechanics + acceptance floor |
-| 2 | Stage 0 drift budget | soft-token feedback (softloop.py), snap-period sweep k∈{1,2,4,8,16,32,∞} on 7B | ~$1 | spec's own gate: drift budget k<2-3 ⇒ redesign before any training |
+| 1 | Spec-decode baseline — **DONE 2026-07-09** | specdec.py, 0.5B drafts / 7B verifies, gamma sweep | ~$0.55 actual (2 dud nodes) | tokens/pass 3.6-7.6 (drafter-inclusive speedup ~2.8-3.6x at 7B); acceptance workload-shaped: SQL 1.00, prose 0.10-0.31 — the floor gist-conditioning must lift. Identity 4/6, consistent-token numerics, prefill cross-check pending. |
+| 2 | Stage 0 drift budget — **NEXT** (patch raw-entropy trace first, see GIST_PILOT_PLAN order-of-work) | soft-token feedback (softloop.py), snap-period sweep k∈{1,2,4,8,16,32,∞} on 7B | ~$1 | spec's own gate: drift budget k<2-3 ⇒ redesign before any training |
 | 3 | Mimir confirmations | hard-axiom stress (7B), 32B-Instruct fact/skill confirm (A100 inference) | ~$2 | closes Mimir's open instruct gates |
-| 4 | Stage-1 gist PILOT | 7B QLoRA, k=8 gist slots, 20-50M tokens, 3090 | ~$3 | continuation-PPL(gist) ≈ PPL(full context)? kill/scale decision |
+| 4 | Stage-1 gist PILOT — plan: GIST_PILOT_PLAN.md | 7B QLoRA, k=8 gist slots, 20M tokens first, 3090 | ~$3 | gist closes >50% of the none→full PPL gap ⇒ scale; gist≈none ⇒ kill |
 
 Stage-1 pilot prerequisites (build before launching, ~a day):
 - Results push channel (vastai logs hard-wraps ~490 cols — node must PUSH
