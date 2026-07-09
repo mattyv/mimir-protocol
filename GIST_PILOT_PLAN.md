@@ -87,11 +87,13 @@ run-3 fresh-cache lesson: test the instrument before believing the reading.
 
 ## Infra (build once, this is also the Stage-1-real substrate)
 
-- **HF push channel:** private repo (user creates) + fine-grained write-only
-  token, passed via onstart env (VAST hosts can read containers — token is
-  disposable, revoked after the campaign, never committed/echoed/logged).
-  Push: adapter (peft save), gist embeddings (.safetensors), eval JSON,
-  every ~30 min and at end. `huggingface_hub.upload_folder`.
+- **HF push channel:** repo = `mattyvee/mimir-artifacts` (private, created
+  2026-07-09) + fine-grained write-only token, passed via onstart env
+  (HF_TOKEN; VAST hosts can read containers — token is disposable, revoked
+  after the campaign, never committed/echoed/logged). Implemented in
+  `hf_push.py` (save_bundle/push_bundle/resume_step/fetch_step, checkpoint
+  naming + latest-step resume logic unit-tested). Push adapter + gist
+  embeddings + manifest every ~30 min and at end.
 - **Resume:** on start, look for the latest checkpoint in the HF repo; if
   present, download and continue (step counter persisted). Idempotent
   onstart = a dead node costs one relaunch, not the run.
