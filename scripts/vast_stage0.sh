@@ -11,7 +11,7 @@ DISK_GB=80
 
 echo "→ Searching RTX 3090 (reliability >= 0.98)..."
 OFFER_ID=$(vastai search offers \
-  'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cuda_vers>=12.0 disk_space>=90 reliability>=0.98 rentable=true' \
+  'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cuda_vers>=12.0 disk_space>=90 reliability>=0.98 inet_down>=300 rentable=true' \
   --order dph_total --limit 1 --raw 2>/dev/null | \
   python3 -c "import sys,json; o=json.load(sys.stdin); print(o[0]['id']) if o else exit(1)")
 echo "  offer $OFFER_ID"
