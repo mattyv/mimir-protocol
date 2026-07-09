@@ -28,11 +28,16 @@ pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' sentencepiece 2>&1 | ta
   || { sleep 20; pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' sentencepiece 2>&1 | tail -3; }
 python -c "import torch,transformers; print('CUDA', torch.cuda.is_available(), 'tf', transformers.__version__)" \
   || { echo "SETUPFAIL"; echo "ALLDONE"; exit 1; }
-echo "=== run ==="
+echo "=== run: stage0 drift budget ==="
 PYTHONPATH=src python -u -m marker.run_stage0_soft \
   --model-name Qwen/Qwen2.5-7B \
   --n-steps 64 2>&1 | tee /root/stage0.log
-echo "EXITRC=${PIPESTATUS[0]}" | tee -a /root/stage0.log
+echo "STAGE0_RC=${PIPESTATUS[0]}" | tee -a /root/stage0.log
+echo "=== run: specdec Finding-2 cross-check (reference-prefill) ==="
+PYTHONPATH=src python -u -m marker.run_spec_decode \
+  --verifier Qwen/Qwen2.5-7B --drafter Qwen/Qwen2.5-0.5B \
+  --max-new 80 --reference-prefill 2>&1 | tee -a /root/stage0.log
+echo "XCHECK_RC=${PIPESTATUS[0]}" | tee -a /root/stage0.log
 echo "ALLDONE" | tee -a /root/stage0.log
 EOS
 

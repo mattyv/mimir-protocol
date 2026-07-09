@@ -69,6 +69,24 @@ def greedy_decode(model, ids: torch.Tensor, max_new: int, eos_id: int | None) ->
 
 
 @torch.no_grad()
+def greedy_decode_prefill(model, ids: torch.Tensor, max_new: int, eos_id: int | None) -> list[int]:  # noqa: ANN001
+    """Greedy decode that re-prefills the FULL sequence every step (no KV cache
+    reuse) — the same code path the spec verifier uses. Review Finding 2: if
+    spec_decode's output matches THIS reference but not the incremental
+    greedy_decode, the 4/6 identity gap is prefill-vs-incremental float
+    numerics, not a logic bug. Slow (O(n^2) passes); diagnostic only."""
+    seq = ids[0].tolist()
+    prompt_len = len(seq)
+    while len(seq) - prompt_len < max_new:
+        logits = model(torch.tensor([seq], device=ids.device)).logits[0, -1]
+        tok = int(logits.argmax().item())
+        seq.append(tok)
+        if tok == eos_id:
+            break
+    return trim_at_eos(seq[prompt_len:], eos_id)
+
+
+@torch.no_grad()
 def _draft_tokens(
     drafter,  # noqa: ANN001
     prefix_ids: torch.Tensor,

@@ -43,6 +43,18 @@ def entropy(p: torch.Tensor) -> torch.Tensor:
     return -(p * p.clamp_min(1e-12).log()).sum(dim=-1)
 
 
+def softmax_entropy(logits: torch.Tensor, tau: float) -> torch.Tensor:
+    """Entropy of the FULL (untruncated) softmax(logits/tau) — the drift signal.
+
+    Review Finding 3: the drift trace must read the raw distribution, not the
+    top-p-truncated one used for mixing. Truncation clamps the tail — exactly
+    the mass that swells as the chain drifts off-manifold — so truncated
+    entropy saturates and understates drift onset. Raw entropy >= truncated
+    entropy always (truncation concentrates mass), and it rises smoothly with
+    drift, which is what the k-sweep needs to see."""
+    return entropy(torch.softmax(logits / tau, dim=-1))
+
+
 def mix_embedding(p: torch.Tensor, embed_matrix: torch.Tensor) -> torch.Tensor:
     """Probability-weighted mixture of input-embedding rows: p [V] @ E [V,d]."""
     return p.to(embed_matrix.dtype) @ embed_matrix
@@ -73,7 +85,8 @@ def soft_generate(
 
     Returns (argmax_trace, entropy_trace, snap_flags): the nearest-lattice
     token at each step (readable transcript of the chain), the entropy of the
-    soft distribution at each step (drift signal), and whether each step was
+    RAW (untruncated) softmax at each step (the drift signal — Finding 3; the
+    truncated distribution is used only for mixing), and whether each step was
     a snap (hard token fed) or soft (mixed embedding fed).
 
     Note: on tied-embedding checkpoints W_lm == E^T; mixing always uses the
@@ -92,10 +105,13 @@ def soft_generate(
     snap_flags: list[bool] = []
 
     for step in range(n_steps):
-        p = soft_distribution(logits.float(), tau, top_p)
+        logits_f = logits.float()
+        p = soft_distribution(logits_f, tau, top_p)
         tok = int(p.argmax().item())
         argmax_trace.append(tok)
-        entropy_trace.append(float(entropy(p)))
+        # Drift signal = entropy of the RAW softmax, not the truncated p used
+        # for mixing (Finding 3).
+        entropy_trace.append(float(softmax_entropy(logits_f, tau)))
         snap = is_snap_step(step, k)
         snap_flags.append(snap)
 

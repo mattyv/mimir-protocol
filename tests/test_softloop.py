@@ -13,7 +13,13 @@ import math
 
 import torch
 
-from marker.softloop import entropy, is_snap_step, mix_embedding, soft_distribution
+from marker.softloop import (
+    entropy,
+    is_snap_step,
+    mix_embedding,
+    soft_distribution,
+    softmax_entropy,
+)
 
 # ── soft_distribution ───────────────────────────────────────────────────────────
 
@@ -64,6 +70,23 @@ def test_entropy_one_hot_is_zero():
     p = torch.zeros(8)
     p[3] = 1.0
     assert float(entropy(p)) < 1e-6
+
+
+def test_raw_softmax_entropy_at_least_truncated(  # Finding 3: raw is the drift signal
+):
+    # A fat-tailed distribution: top-p truncation drops tail mass, concentrating
+    # the distribution, so truncated entropy < raw entropy. The drift trace must
+    # read the raw value (it swells with off-manifold tail mass).
+    logits = torch.tensor([2.0, 1.9, 1.8, 1.0, 0.9, 0.8, 0.7, 0.6])
+    raw = float(softmax_entropy(logits, tau=1.0))
+    trunc = float(entropy(soft_distribution(logits, tau=1.0, top_p=0.7)))
+    assert raw > trunc
+
+
+def test_raw_softmax_entropy_matches_full_softmax():
+    logits = torch.randn(32)
+    expected = float(entropy(torch.softmax(logits / 0.7, dim=-1)))
+    assert abs(float(softmax_entropy(logits, tau=0.7)) - expected) < 1e-6
 
 
 # ── mix_embedding ───────────────────────────────────────────────────────────────

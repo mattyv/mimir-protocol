@@ -27,7 +27,7 @@ import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from marker.specdec import greedy_decode, spec_decode
+from marker.specdec import greedy_decode, greedy_decode_prefill, spec_decode
 
 PROMPTS = [
     "Q: Explain why the sky is blue in two sentences.\nA:",
@@ -53,6 +53,13 @@ def main() -> None:
     parser.add_argument("--verifier", default="Qwen/Qwen2.5-7B")
     parser.add_argument("--drafter", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--max-new", type=int, default=80)
+    parser.add_argument(
+        "--reference-prefill",
+        action="store_true",
+        help="Finding 2 cross-check: build the greedy reference via repeated "
+        "full-prefill (the verifier's own code path) instead of incremental "
+        "decode. If spec output then matches, the identity gap was numerics.",
+    )
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
 
@@ -76,10 +83,14 @@ def main() -> None:
     eos_id = tok.eos_token_id
 
     # ── Vanilla reference (once per prompt — gamma-independent) ────────────────
+    ref_fn = greedy_decode_prefill if args.reference_prefill else greedy_decode
+    print(
+        f"reference path: {'full-prefill (Finding 2 cross-check)' if args.reference_prefill else 'incremental'}"
+    )
     references: list[list[int]] = []
     for p in prompts:
         ids = tok(p, return_tensors="pt").input_ids.to(device)
-        references.append(greedy_decode(verifier, ids, args.max_new, eos_id))
+        references.append(ref_fn(verifier, ids, args.max_new, eos_id))
 
     # ── Spec decode grid ────────────────────────────────────────────────────────
     summary_rows = []
