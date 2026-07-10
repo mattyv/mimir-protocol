@@ -14,11 +14,22 @@ from marker.gist_model import (
     assert_attn_impl,
     attach_gist,
     gap_closed,
+    generate_from_gist,
     gist_forward,
+    roll_spans,
     three_ppls,
     to_leaf_param,
     trainable_param_names,
 )
+
+
+def test_roll_spans_permutes_all_positions():
+    # every continuation gets a DIFFERENT span (no fixed point) for n>=2
+    spans = [[1], [2], [3]]
+    rolled = roll_spans(spans)
+    assert rolled == [[3], [1], [2]]
+    assert all(r != o for r, o in zip(rolled, spans, strict=True))
+
 
 # ── to_leaf_param: the GPU-only "non-leaf Tensor" optimizer crash ───────────────
 
@@ -158,6 +169,15 @@ def test_adapter_save_load_round_trip(tmp_path):
         l1 = gist_forward(pm, gist, spans, conts)
         l2 = gist_forward(pm2, gist2, spans, conts)
     assert torch.isclose(l1, l2, atol=1e-5), f"resume mismatch: {l1} vs {l2}"
+
+
+@pytest.mark.slow
+def test_generate_from_gist_runs_and_respects_max_new():
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    gen = generate_from_gist(pm, gist, [1, 2, 3], max_new=5)
+    assert 1 <= len(gen) <= 5
+    assert all(isinstance(t, int) for t in gen)
 
 
 @pytest.mark.slow

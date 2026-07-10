@@ -148,6 +148,53 @@ def three_ppls(
     return out
 
 
+def roll_spans(spans: list[list[int]]) -> list[list[int]]:
+    """Roll the spans by one within a batch, keeping continuations in place —
+    the SHUFFLED-GIST control (Fable gate review): each continuation now sees a
+    gist computed from a DIFFERENT sentence's span. If shuffled ~= none, the
+    gist genuinely carries the span's content; if shuffled ~= gist, the headline
+    was just 'having a warm prefix helps'. Needs >= 2 spans to be a real
+    permutation (single-item batches are dropped by the caller)."""
+    return spans[-1:] + spans[:-1]
+
+
+@torch.no_grad()
+def generate_from_gist(
+    peft_model,  # noqa: ANN001
+    gist_param: torch.nn.Parameter,
+    span: list[int],
+    *,
+    cont_sees: frozenset[str] = frozenset({"gist"}),
+    max_new: int = 40,
+    pad_id: int = 0,
+    eos_id: int | None = None,
+) -> list[int]:
+    """Greedily decode a continuation for a single span, where generated tokens
+    attend per `cont_sees` (gist-only vs gist+span). Re-prefills each step
+    (eval-only, small). Returns the generated token ids. Compare gist-only vs
+    full decode for the topical-agreement sanity check + the ilp_for probe."""
+    device = next(peft_model.parameters()).device
+    k = gist_param.shape[0]
+    embed = peft_model.get_input_embeddings()
+    gen: list[int] = []
+    for _ in range(max_new):
+        cont = gen if gen else [pad_id]  # need >=1 cont slot to read a logit
+        span_e = embed(torch.tensor([span], device=device))
+        cont_e = embed(torch.tensor([cont], device=device))
+        gist_e = gist_param.to(span_e.dtype).unsqueeze(0).expand(1, -1, -1)
+        inp = torch.cat([span_e, gist_e, cont_e], dim=1)
+        mask = build_batch_mask(
+            [len(span)], [len(cont)], k, len(span), len(cont), cont_sees=cont_sees, dtype=inp.dtype
+        ).to(device)
+        pos = torch.arange(inp.shape[1], device=device).unsqueeze(0)
+        logits = peft_model(inputs_embeds=inp, attention_mask=mask, position_ids=pos).logits
+        nxt = int(logits[0, -1].argmax().item())
+        gen.append(nxt)
+        if nxt == eos_id:
+            break
+    return gen
+
+
 def gap_closed(ppls: dict[str, float]) -> float:
     """Fraction of the none->full PPL gap that gist closes. 1.0 = gist matches
     full context; 0.0 = gist no better than nothing; <0 = worse than nothing."""
