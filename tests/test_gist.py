@@ -12,6 +12,8 @@ import torch
 
 from marker.gist import (
     build_attention_mask,
+    build_batch_labels,
+    build_batch_mask,
     build_labels,
     build_leak_diagnostic_mask,
     gist_position_ids,
@@ -80,6 +82,58 @@ def test_diagnostic_mask_additionally_blocks_gist_to_span():
     # C->S blocked in both; C->gist open in both
     assert train[s + k, 0] == NEG and diag[s + k, 0] == NEG
     assert train[s + k, s] == 0.0 and diag[s + k, s] == 0.0
+
+
+# ── Batched mask (Fable build-note #2): 2 samples, different s and c ─────────────
+
+
+def test_batch_mask_shape_and_padding_keys_blocked():
+    # sample 0: s=3,c=4 (full); sample 1: s=2,c=2 (span pad at 2, cont pad at 7,8)
+    m = build_batch_mask([3, 2], [4, 2], k=2, max_s=3, max_c=4)
+    assert m.shape == (2, 1, 9, 9)  # T = 3+2+4
+    m1 = m[1, 0]
+    # sample 1 padded keys: span-pad col 2, cont-pad cols 7,8 blocked for every
+    # real query (rows 0,1 span; 3,4 gist; 5,6 cont)
+    for q in (0, 1, 3, 4, 5, 6):
+        for pad_key in (2, 7, 8):
+            assert m1[q, pad_key] == NEG, f"row {q} must not see pad key {pad_key}"
+
+
+def test_batch_mask_continuation_blocked_from_span_per_sample():
+    m = build_batch_mask([3, 2], [4, 2], k=2, max_s=3, max_c=4)
+    c0 = 5
+    # sample 0: C rows 5..8 blocked from span 0..2
+    for q in range(c0, c0 + 4):
+        for key in range(0, 3):
+            assert m[0, 0, q, key] == NEG
+    # sample 1: C rows 5..6 (real) blocked from span real 0..1 AND span pad 2
+    for q in range(c0, c0 + 2):
+        for key in range(0, 3):
+            assert m[1, 0, q, key] == NEG
+
+
+def test_batch_mask_gist_sees_only_real_span():
+    m = build_batch_mask([3, 2], [4, 2], k=2, max_s=3, max_c=4)
+    g0 = 3
+    # sample 1 gist (rows 3,4) sees real span cols 0,1 but NOT span-pad col 2
+    for q in (g0, g0 + 1):
+        assert m[1, 0, q, 0] == 0.0 and m[1, 0, q, 1] == 0.0
+        assert m[1, 0, q, 2] == NEG
+
+
+def test_batch_mask_no_all_blocked_rows():
+    # every query row must have at least one open key (else softmax -> NaN)
+    m = build_batch_mask([3, 2], [4, 2], k=2, max_s=3, max_c=4)
+    for b in range(2):
+        for q in range(9):
+            assert (m[b, 0, q] == 0.0).any(), f"sample {b} row {q} fully blocked"
+
+
+def test_batch_labels_only_real_continuation():
+    labels = build_batch_labels([[10, 11, 12, 13], [20, 21]], max_s=3, k=2, max_c=4)
+    assert labels.shape == (2, 9)
+    assert labels[0, 5:].tolist() == [10, 11, 12, 13]  # full cont
+    assert labels[1, 5:].tolist() == [20, 21, -100, -100]  # padded tail masked
 
 
 # ── Labels & positions ──────────────────────────────────────────────────────────

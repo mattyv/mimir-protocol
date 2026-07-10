@@ -88,6 +88,69 @@ def gist_position_ids(s: int, k: int, c: int) -> torch.Tensor:
     return torch.arange(s + k + c).unsqueeze(0)
 
 
+# ── Batched construction (Fable build-note #2: per-sample masks + padding) ───────
+# Fixed layout per row:  [ span padded to max_s ][ k gist ][ cont padded to max_c ]
+# so the gist and C sit at the same absolute positions across the batch. Padded
+# span/cont positions are blocked as KEYS for everyone; padded QUERY rows get a
+# self-only diagonal so their softmax row is never all -inf (which would NaN).
+
+
+def build_batch_mask(
+    span_lens: list[int],
+    cont_lens: list[int],
+    k: int,
+    max_s: int,
+    max_c: int,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """[B, 1, T, T] additive mask, T = max_s + k + max_c. Per row b with real
+    span length s and continuation length c, the bottleneck rules hold on the
+    REAL tokens (C→gist+causal-C, gist→real-S+causal-gist, S→causal-real-S),
+    padded keys are blocked, and padded query rows self-attend only."""
+    b = len(span_lens)
+    t = max_s + k + max_c
+    g0, c0 = max_s, max_s + k  # gist start, cont start
+    mask = torch.full((b, 1, t, t), _NEG, dtype=dtype)
+
+    for i, (s, c) in enumerate(zip(span_lens, cont_lens, strict=True)):
+        m = mask[i, 0]
+        span_real = range(0, s)
+        gist = range(g0, g0 + k)
+        cont_real = range(c0, c0 + c)
+
+        for q in span_real:  # causal within real span
+            for key in range(0, q + 1):
+                m[q, key] = 0.0
+        for q in gist:  # all real span + causal gist
+            for key in span_real:
+                m[q, key] = 0.0
+            for key in range(g0, q + 1):
+                m[q, key] = 0.0
+        for q in cont_real:  # gist + causal cont; NOT span
+            for key in gist:
+                m[q, key] = 0.0
+            for key in range(c0, q + 1):
+                m[q, key] = 0.0
+        # padded query rows (span pad, cont pad): self-only, avoids all-(-inf).
+        for q in range(t):
+            if q not in span_real and q not in gist and q not in cont_real:
+                m[q, q] = 0.0
+
+    return mask
+
+
+def build_batch_labels(
+    cont_ids_batch: list[list[int]], max_s: int, k: int, max_c: int
+) -> torch.Tensor:
+    """[B, T] labels: -100 except real continuation positions (padded cont
+    positions stay -100, so CE ignores them)."""
+    b = len(cont_ids_batch)
+    labels = torch.full((b, max_s + k + max_c), -100, dtype=torch.long)
+    for i, cont in enumerate(cont_ids_batch):
+        labels[i, max_s + k : max_s + k + len(cont)] = torch.tensor(cont, dtype=torch.long)
+    return labels
+
+
 # ── Sentence pairing (data prep, model-free) ─────────────────────────────────────
 
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
