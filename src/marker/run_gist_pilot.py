@@ -225,4 +225,13 @@ def _checkpoint(peft_model, gist, repo, step, ppls, gc):  # noqa: ANN001
 
 
 if __name__ == "__main__":
+    import os
+    import sys
+
     main()
+    # All work (prints flushed, checkpoints pushed) is done. Skip interpreter
+    # teardown, which SIGABRTs on bitsandbytes/CUDA cleanup (GIST_RC=134) and
+    # would mask a real nonzero exit. os._exit avoids the abort.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
