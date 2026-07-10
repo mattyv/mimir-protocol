@@ -66,6 +66,10 @@ def evaluate(peft_model, gist, heldout, batch_size):  # noqa: ANN001
             }[cond]
             sums[cond] += float(gist_forward(peft_model, gist, spans, conts, cont_sees=sees))
         n += 1
+        if n % 10 == 0:
+            # keep the log alive during a long eval — the training heartbeat is
+            # off, and a silent multi-minute eval otherwise false-trips the stall.
+            print(f"    ...eval batch {n}", flush=True)
     ppls = {c: float(torch.exp(torch.tensor(sums[c] / max(1, n)))) for c in sums}
     return ppls, gap_closed(ppls)
 
