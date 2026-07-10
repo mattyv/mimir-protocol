@@ -31,20 +31,23 @@ echo "  offer $OFFER_ID"
 read -r -d '' ONSTART <<EOS || true
 exec > /proc/1/fd/1 2>&1
 export HF_HUB_ENABLE_HF_TRANSFER=1
+# One heartbeat for ALL of setup (pip + download are both silent and slow on
+# fresh nodes) so a slow-but-live setup grows the log and never false-trips the
+# poller stall. Killed right before training, which prints its own progress.
+( while true; do echo "  ...setup heartbeat \$(date -u +%H:%M:%S)"; sleep 40; done ) &
+HB=\$!
 cd /root
 echo "=== clone ==="
 git clone --branch claude/project-review-6rx97z --single-branch https://github.com/mattyv/mimir-protocol.git 2>&1 | tail -2
 cd /root/mimir-protocol
 echo "=== pip ==="
-pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -3 \
-  || { sleep 20; pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -3; }
-python -c "import torch,peft,bitsandbytes,datasets; print('CUDA', torch.cuda.is_available())" || { echo "SETUPFAIL"; echo "ALLDONE"; exit 1; }
+pip install 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -4 \
+  || { sleep 20; pip install 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -4; }
+python -c "import torch,peft,bitsandbytes,datasets; print('CUDA', torch.cuda.is_available())" || { kill \$HB; echo "SETUPFAIL"; echo "ALLDONE"; exit 1; }
 echo "=== HF token check (fail fast BEFORE spending on download/train) ==="
 python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get('name'))" \
-  || { echo "SETUPFAIL (bad/revoked HF token)"; echo "ALLDONE"; exit 1; }
+  || { kill \$HB; echo "SETUPFAIL (bad/revoked HF token)"; echo "ALLDONE"; exit 1; }
 echo "=== download ${MODEL} (authenticated) ==="
-( while true; do echo "  ...downloading \$(date -u +%H:%M:%S)"; sleep 60; done ) &
-HB=\$!
 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2
 kill \$HB 2>/dev/null
 echo "=== run: gist pilot (steps=${STEPS} ckpt=${CKPT_EVERY} repo=${REPO}) ==="
