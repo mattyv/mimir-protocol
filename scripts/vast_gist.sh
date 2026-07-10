@@ -48,8 +48,9 @@ python -c "import torch,peft,bitsandbytes,datasets; print('CUDA', torch.cuda.is_
 echo "=== HF token check (fail fast BEFORE spending on download/train) ==="
 python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get('name'))" \
   || { kill \$HB; echo "SETUPFAIL (bad/revoked HF token)"; echo "ALLDONE"; exit 1; }
-echo "=== download ${MODEL} (authenticated) ==="
-python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2
+echo "=== download ${MODEL} (authenticated, 20min cap) ==="
+timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2 \
+  || { kill \$HB; echo "SETUPFAIL (download too slow — relaunch for a faster node)"; echo "ALLDONE"; exit 1; }
 kill \$HB 2>/dev/null
 echo "=== run: gist pilot (steps=${STEPS} ckpt=${CKPT_EVERY} repo=${REPO}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_pilot \
