@@ -63,6 +63,15 @@ def attach_gist(
     return peft_model, gist_param
 
 
+def to_leaf_param(param: torch.nn.Parameter, device) -> torch.nn.Parameter:  # noqa: ANN001
+    """Move a Parameter to `device` and keep it a LEAF (optimizable). A plain
+    `param.to(cuda)` returns a NON-leaf tensor (result of the move op), which
+    AdamW rejects with 'can't optimize a non-leaf Tensor' — and CPU `.to(cpu)`
+    is a no-op that hides the bug in tests. Re-wrap the moved data as a fresh
+    Parameter so it's a leaf again."""
+    return torch.nn.Parameter(param.detach().to(device))
+
+
 def trainable_param_names(peft_model) -> list[str]:  # noqa: ANN001
     """Names of base/LoRA params that require grad (the gist param is separate
     and always trainable — tested directly)."""

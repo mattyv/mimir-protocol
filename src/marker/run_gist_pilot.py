@@ -30,7 +30,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from marker.gist_data import batched, stream_doc_pairs, take_heldout_docs
-from marker.gist_model import attach_gist, gap_closed, gist_forward
+from marker.gist_model import attach_gist, gap_closed, gist_forward, to_leaf_param
 
 # A tiny synthetic corpus for --smoke (no network / no bitsandbytes).
 SMOKE_TEXTS = [
@@ -129,7 +129,7 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(args.model_name)
     base = _load_base(args.model_name, quantize, device)
     peft_model, gist = attach_gist(base, gist_k=args.gist_k, r=args.r)
-    gist = gist.to(device)
+    gist = to_leaf_param(gist, device)  # .to(device) alone makes it non-leaf -> AdamW rejects it
 
     start_step = 0
     if args.resume and args.repo:

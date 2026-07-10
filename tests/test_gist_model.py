@@ -16,8 +16,26 @@ from marker.gist_model import (
     gap_closed,
     gist_forward,
     three_ppls,
+    to_leaf_param,
     trainable_param_names,
 )
+
+# ── to_leaf_param: the GPU-only "non-leaf Tensor" optimizer crash ───────────────
+
+
+def test_moved_param_is_non_leaf_but_to_leaf_param_fixes_it():
+    p = torch.nn.Parameter(torch.randn(4, 8))
+    # a device/dtype move returns a NON-leaf tensor that AdamW rejects (CPU
+    # .to(cpu) is a no-op, so force it with a dtype move to reproduce on CPU)
+    moved = p.to(torch.float64)
+    assert not moved.is_leaf
+    with pytest.raises(ValueError, match="non-leaf"):
+        torch.optim.AdamW([moved])
+    # to_leaf_param re-wraps as a leaf -> optimizer accepts it
+    fixed = to_leaf_param(p, torch.device("cpu"))
+    assert fixed.is_leaf and fixed.requires_grad
+    torch.optim.AdamW([fixed])  # no raise
+
 
 # ── model-free: gap_closed arithmetic ───────────────────────────────────────────
 
