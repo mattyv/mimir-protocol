@@ -148,6 +148,24 @@ def three_ppls(
     return out
 
 
+def cross_doc_spans(docs: list[list[tuple[list[int], list[int]]]]) -> list[list[int]]:
+    """The TRUE null for the shuffled-gist control (gate-review correction):
+    for the flattened pair list of doc-grouped heldout, return a donor span
+    from a DIFFERENT document per pair (doc j borrows from doc j+1, index-
+    matched modulo donor length). The within-batch roll_spans control turned
+    out to donate a same-document NEIGHBOR — topically overlapping the gold
+    continuation — so it measures 'nearby context helps', not slot-presence.
+    Cross-document donors share no document context; if their gists still
+    close the gap, THAT would be the artifact signal."""
+    donor_spans = [[p[0] for p in d] for d in docs]
+    out: list[list[int]] = []
+    for j, d in enumerate(docs):
+        donor = donor_spans[(j + 1) % len(docs)]
+        for i in range(len(d)):
+            out.append(donor[i % len(donor)])
+    return out
+
+
 def roll_spans(spans: list[list[int]]) -> list[list[int]]:
     """Roll the spans by one within a batch, keeping continuations in place —
     the SHUFFLED-GIST control (Fable gate review): each continuation now sees a

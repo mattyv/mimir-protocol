@@ -3,11 +3,13 @@
 Loads the step-16000 checkpoint (adapter + gist) from the HF repo — NO
 training — and runs three things on one node (~$0.15):
 
-1. SHUFFLED-GIST control (required before Stage-2 spend). Four PPL conditions:
-   gist / full / none / shuffled. Shuffled = each continuation sees a gist
-   computed from a DIFFERENT sentence's span (roll spans within the batch).
-   If shuffled ~= none, the gist truly carries the span's content and the
-   0.887 is real; if shuffled ~= gist, the headline was slot-presence.
+1. GIST-CONTENT controls (required before Stage-2 spend). Five PPL conditions:
+   gist / full / none / neighbor / xdoc. neighbor = within-batch roll, whose
+   donor turned out to be a same-document neighbor (topically overlapping the
+   continuation — measures 'nearby context helps', NOT a null; first-run
+   design flaw, own-goal acknowledged in the gate review). xdoc = donor span
+   from a DIFFERENT document — the true null. If xdoc ~= none, the 0.887 is
+   real content-carrying; if xdoc retains the gap, it was slot-presence.
 
 2. DECODE-FROM-GIST sanity: greedily generate a continuation from gist-only
    vs full context; eyeball topical agreement (no reconstruction head, so not
@@ -31,7 +33,7 @@ import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from marker.gist_data import stream_doc_pairs, take_heldout_docs
+from marker.gist_data import stream_doc_pairs
 from marker.gist_model import (
     attach_gist,
     gap_closed,
@@ -50,20 +52,34 @@ CONDS = {
 
 
 @torch.no_grad()
-def four_condition_ppls(peft_model, gist, heldout, batch_size):  # noqa: ANN001
-    """gist / full / none via gist_forward, plus SHUFFLED (rolled spans)."""
-    sums = dict.fromkeys([*CONDS, "shuffled"], 0.0)
-    n = 0
+def five_condition_ppls(peft_model, gist, heldout_docs, batch_size):  # noqa: ANN001
+    """gist / full / none, plus TWO controls:
+    - neighbor: within-batch roll — donor span is a same-document neighbor
+      (measures 'nearby context helps'; NOT a null — gate-review correction).
+    - xdoc: donor span from a DIFFERENT document (the true null: if these
+      gists still close the gap, the headline was slot-presence artifact)."""
     from marker.gist_data import batched  # noqa: PLC0415
+    from marker.gist_model import cross_doc_spans  # noqa: PLC0415
 
-    for spans, conts in batched(iter(heldout), batch_size):
-        if len(spans) < 2:
-            continue  # shuffle needs a real permutation
+    flat = [p for d in heldout_docs for p in d]
+    xdoc = cross_doc_spans(heldout_docs)
+    sums = dict.fromkeys([*CONDS, "neighbor", "xdoc"], 0.0)
+    n = 0
+    idx = 0
+    for spans, conts in batched(iter(flat), batch_size):
+        b = len(spans)
+        if b < 2:
+            idx += b
+            continue
         for name, sees in CONDS.items():
             sums[name] += float(gist_forward(peft_model, gist, spans, conts, cont_sees=sees))
-        sums["shuffled"] += float(
+        sums["neighbor"] += float(
             gist_forward(peft_model, gist, roll_spans(spans), conts, cont_sees=CONDS["gist"])
         )
+        sums["xdoc"] += float(
+            gist_forward(peft_model, gist, xdoc[idx : idx + b], conts, cont_sees=CONDS["gist"])
+        )
+        idx += b
         n += 1
         if n % 10 == 0:
             print(f"    ...eval batch {n}", flush=True)
@@ -124,22 +140,37 @@ def main() -> None:
     quantize = device == "cuda" and not args.smoke
     peft_model, gist, tok = _load_from_ckpt(args.model_name, args.repo, device, quantize)
 
-    # 1. Four-condition PPL + shuffled control
-    docs = _smoke_docs(tok) if args.smoke else stream_doc_pairs(tok)
-    heldout, _ = take_heldout_docs(docs, args.heldout_n)
-    print(f"heldout pairs: {len(heldout)}", flush=True)
-    ppls = four_condition_ppls(peft_model, gist, heldout, args.batch)
-    gc_real = gap_closed(ppls)
-    gc_shuf = gap_closed({"none": ppls["none"], "full": ppls["full"], "gist": ppls["shuffled"]})
-    print("\n===== SHUFFLED-GIST CONTROL =====")
+    # 1. Five-condition PPL: gist/full/none + neighbor(same-doc) + xdoc(true null)
+    doc_iter = _smoke_docs(tok) if args.smoke else stream_doc_pairs(tok)
+    heldout_docs: list = []
+    total = 0
+    for d in doc_iter:
+        heldout_docs.append(d)
+        total += len(d)
+        if total >= args.heldout_n:
+            break
+    heldout = [p for d in heldout_docs for p in d]
+    print(f"heldout: {len(heldout)} pairs across {len(heldout_docs)} docs", flush=True)
+    ppls = five_condition_ppls(peft_model, gist, heldout_docs, args.batch)
+
+    def _gc(name: str) -> float:
+        return gap_closed({"none": ppls["none"], "full": ppls["full"], "gist": ppls[name]})
+
+    print("\n===== GIST CONTENT CONTROLS =====")
     print(
-        f"  PPL  gist={ppls['gist']:.3f} full={ppls['full']:.3f} "
-        f"none={ppls['none']:.3f} shuffled={ppls['shuffled']:.3f}"
+        f"  PPL  gist={ppls['gist']:.3f} full={ppls['full']:.3f} none={ppls['none']:.3f} "
+        f"neighbor={ppls['neighbor']:.3f} xdoc={ppls['xdoc']:.3f}"
     )
-    print(f"  gap_closed(gist)={gc_real:.3f}   gap_closed(shuffled)={gc_shuf:.3f}")
     print(
-        f"  VERDICT: {'REAL (shuffled collapses to ~none)' if gc_shuf < 0.3 else 'SUSPECT (shuffled retains gap — slot-presence artifact)'}"
+        f"  gap_closed: gist={_gc('gist'):.3f}  neighbor(same-doc)={_gc('neighbor'):.3f}  "
+        f"xdoc(true null)={_gc('xdoc'):.3f}"
     )
+    verdict = (
+        "REAL — cross-doc gist collapses toward none; slots carry span/doc content"
+        if _gc("xdoc") < 0.3
+        else "ARTIFACT SIGNAL — even cross-doc gists close the gap (slot presence)"
+    )
+    print(f"  VERDICT: {verdict}")
 
     # 2 + 3. Decode-from-gist sanity + ilp_for probe
     print("\n===== DECODE-FROM-GIST (topical agreement, not verbatim) =====")
@@ -187,4 +218,10 @@ def _smoke_docs(tok):  # noqa: ANN001
 
 
 if __name__ == "__main__":
+    import os
+    import sys
+
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)  # skip bitsandbytes teardown SIGABRT (same fix as the pilot runner)

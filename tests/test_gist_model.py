@@ -23,6 +23,27 @@ from marker.gist_model import (
 )
 
 
+def test_cross_doc_spans_never_donates_from_own_document():
+    from marker.gist_model import cross_doc_spans
+
+    docs = [
+        [([1], [10]), ([2], [20])],  # doc 0 spans: [1],[2]
+        [([3], [30])],  # doc 1 spans: [3]
+        [([4], [40]), ([5], [50]), ([6], [60])],  # doc 2
+    ]
+    donors = cross_doc_spans(docs)
+    assert len(donors) == 6  # aligned with the flattened pair list
+    # doc 0's pairs borrow from doc 1; doc 1 from doc 2; doc 2 from doc 0
+    assert donors[0] == [3] and donors[1] == [3]
+    assert donors[2] == [4]
+    assert donors[3] == [1] and donors[4] == [2] and donors[5] == [1]
+    # none of the donors comes from the pair's own document
+    flat_own_docs = [0, 0, 1, 2, 2, 2]
+    for idx, d in enumerate(donors):
+        own_spans = [p[0] for p in docs[flat_own_docs[idx]]]
+        assert d not in own_spans, f"pair {idx} borrowed from its own doc"
+
+
 def test_roll_spans_permutes_all_positions():
     # every continuation gets a DIFFERENT span (no fixed point) for n>=2
     spans = [[1], [2], [3]]
