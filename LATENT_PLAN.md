@@ -41,6 +41,26 @@ Stage-1 pilot prerequisites (build before launching, ~a day):
 - Self-stop (exit PID 1 at end of training -> billing drops to storage;
   any later session destroys the stopped instance).
 
+## Parked: Stage-2 predictor training signal (raw text vs CoT distillation)
+
+The next-thought predictor (Stage 2, gated on the gist pilot passing) is
+self-supervised by default: encode a raw corpus through the frozen Stage-1
+compressor offline, then train the predictor to map gists g_1..g_t -> g_{t+1}
+(the gist of the real next sentence). No teacher, no thought-dataset — the
+actual continuation is the label. Loss = contrastive (InfoNCE, beat the
+regression-to-the-mean platitude failure) + regression, in whitened gist space
+(Sigma^-1/2), with a distributional/diffusion sampling head.
+
+**Caveat that motivates a variant:** raw-text next-sentence prediction learns
+"plausible continuation", not reasoning — spec failure-mode #1 (platitudes).
+**Parked idea (try after the raw-text version):** distill from a strong
+reasoning model's chain-of-thought — generate CoT traces, encode them to gist
+sequences, train the predictor on reasoning-shaped successions instead of
+generic web-text successions. More expensive (needs a teacher + trace
+generation) but the plausible path to reasoning rather than fluent drift.
+Only worth it if (a) the gist representation works AND (b) the raw-text
+predictor produces platitudes.
+
 ## Stage 0 measurement plan (no judge model at this budget)
 
 Per (prompt, k): run n soft steps; at each step record (a) the argmax token
