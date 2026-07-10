@@ -17,6 +17,7 @@ REPO="${REPO:-mattyvee/mimir-artifacts}"
 STEPS="${STEPS:-16000}"
 CKPT_EVERY="${CKPT_EVERY:-1000}"
 EVAL_EVERY="${EVAL_EVERY:-500}"
+HELDOUT="${HELDOUT:-512}"
 TIMEOUT="${TIMEOUT:-8h}"
 RESUME_FLAG=""
 [ "${RESUME:-0}" = "1" ] && RESUME_FLAG="--resume"
@@ -53,7 +54,7 @@ kill \$HB 2>/dev/null
 echo "=== run: gist pilot (steps=${STEPS} ckpt=${CKPT_EVERY} repo=${REPO}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_pilot \
   --model-name ${MODEL} --repo ${REPO} \
-  --max-steps ${STEPS} --eval-every ${EVAL_EVERY} --ckpt-every ${CKPT_EVERY} ${RESUME_FLAG} 2>&1 | tee /root/gist.log
+  --max-steps ${STEPS} --eval-every ${EVAL_EVERY} --ckpt-every ${CKPT_EVERY} --heldout-n ${HELDOUT} ${RESUME_FLAG} 2>&1 | tee /root/gist.log
 echo "GIST_RC=\${PIPESTATUS[0]}" | tee -a /root/gist.log
 echo "ALLDONE" | tee -a /root/gist.log
 EOS
