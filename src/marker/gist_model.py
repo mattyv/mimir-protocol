@@ -1,0 +1,148 @@
+"""Stage-1 gist model: LoRA + learned gist embeddings on a frozen base, the
+batched training forward, and the 3-PPL eval (see GIST_PILOT_PLAN.md).
+
+Trainables = LoRA adapters + the k gist embeddings ONLY; the base is frozen.
+The 4-bit quantization for the real 7B run lives in the runner — this module
+takes an already-loaded base model so it stays CPU-testable on a tiny model.
+
+Fable build-notes honored here:
+ #1 4D masks need an explicit attention path — assert_attn_impl() refuses
+    flash-attention-2 (which would silently ignore the mask).
+ #2 batched per-sample masks (marker.gist.build_batch_mask), use_cache=False.
+ #3 the three eval PPLs keep C at identical positions, varying only cont_sees.
+ #4 resume without optimizer state is acceptable for the pilot (runner concern).
+"""
+
+from __future__ import annotations
+
+import torch
+from peft import LoraConfig, get_peft_model
+
+from marker.gist import build_batch_labels, build_batch_mask
+
+QWEN_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def assert_attn_impl(model) -> None:  # noqa: ANN001
+    """Refuse flash-attention-2: it ignores the 4D additive mask, which would
+    silently break the gist bottleneck and fake a 'gist works' result. sdpa and
+    eager both honor a custom 4D mask."""
+    impl = getattr(model.config, "_attn_implementation", "eager")
+    if impl not in ("sdpa", "eager"):
+        raise ValueError(
+            f"attn_implementation={impl!r} ignores 4D masks; load with "
+            "attn_implementation='sdpa' (or 'eager')."
+        )
+
+
+def attach_gist(
+    base_model,  # noqa: ANN001
+    gist_k: int,
+    r: int = 16,
+    alpha: int = 32,
+    targets: list[str] | None = None,
+) -> tuple[object, torch.nn.Parameter]:
+    """Wrap base_model with LoRA and create k learned gist embeddings. Returns
+    (peft_model, gist_param). Base frozen; only LoRA + gist require grad."""
+    assert_attn_impl(base_model)
+    cfg = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        target_modules=targets or QWEN_TARGETS,
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    peft_model = get_peft_model(base_model, cfg)
+
+    hidden = base_model.get_input_embeddings().weight.shape[1]
+    # Stat-matched small init (the embedding std is a reasonable scale so the
+    # gist slots start in-distribution rather than swamping attention).
+    emb_std = base_model.get_input_embeddings().weight.std().item()
+    gist_param = torch.nn.Parameter(torch.randn(gist_k, hidden, dtype=torch.float32) * emb_std)
+    return peft_model, gist_param
+
+
+def trainable_param_names(peft_model) -> list[str]:  # noqa: ANN001
+    """Names of base/LoRA params that require grad (the gist param is separate
+    and always trainable — tested directly)."""
+    return [n for n, p in peft_model.named_parameters() if p.requires_grad]
+
+
+def _pad(seqs: list[list[int]], max_len: int, pad_id: int, device) -> torch.Tensor:  # noqa: ANN001
+    return torch.tensor(
+        [s + [pad_id] * (max_len - len(s)) for s in seqs], dtype=torch.long, device=device
+    )
+
+
+def gist_forward(
+    peft_model,  # noqa: ANN001
+    gist_param: torch.nn.Parameter,
+    spans: list[list[int]],
+    conts: list[list[int]],
+    *,
+    cont_sees: frozenset[str] = frozenset({"gist"}),
+    pad_id: int = 0,
+) -> torch.Tensor:
+    """One batched forward: splice [span | gist | cont] embeddings, apply the
+    4D mask for `cont_sees`, CE on continuation tokens only. Returns the loss
+    (mean CE over real continuation positions)."""
+    device = next(peft_model.parameters()).device
+    k = gist_param.shape[0]
+    span_lens = [len(s) for s in spans]
+    cont_lens = [len(c) for c in conts]
+    max_s, max_c = max(span_lens), max(cont_lens)
+
+    embed = peft_model.get_input_embeddings()
+    span_e = embed(_pad(spans, max_s, pad_id, device))
+    cont_e = embed(_pad(conts, max_c, pad_id, device))
+    gist_e = gist_param.to(span_e.dtype).unsqueeze(0).expand(len(spans), -1, -1)
+    inputs_embeds = torch.cat([span_e, gist_e, cont_e], dim=1)
+
+    mask = build_batch_mask(
+        span_lens, cont_lens, k, max_s, max_c, cont_sees=cont_sees, dtype=inputs_embeds.dtype
+    ).to(device)
+    labels = build_batch_labels(conts, max_s, k, max_c).to(device)
+    t = inputs_embeds.shape[1]
+    position_ids = torch.arange(t, device=device).unsqueeze(0).expand(len(spans), -1)
+
+    out = peft_model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=mask,
+        position_ids=position_ids,
+        labels=labels,
+        use_cache=False,
+    )
+    return out.loss
+
+
+@torch.no_grad()
+def three_ppls(
+    peft_model,  # noqa: ANN001
+    gist_param: torch.nn.Parameter,
+    spans: list[list[int]],
+    conts: list[list[int]],
+    pad_id: int = 0,
+) -> dict[str, float]:
+    """Perplexity of the continuation under three conditions at IDENTICAL
+    positions: gist (C sees only the k gist slots), full (C sees the raw span
+    — upper bound), none (C sees neither — lower bound). Returns
+    {'gist','full','none'} PPLs. Sanity direction: full <= none."""
+    out = {}
+    for name, sees in [
+        ("gist", frozenset({"gist"})),
+        ("full", frozenset({"gist", "span"})),
+        ("none", frozenset()),
+    ]:
+        loss = gist_forward(peft_model, gist_param, spans, conts, cont_sees=sees, pad_id=pad_id)
+        out[name] = float(torch.exp(loss))
+    return out
+
+
+def gap_closed(ppls: dict[str, float]) -> float:
+    """Fraction of the none->full PPL gap that gist closes. 1.0 = gist matches
+    full context; 0.0 = gist no better than nothing; <0 = worse than nothing."""
+    denom = ppls["none"] - ppls["full"]
+    if denom <= 0:
+        return 0.0
+    return (ppls["none"] - ppls["gist"]) / denom

@@ -101,12 +101,17 @@ def build_batch_mask(
     k: int,
     max_s: int,
     max_c: int,
+    cont_sees: frozenset[str] = frozenset({"gist"}),
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """[B, 1, T, T] additive mask, T = max_s + k + max_c. Per row b with real
-    span length s and continuation length c, the bottleneck rules hold on the
-    REAL tokens (C→gist+causal-C, gist→real-S+causal-gist, S→causal-real-S),
-    padded keys are blocked, and padded query rows self-attend only."""
+    span length s and continuation length c: span is causal within itself, gist
+    attends to all real span + causal-gist, and C attends causally within
+    itself PLUS whatever `cont_sees` allows — {"gist"} for training/eval-gist,
+    {"gist","span"} for eval-full (C gets raw S, the PPL upper bound), or
+    frozenset() for eval-none (C alone, the lower bound). Keeping C at the SAME
+    absolute positions across all three (Fable build-note #3) makes the three
+    PPLs RoPE-comparable. Padded keys blocked; padded query rows self-attend."""
     b = len(span_lens)
     t = max_s + k + max_c
     g0, c0 = max_s, max_s + k  # gist start, cont start
@@ -126,11 +131,15 @@ def build_batch_mask(
                 m[q, key] = 0.0
             for key in range(g0, q + 1):
                 m[q, key] = 0.0
-        for q in cont_real:  # gist + causal cont; NOT span
-            for key in gist:
-                m[q, key] = 0.0
+        for q in cont_real:  # causal-C always, plus what cont_sees allows
             for key in range(c0, q + 1):
                 m[q, key] = 0.0
+            if "gist" in cont_sees:
+                for key in gist:
+                    m[q, key] = 0.0
+            if "span" in cont_sees:
+                for key in span_real:
+                    m[q, key] = 0.0
         # padded query rows (span pad, cont pad): self-only, avoids all-(-inf).
         for q in range(t):
             if q not in span_real and q not in gist and q not in cont_real:

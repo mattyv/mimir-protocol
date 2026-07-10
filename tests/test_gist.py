@@ -136,6 +136,26 @@ def test_batch_labels_only_real_continuation():
     assert labels[1, 5:].tolist() == [20, 21, -100, -100]  # padded tail masked
 
 
+def test_eval_masks_differ_only_in_continuation_access():
+    # Fable #3: gist / full / none conditions keep C at the SAME positions and
+    # differ ONLY in what C attends to among {span, gist}.
+    args = ([3], [4], 2, 3, 4)  # s=3,c=4,k=2,max_s=3,max_c=4 -> C rows 5..8
+    g = build_batch_mask(*args, cont_sees=frozenset({"gist"}))[0, 0]
+    full = build_batch_mask(*args, cont_sees=frozenset({"gist", "span"}))[0, 0]
+    none = build_batch_mask(*args, cont_sees=frozenset())[0, 0]
+    for q in range(5, 9):  # continuation rows
+        # gist: sees gist (3,4), not span (0..2)
+        assert g[q, 3] == 0.0 and g[q, 0] == NEG
+        # full: sees span AND gist
+        assert full[q, 0] == 0.0 and full[q, 3] == 0.0
+        # none: sees neither span nor gist (only causal C)
+        assert none[q, 0] == NEG and none[q, 3] == NEG
+        assert none[q, 5] == 0.0  # but still causal within C
+    # span and gist rows identical across conditions (only C access changes)
+    for q in range(0, 5):
+        assert torch.equal(g[q], full[q]) and torch.equal(g[q], none[q])
+
+
 # ── Labels & positions ──────────────────────────────────────────────────────────
 
 
