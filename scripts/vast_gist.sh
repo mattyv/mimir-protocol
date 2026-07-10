@@ -43,10 +43,10 @@ echo "=== HF token check (fail fast BEFORE spending on download/train) ==="
 python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get('name'))" \
   || { echo "SETUPFAIL (bad/revoked HF token)"; echo "ALLDONE"; exit 1; }
 echo "=== download ${MODEL} (authenticated) ==="
-( while true; do echo "  ...downloading $(date -u +%H:%M:%S)"; sleep 60; done ) &
-HB=$!
+( while true; do echo "  ...downloading \$(date -u +%H:%M:%S)"; sleep 60; done ) &
+HB=\$!
 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2
-kill $HB 2>/dev/null
+kill \$HB 2>/dev/null
 echo "=== run: gist pilot (steps=${STEPS} ckpt=${CKPT_EVERY} repo=${REPO}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_pilot \
   --model-name ${MODEL} --repo ${REPO} \
