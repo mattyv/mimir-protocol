@@ -29,7 +29,7 @@ import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from marker.gist_data import batched, stream_pairs, take_heldout
+from marker.gist_data import batched, stream_doc_pairs, take_heldout_docs
 from marker.gist_model import attach_gist, gap_closed, gist_forward
 
 # A tiny synthetic corpus for --smoke (no network / no bitsandbytes).
@@ -42,11 +42,14 @@ SMOKE_TEXTS = [
 ] * 20
 
 
-def _smoke_pairs(tokenizer):  # noqa: ANN001
+def _smoke_docs(tokenizer):  # noqa: ANN001
+    """Per-document pair lists for the smoke path (mirrors stream_doc_pairs)."""
     from marker.gist_data import pairs_from_text  # noqa: PLC0415
 
     for text in SMOKE_TEXTS:
-        yield from pairs_from_text(text, tokenizer, max_span=32, max_cont=32, min_cont=6)
+        pairs = pairs_from_text(text, tokenizer, max_span=32, max_cont=32, min_cont=6)
+        if pairs:
+            yield pairs
 
 
 @torch.no_grad()
@@ -97,7 +100,9 @@ def main() -> None:
     p.add_argument("--repo", default=None, help="HF repo for checkpoints (push/resume)")
     p.add_argument("--gist-k", type=int, default=8)
     p.add_argument("--r", type=int, default=16)
-    p.add_argument("--max-steps", type=int, default=4000)
+    # 16000 micro-steps x 8 seqs x ~130 tokens ~= 16M tokens (the pre-registered
+    # pilot gate said 20M; 4000 was a 5x undershoot — Fable finding #4).
+    p.add_argument("--max-steps", type=int, default=16000)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -128,6 +133,7 @@ def main() -> None:
 
     start_step = 0
     if args.resume and args.repo:
+        from peft import set_peft_model_state_dict  # noqa: PLC0415
         from safetensors.torch import load_file  # noqa: PLC0415
 
         from marker.hf_push import fetch_step, resume_step  # noqa: PLC0415
@@ -135,19 +141,26 @@ def main() -> None:
         step = resume_step(args.repo)
         if step:
             ckpt = fetch_step(args.repo, step, "/tmp/gist_resume")  # noqa: S108
-            peft_model.load_adapter(str(ckpt), adapter_name="default")
+            # Load weights INTO the existing 'default' adapter — load_adapter()
+            # with an existing name raises (Fable pre-launch finding #1).
+            adapter_state = load_file(str(ckpt / "adapter_model.safetensors"))
+            set_peft_model_state_dict(peft_model, adapter_state)
             gist.data = load_file(str(ckpt / "gist.safetensors"))["gist"].to(device)
             start_step = step
             print(f"resumed from step {step}")
 
-    pairs = _smoke_pairs(tok) if args.smoke else stream_pairs(tok)
-    heldout, train_stream = take_heldout(pairs, args.heldout_n)
-    print(f"heldout pairs: {len(heldout)}")
+    # Document-disjoint heldout/train split (Fable pre-launch finding #2 —
+    # pairs within a doc overlap, so the split must happen at doc boundaries).
+    docs = _smoke_docs(tok) if args.smoke else stream_doc_pairs(tok)
+    heldout, train_stream = take_heldout_docs(docs, args.heldout_n)
+    print(f"heldout pairs: {len(heldout)} (document-disjoint from training)")
 
     trainable = [p_ for p_ in peft_model.parameters() if p_.requires_grad] + [gist]
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.0)
+    # T_max counts OPTIMIZER steps (one per grad_accum micro-steps), so the
+    # cosine actually completes (Fable pre-launch finding #5).
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.max_steps, eta_min=args.lr / 10
+        opt, T_max=max(1, args.max_steps // args.grad_accum), eta_min=args.lr / 10
     )
 
     step = start_step
@@ -156,6 +169,21 @@ def main() -> None:
     for spans, conts in batched(train_stream, args.batch):
         loss = gist_forward(peft_model, gist, spans, conts) / args.grad_accum
         loss.backward()
+
+        if step == start_step:
+            # The quantized path (prepare_model_for_kbit_training + gradient
+            # checkpointing + inputs_embeds splice) is unexercised by CPU
+            # tests. A silent no-grad here would fake gist~=none and wrongly
+            # kill the recipe — fail LOUDLY instead (Fable finding #3).
+            lora_ok = any(
+                p_.grad is not None and p_.grad.abs().sum() > 0
+                for p_ in peft_model.parameters()
+                if p_.requires_grad
+            )
+            gist_ok = gist.grad is not None and gist.grad.abs().sum() > 0
+            assert lora_ok and gist_ok, f"GRAD FAIL: lora_ok={lora_ok} gist_ok={gist_ok}"
+            print("GRAD_OK (lora + gist gradients flowing)", flush=True)
+
         if (step + 1) % args.grad_accum == 0:
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt.step()

@@ -109,6 +109,40 @@ def test_loss_decreases_over_steps():
 
 
 @pytest.mark.slow
+def test_adapter_save_load_round_trip(tmp_path):
+    # The resume path: save_bundle -> fresh model -> set_peft_model_state_dict
+    # (NOT load_adapter, which raises on the existing 'default' name — Fable
+    # pre-launch finding #1). Loss on the same batch must match exactly.
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    from marker.hf_push import save_bundle
+
+    spans, conts = [[1, 2, 3, 4]], [[5, 6, 7, 8]]
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    params = [p for p in pm.parameters() if p.requires_grad] + [gist]
+    opt = torch.optim.AdamW(params, lr=1e-2)
+    for _ in range(5):  # train so LoRA weights are nonzero (init B=0 is trivial)
+        opt.zero_grad()
+        gist_forward(pm, gist, spans, conts).backward()
+        opt.step()
+    save_bundle(tmp_path, pm, gist, {"step": 5})
+
+    base2 = _tiny_base()  # same seed -> identical base
+    pm2, gist2 = attach_gist(base2, gist_k=4, r=4)
+    adapter_state = load_file(str(tmp_path / "adapter_model.safetensors"))
+    set_peft_model_state_dict(pm2, adapter_state)
+    gist2.data = load_file(str(tmp_path / "gist.safetensors"))["gist"]
+
+    with torch.no_grad():
+        l1 = gist_forward(pm, gist, spans, conts)
+        l2 = gist_forward(pm2, gist2, spans, conts)
+    assert torch.isclose(l1, l2, atol=1e-5), f"resume mismatch: {l1} vs {l2}"
+
+
+@pytest.mark.slow
 def test_three_ppls_direction_full_le_none():
     base = _tiny_base()
     peft_model, gist = attach_gist(base, gist_k=4, r=4)

@@ -38,7 +38,7 @@ def pairs_from_text(
     return pairs
 
 
-def stream_pairs(
+def stream_doc_pairs(
     tokenizer,  # noqa: ANN001
     max_span: int = 64,
     max_cont: int = 64,
@@ -46,29 +46,40 @@ def stream_pairs(
     dataset: str = DEFAULT_DATASET,
     config: str = DEFAULT_CONFIG,
     text_key: str = "text",
-) -> Iterator[tuple[list[int], list[int]]]:
-    """Lazily stream the corpus and yield (span, cont) pairs one at a time.
-    Streaming = no full download; the iterator is effectively unbounded."""
+) -> Iterator[list[tuple[list[int], list[int]]]]:
+    """Lazily stream the corpus, yielding each DOCUMENT's pairs as one list
+    (empty docs skipped). Document granularity matters: pairs within a doc
+    overlap heavily (sentence i's continuation contains sentence i+1's span),
+    so any heldout/train split must happen at doc boundaries or the eval
+    leaks into training (Fable review finding #2 — the v10 lesson)."""
     from datasets import load_dataset  # noqa: PLC0415
 
     ds = load_dataset(dataset, name=config, split="train", streaming=True)
     for row in ds:
         text = row.get(text_key) or ""
-        yield from pairs_from_text(text, tokenizer, max_span, max_cont, min_cont)
+        pairs = pairs_from_text(text, tokenizer, max_span, max_cont, min_cont)
+        if pairs:
+            yield pairs
 
 
-def take_heldout(
-    pair_iter: Iterator[tuple[list[int], list[int]]], n: int
+def take_heldout_docs(
+    doc_iter: Iterator[list[tuple[list[int], list[int]]]], min_pairs: int
 ) -> tuple[list[tuple[list[int], list[int]]], Iterator[tuple[list[int], list[int]]]]:
-    """Pull the first n pairs off the stream as a fixed held-out eval set;
-    return (heldout, remaining_iterator). Deterministic given a deterministic
-    stream — the eval set is the first n pairs, set aside before training."""
-    heldout = []
-    for pair in pair_iter:
-        heldout.append(pair)
-        if len(heldout) >= n:
+    """Accumulate WHOLE documents into the held-out set until it has at least
+    min_pairs pairs; return (heldout_pairs, train_pair_iterator). The training
+    iterator starts at the next document, so heldout and train are
+    document-disjoint by construction."""
+    heldout: list[tuple[list[int], list[int]]] = []
+    for doc_pairs in doc_iter:
+        heldout.extend(doc_pairs)
+        if len(heldout) >= min_pairs:
             break
-    return heldout, pair_iter
+
+    def _train() -> Iterator[tuple[list[int], list[int]]]:
+        for doc_pairs in doc_iter:
+            yield from doc_pairs
+
+    return heldout, _train()
 
 
 def batched(

@@ -13,7 +13,7 @@ set -euo pipefail
 IMAGE="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
 DISK_GB=90
 REPO="${REPO:-mattyvee/mimir-artifacts}"
-STEPS="${STEPS:-4000}"
+STEPS="${STEPS:-16000}"
 CKPT_EVERY="${CKPT_EVERY:-1000}"
 EVAL_EVERY="${EVAL_EVERY:-500}"
 TIMEOUT="${TIMEOUT:-8h}"
@@ -38,6 +38,9 @@ echo "=== pip ==="
 pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -3 \
   || { sleep 20; pip install -q 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -3; }
 python -c "import torch,peft,bitsandbytes,datasets; print('CUDA', torch.cuda.is_available())" || { echo "SETUPFAIL"; echo "ALLDONE"; exit 1; }
+echo "=== HF token check (fail fast BEFORE spending on download/train) ==="
+python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get('name'))" \
+  || { echo "SETUPFAIL (bad/revoked HF token)"; echo "ALLDONE"; exit 1; }
 echo "=== 7B download (authenticated) ==="
 python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B'); print('7B CACHED')" 2>&1 | tail -2
 echo "=== run: gist pilot (steps=${STEPS} ckpt=${CKPT_EVERY} repo=${REPO}) ==="
