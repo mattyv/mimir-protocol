@@ -51,10 +51,12 @@ python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get
 echo "=== download ${MODEL} (authenticated, 20min cap) ==="
 timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2 \
   || { kill \$HB; echo "SETUPFAIL (download too slow — relaunch for a faster node)"; echo "ALLDONE"; exit 1; }
-kill \$HB 2>/dev/null
-echo "=== run: gist pilot (steps=${STEPS} ckpt=${CKPT_EVERY} repo=${REPO}) ==="
+echo "=== run: gist eval (repo=${REPO} heldout=${HELDOUT}) ==="
+# keep the heartbeat alive THROUGH the eval — checkpoint-load + heldout
+# streaming are silent, and unlike training there are no per-step prints.
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_eval \
   --model-name ${MODEL} --repo ${REPO} --heldout-n ${HELDOUT} 2>&1 | tee /root/gist.log
+kill \$HB 2>/dev/null
 echo "GIST_RC=\${PIPESTATUS[0]}" | tee -a /root/gist.log
 echo "ALLDONE" | tee -a /root/gist.log
 EOS
