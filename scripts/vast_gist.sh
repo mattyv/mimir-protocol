@@ -12,6 +12,7 @@ set -euo pipefail
 
 IMAGE="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
 DISK_GB=90
+MODEL="${MODEL:-Qwen/Qwen2.5-7B}"   # shakedown can use a small model for a fast download
 REPO="${REPO:-mattyvee/mimir-artifacts}"
 STEPS="${STEPS:-16000}"
 CKPT_EVERY="${CKPT_EVERY:-1000}"
@@ -20,9 +21,9 @@ TIMEOUT="${TIMEOUT:-8h}"
 RESUME_FLAG=""
 [ "${RESUME:-0}" = "1" ] && RESUME_FLAG="--resume"
 
-echo "→ Searching RTX 3090 (reliability >= 0.98, inet_down >= 300)..."
+echo "→ Searching RTX 3090 (reliability >= 0.98, inet_down >= 500)..."
 OFFER_ID=$(vastai search offers \
-  'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cuda_vers>=12.0 disk_space>=100 reliability>=0.98 inet_down>=300 rentable=true' \
+  'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cuda_vers>=12.0 disk_space>=100 reliability>=0.98 inet_down>=500 rentable=true' \
   --order dph_total --limit 1 --raw 2>/dev/null | \
   python3 -c "import sys,json; o=json.load(sys.stdin); print(o[0]['id']) if o else exit(1)")
 echo "  offer $OFFER_ID"
@@ -41,11 +42,14 @@ python -c "import torch,peft,bitsandbytes,datasets; print('CUDA', torch.cuda.is_
 echo "=== HF token check (fail fast BEFORE spending on download/train) ==="
 python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get('name'))" \
   || { echo "SETUPFAIL (bad/revoked HF token)"; echo "ALLDONE"; exit 1; }
-echo "=== 7B download (authenticated) ==="
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B'); print('7B CACHED')" 2>&1 | tail -2
+echo "=== download ${MODEL} (authenticated) ==="
+( while true; do echo "  ...downloading $(date -u +%H:%M:%S)"; sleep 60; done ) &
+HB=$!
+python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2
+kill $HB 2>/dev/null
 echo "=== run: gist pilot (steps=${STEPS} ckpt=${CKPT_EVERY} repo=${REPO}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_pilot \
-  --model-name Qwen/Qwen2.5-7B --repo ${REPO} \
+  --model-name ${MODEL} --repo ${REPO} \
   --max-steps ${STEPS} --eval-every ${EVAL_EVERY} --ckpt-every ${CKPT_EVERY} ${RESUME_FLAG} 2>&1 | tee /root/gist.log
 echo "GIST_RC=\${PIPESTATUS[0]}" | tee -a /root/gist.log
 echo "ALLDONE" | tee -a /root/gist.log
