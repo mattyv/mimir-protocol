@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from marker.whiten import Whitener
+from marker.whiten import PerSlotWhitener, Whitener
 
 
 def _anisotropic_gists(n=2000, d=16):
@@ -60,3 +60,45 @@ def test_save_load_round_trip(tmp_path):
     w.save(p)
     w2 = Whitener.load(p)
     assert torch.allclose(w.transform(g), w2.transform(g), atol=1e-5)
+
+
+# ── streaming fit: same result as in-memory, without materializing all gists ────
+
+
+def test_streaming_fit_matches_in_memory():
+    g = _anisotropic_gists(n=3000, d=16)
+    full = Whitener.fit(g)
+    chunks = [g[i : i + 250] for i in range(0, len(g), 250)]  # 12 chunks
+    stream = Whitener.fit_streaming(iter(chunks))
+    # same statistical fit -> same whitened output
+    assert torch.allclose(full.transform(g), stream.transform(g), atol=1e-2)
+    assert torch.allclose(full.mean, stream.mean, atol=1e-3)
+
+
+# ── per-slot whiteners: 8 slots with different distributions, each whitened ──────
+
+
+def _per_slot_gists(n=1500, k=8, d=8):
+    torch.manual_seed(1)
+    g = torch.randn(n, k, d)
+    for s in range(k):  # give each slot index a different scale + mean
+        g[:, s, :] *= 1.0 + s
+        g[:, s, 0] += s
+    return g
+
+
+def test_per_slot_whitens_each_slot_independently():
+    g = _per_slot_gists()
+    w = PerSlotWhitener.fit(g)
+    z = w.transform(g)  # [N, k, d]
+    for s in range(g.shape[1]):
+        zs = z[:, s, :]
+        assert torch.allclose(zs.mean(0), torch.zeros(g.shape[2]), atol=1e-4), f"slot {s} mean"
+        cov = (zs.T @ zs) / (zs.shape[0] - 1)
+        assert torch.allclose(cov, torch.eye(g.shape[2]), atol=5e-2), f"slot {s} cov"
+
+
+def test_per_slot_round_trip():
+    g = _per_slot_gists()
+    w = PerSlotWhitener.fit(g)
+    assert torch.allclose(w.inverse(w.transform(g)), g, atol=1e-3)
