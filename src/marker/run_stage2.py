@@ -157,7 +157,7 @@ def main() -> None:
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
-    max_span, max_sents, min_sents = 48, 24, args.window + 1
+    max_span, max_sents, min_sents = 64, 24, args.window + 1  # 64 = stage-1 training cap; 48 tripled truncation (9.1% vs 3.4%)
     if args.smoke:
         args.model_name, args.repo, args.n_docs, args.steps = "Qwen/Qwen2.5-0.5B", None, 30, 60
         args.window = 4
