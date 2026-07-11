@@ -61,6 +61,8 @@ echo "  offer $OFFER_ID"
 read -r -d '' ONSTART <<EOS || true
 exec > /proc/1/fd/1 2>&1
 export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_HUB_ETAG_TIMEOUT=60      # default 10s HEAD timeout blows on flaky nodes
+export HF_HUB_DOWNLOAD_TIMEOUT=60
 ( while true; do echo "  ...setup heartbeat \$(date -u +%H:%M:%S)"; sleep 40; done ) &
 HB=\$!
 cd /root
