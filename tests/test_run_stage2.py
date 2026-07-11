@@ -143,6 +143,19 @@ def test_recall_within_doc_isolates_succession_from_topic():
     perfect = _recall_within_doc(t.clone(), t, doc, topk=1)
     assert perfect["recall"] == 1.0
     assert perfect["pool"] == 4.0  # mean same-doc candidates
+
+
+def test_within_doc_chance_is_mean_of_inverse_pools_not_inverse_mean():
+    # Jensen: E[1/n] > 1/E[n] for mixed pool sizes. Pools of 2 and 4 (mean 3):
+    # true recall@1 chance = (2*(1/2) + 4*(1/4)) / 6 = 1/3? NO — per-ROW chance:
+    # each of the 2 rows in the small doc has chance 1/2, each of the 4 rows in
+    # the big doc 1/4 -> mean = (0.5+0.5+0.25*4)/6 = 2/6 + ... compute: 0.3333?
+    # (2*0.5 + 4*0.25)/6 = 2/6 = 0.333 vs 1/mean(pool)=1/3.333=0.3 — distinct.
+    t = torch.eye(6)
+    doc = torch.tensor([0, 0, 1, 1, 1, 1])  # pools: 2,2,4,4,4,4
+    got = _recall_within_doc(torch.randn(6, 6), t, doc, topk=1)
+    assert abs(got["chance"] - (2 * 0.5 + 4 * 0.25) / 6) < 1e-6  # E[1/n] = 1/3
+    assert abs(got["pool"] - (2 * 2 + 4 * 4) / 6) < 1e-6  # E[n] = 10/3
     # prediction = the doc centroid (pure topic, no succession): within-doc
     # recall@1 must be ~chance (1/4), nowhere near 1.0
     centroid = torch.stack([t[doc == d].mean(0) for d in doc.tolist()])

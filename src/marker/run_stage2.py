@@ -251,9 +251,14 @@ def _recall_within_doc(p, t, doc, topk=5):  # noqa: ANN001
     n = sims.shape[0]
     top = sims.topk(min(topk, n), dim=-1).indices
     hits = (top == torch.arange(n, device=sims.device).unsqueeze(1)).any(-1)
+    pools = same.float().sum(1)
     return {
         "recall": float(hits.float().mean()),
-        "pool": float(same.float().sum(1).mean()),
+        "pool": float(pools.mean()),
+        # blind-guess baseline computed the RIGHT way: average each row's own
+        # 1/pool (E[1/n]), not 1/average-pool (1/E[n]) — with mixed pool sizes
+        # the latter understates chance (Jensen) and flatters the result.
+        "chance": float((topk / pools).clamp(max=1.0).mean()),
     }
 
 
@@ -343,6 +348,7 @@ def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
         # 1/doc_pool); recall@5_doc saturates to 1.0 when doc_pool <= 5 (short
         # reasoning traces), so it only discriminates for long docs.
         "recall@1_doc": round(within1["recall"], 3),
+        "doc_chance": round(within1["chance"], 3),
         "recall@5_doc": round(within5["recall"], 3),
         "doc_pool": round(within5["pool"], 1),
         "diversity": round(prediction_diversity(p), 3),
@@ -480,11 +486,13 @@ def main() -> None:
                 ev = evaluate(model, eval_seqs, args.window, whitener, device)
                 print(f"[step {step}] loss {loss.item():.4f}  eval {ev}", flush=True)
                 # gate reads the BEST eval checkpoint (pre-registered before
-                # launch): the predictor can peak then overfit, and "did it
-                # ever find structure" is the Stage-2 question. FINAL is
-                # reported alongside for honesty about the overfit gap.
-                # Keyed on recall@5_128 — the gate-comparable pool.
-                if ev.get("recall@5_128", -1.0) > best.get("recall@5_128", -1.0):
+                # launch). Keyed on recall@1_doc — the within-doc succession
+                # metric. recall@5_128 anti-correlates with it across training
+                # (topic-matching saturates it early: A's 0.901 was at the
+                # checkpoint WORST at succession), so selecting on it ships a
+                # topic-matcher. recall@5_128 breaks ties.
+                key = (ev.get("recall@1_doc", -1.0), ev.get("recall@5_128", -1.0))
+                if key > (best.get("recall@1_doc", -1.0), best.get("recall@5_128", -1.0)):
                     best = {**ev, "step": step}
                     best_state = {
                         n: v.detach().cpu().clone() for n, v in model.state_dict().items()
@@ -494,18 +502,18 @@ def main() -> None:
         epoch += 1
 
     ev = evaluate(model, eval_seqs, args.window, whitener, device)
-    if ev.get("recall@5_128", -1.0) > best.get("recall@5_128", -1.0):
+    fkey = (ev.get("recall@1_doc", -1.0), ev.get("recall@5_128", -1.0))
+    if fkey > (best.get("recall@1_doc", -1.0), best.get("recall@5_128", -1.0)):
         best = {**ev, "step": step}
         best_state = None  # final model IS the best
     print(f"[FINAL] {ev}", flush=True)
     print(f"[BEST]  {best}", flush=True)
-    dp = best.get("doc_pool", 0) or 0
-    doc_chance = round(1.0 / dp, 3) if dp else None
     print(
-        f"GATE (on BEST): recall@5_128 > 0.40 AND diversity < tgt_sim ({best.get('tgt_sim')}) "
-        f"AND within-doc succession: recall@1_doc ({best.get('recall@1_doc')}) > "
-        f"1/doc_pool ({doc_chance}). recall@1_doc is the length-robust control "
-        "(recall@5_doc saturates when doc_pool <= 5)."
+        f"GATE (on BEST): within-doc succession recall@1_doc ({best.get('recall@1_doc')}) "
+        f"must beat its empirical blind-guess baseline doc_chance ({best.get('doc_chance')}) "
+        f"— THE load-bearing test. recall@5_128 ({best.get('recall@5_128')}) > 0.40 is "
+        "necessary but topic-matching alone saturates it at small doc_pool. "
+        f"Platitude: diversity < tgt_sim ({best.get('tgt_sim')})."
     )
 
     if args.out_repo:

@@ -218,6 +218,26 @@ Sequenced, each gated on the last:
 3. CoT Stage-2 run on an OPEN trace dataset (~$2-3; fresh teacher distillation
    deferred — control over domain/format isn't needed to de-risk mechanism).
 
+### A (GSM8K) RESULT + gate post-mortem (2026-07-11, Fable review)
+
+Run completed clean (encoder gate 0.884; artifacts pushed). Numbers:
+recall@5_128 BEST 0.901 (step 250) but recall@1_doc there 0.427 ~= chance;
+recall@1_doc peaks ~0.51 late (step 2000) vs empirical chance ~0.38-0.42.
+- **The registered recall@5_128>0.40 gate is NEAR-VACUOUS on short traces:**
+  with doc_pool ~3, topic-matching alone saturates it (~0.9+) — it re-measures
+  Stage-1's known topic signal, and it CANNOT FAIL on such corpora. On B
+  (doc_pool ~10) its topic-only baseline is still ~0.5. The load-bearing gate
+  is within-doc succession ONLY.
+- **Honest verdict: succession is real but small on GSM8K** — ~+0.1 absolute
+  over blind guessing (0.48-0.51 vs ~0.40). B (chance ~0.1) is the sharp test.
+- Fixes landed (pre-registered before B's numbers exist): (1) doc_chance now
+  computed empirically per-row as E[topk/pool_i] (1/mean-pool understates
+  chance — Jensen); (2) best-checkpoint selection keys on recall@1_doc, NOT
+  recall@5_128 — the two ANTI-CORRELATE across training (early ckpt = topic
+  matcher, late = step predictor; selecting on @128 shipped the topic-matcher).
+  B is running with old selection: judge B from its printed eval curve using
+  the new criterion; only its pushed artifact is mis-picked.
+
 Fable steers for the CoT run:
 - STEP-TEMPLATE SHORTCUT: math traces are positionally regular ('So the answer
   is...' is always last). Report per-position recall; a terminal-step spike =
