@@ -173,8 +173,37 @@ Success shape: a capacity curve + a boundary-policy verdict + a slot anatomy,
 for the price of one pilot. Feeds directly into whether the "one vector per
 construct" idea (parked above) gets built.
 
+## CoT traces PROMOTED to main line (user call 2026-07-11, Fable steers baked)
+
+CoT is no longer the KILL-gate fallback — it's the aligned objective. Raw web
+prose has WEAK succession (next sentence often drifts topic; predictor ceiling
+= narrative drift). Reasoning traces have TIGHT succession (step n+1 entailed
+by step n) — higher recall ceiling, and what it learns is inference, not
+topic-continuation. That is exactly the Stage-3 latent-reasoning target. The
+raw-text run stays worth its ~$2 as the cheap mechanism check.
+
+Sequenced, each gated on the last:
+1. Raw-text n=1500 validation (IN FLIGHT) — does predict-next-gist work at all.
+2. ENCODER-ON-REASONING CHECK (reason_check.py, ~10 min GPU, rides the next
+   node): gap_closed on consecutive GSM8K step pairs with the EXISTING
+   adapter. Pre-registered: >= 0.4 -> proceed; collapse -> Stage-1 re-fit on
+   CoT data FIRST (the FineWeb-trained gist may be blind to equations /
+   'therefore' / symbolic tokens). Prose reference 0.887.
+3. CoT Stage-2 run on an OPEN trace dataset (~$2-3; fresh teacher distillation
+   deferred — control over domain/format isn't needed to de-risk mechanism).
+
+Fable steers for the CoT run:
+- STEP-TEMPLATE SHORTCUT: math traces are positionally regular ('So the answer
+  is...' is always last). Report per-position recall; a terminal-step spike =
+  predicting the template, not the content. Eval stays document-disjoint.
+- Same-problem negatives are harder AND better here (steps mutually similar):
+  doc-clustered batches turn InfoNCE into 'which step', not 'which topic'.
+- Wrong-step risk compounds down a chain (xdoc < none): draft-and-verify in
+  Stage 3 is load-bearing for CoT, not politeness.
+- No runner fork: same run_stage2.py; CoT = corpus source + newline step
+  splitter, not new architecture.
+
 ## Non-goals (defer)
 
-Diffusion head (phase B); the CoT-distillation data variant (parked in
-LATENT_PLAN, only if raw-text predictor hits the KILL gate); 32B; Stage-3
-runtime.
+Diffusion head (phase B); fresh teacher distillation (open datasets first);
+32B; Stage-3 runtime.
