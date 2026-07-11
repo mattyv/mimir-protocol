@@ -68,8 +68,11 @@ echo "=== clone ==="
 git clone --branch claude/project-review-6rx97z --single-branch https://github.com/mattyv/mimir-protocol.git 2>&1 | tail -2
 cd /root/mimir-protocol
 echo "=== pip ==="
-pip install 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -4 \
-  || { sleep 20; pip install 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -4; }
+for pt in 1 2 3 4; do
+  pip install --timeout 100 --retries 5 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -3 && python -c 'import peft,bitsandbytes,transformers,datasets' 2>/dev/null && break
+  echo "  pip attempt \$pt failed (flaky node network), retrying in 15s..."; sleep 15
+done
+python -c 'import peft,bitsandbytes,transformers,datasets' || { kill \$HB; echo "SETUPFAIL (pip could not install deps after retries — flaky node network; relaunch)"; echo "ALLDONE"; exit 1; }
 python -c "import torch,peft,bitsandbytes,datasets; assert torch.cuda.is_available(), 'CUDA unavailable'; print('CUDA True')" || { kill \$HB; echo "SETUPFAIL (no CUDA — driver/image mismatch, e.g. error 804; relaunch for another node)"; echo "ALLDONE"; exit 1; }
 echo "=== HF token check (fail fast) ==="
 python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get('name'))" \
