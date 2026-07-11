@@ -3,7 +3,7 @@
 # the vast-logs branch on every change so another session can `git pull` them.
 # No auto-shutdown of instances — that's a separate, explicit decision.
 set -u
-cd /Users/matthew/Code/mimir-protocol
+cd /tmp/vast-logs-wt
 SSHOPT=(-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes)
 NODES=("18250 ssh5.vast.ai n1" "23804 ssh2.vast.ai n2" "24118 ssh6.vast.ai n3" "24126 ssh5.vast.ai n4")
 STATUS=/tmp/vast_poll_status.txt
