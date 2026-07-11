@@ -211,20 +211,23 @@ def test_evaluate_reports_gate_metrics():
 # ── CoT corpus wiring: reasoning-step splitter vs sentence splitter ──────────────
 
 
-def test_split_units_cot_uses_step_splitter():
+def test_split_units_line_uses_step_splitter():
     sol = (
         "Natalia sold 48/2 = <<48/2=24>>24 clips in May.\n"
         "She sold 48+24 = <<48+24=72>>72 altogether.\n"
         "#### 72"
     )
-    units = _split_units(sol, "cot")
+    units = _split_units(sol, "line")
     assert units == [
         "Natalia sold 48/2 = 24 clips in May.",
         "She sold 48+24 = 72 altogether.",
     ]  # calc annotations stripped, answer line dropped
 
 
-def test_split_units_web_uses_sentence_splitter():
-    units = _split_units("The cat sat. The dog ran. Birds fly.", "web")
+def test_split_units_sentence_uses_sentence_splitter():
+    # long reasoning traces (OpenR1 solutions) split by sentence -> many units,
+    # doc_pool > 5 so the within-doc gate bites; matches the encoder's prose
+    # training distribution better than line splitting.
+    units = _split_units("First we set x=2. Then y=3 follows. So the sum is 5.", "sentence")
     assert len(units) == 3
-    assert units[0].startswith("The cat")
+    assert units[0].startswith("First")

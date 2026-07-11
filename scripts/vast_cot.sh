@@ -20,6 +20,10 @@ DISK_GB=90
 MODEL="${MODEL:-Qwen/Qwen2.5-7B}"
 REPO="${REPO:-mattyvee/mimir-artifacts}"
 DATASET="${DATASET:-openai/gsm8k}"
+DSCONFIG="${DSCONFIG:-}"       # HF config (gsm8k auto-defaults to 'main')
+TEXTFIELD="${TEXTFIELD:-}"     # row field (gsm8k->answer, else->solution)
+UNIT="${UNIT:-line}"           # line (gsm8k step-per-line) | sentence (long solutions)
+SKIP_REASON="${SKIP_REASON:-0}"  # B (OpenR1 LaTeX) isn't what reason_check tests
 NPROB="${NPROB:-150}"          # reason_check problems
 GATE="${GATE:-0.4}"            # gap_closed threshold to proceed
 NDOCS="${NDOCS:-3000}"         # cot traces (GSM8K train has 7473)
@@ -28,6 +32,7 @@ WINDOW="${WINDOW:-3}"          # reasoning traces are short
 DMODEL="${DMODEL:-384}"        # smaller than the raw run's 640 (overfit)
 LAYERS="${LAYERS:-4}"
 EVAL_EVERY="${EVAL_EVERY:-250}"
+OUTSUBDIR="${OUTSUBDIR:-stage2_predictor}"  # distinct per parallel run (no clobber)
 TIMEOUT="${TIMEOUT:-3h}"
 
 echo "→ Searching RTX 3090 (reliability >= 0.98, inet_down >= 500)..."
@@ -57,24 +62,31 @@ echo "=== download ${MODEL} (authenticated, 20min cap) ==="
 timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2 \
   || { kill \$HB; echo "SETUPFAIL (download too slow)"; echo "ALLDONE"; exit 1; }
 
-echo "=== STEP 1: reason_check (encoder-on-reasoning gate, ${NPROB} problems) ==="
-timeout 30m env PYTHONPATH=src python -u -m marker.reason_check \
-  --model-name ${MODEL} --repo ${REPO} --n-problems ${NPROB} 2>&1 | tee /root/reason.log
-GC=\$(grep 'gap_closed=' /root/reason.log | tail -1 | sed -E 's/.*gap_closed=([-0-9.]+).*/\1/')
-echo "REASON_GAP_CLOSED=\${GC:-none}"
-PASS=\$(python3 -c "print('yes' if float('\${GC:-0}') >= ${GATE} else 'no')" 2>/dev/null || echo no)
-if [ "\$PASS" != "yes" ]; then
-  kill \$HB 2>/dev/null
-  echo "REASON GATE FAIL (gap_closed=\${GC:-none} < ${GATE}) — Stage-1 re-fit on CoT is the next fork, NOT this run."
-  echo "ALLDONE"
-  exit 0
+if [ "${SKIP_REASON}" != "1" ]; then
+  echo "=== STEP 1: reason_check (encoder-on-reasoning gate, ${NPROB} problems) ==="
+  timeout 30m env PYTHONPATH=src python -u -m marker.reason_check \
+    --model-name ${MODEL} --repo ${REPO} --n-problems ${NPROB} 2>&1 | tee /root/reason.log
+  GC=\$(grep 'gap_closed=' /root/reason.log | tail -1 | sed -E 's/.*gap_closed=([-0-9.]+).*/\1/')
+  echo "REASON_GAP_CLOSED=\${GC:-none}"
+  PASS=\$(python3 -c "print('yes' if float('\${GC:-0}') >= ${GATE} else 'no')" 2>/dev/null || echo no)
+  if [ "\$PASS" != "yes" ]; then
+    kill \$HB 2>/dev/null
+    echo "REASON GATE FAIL (gap_closed=\${GC:-none} < ${GATE}) — Stage-1 re-fit on CoT is the next fork, NOT this run."
+    echo "ALLDONE"
+    exit 0
+  fi
+  echo "REASON GATE PASS (gap_closed=\${GC} >= ${GATE}) — proceeding to CoT Stage-2 run."
+else
+  echo "=== reason_check SKIPPED (SKIP_REASON=1; this corpus is not GSM8K arithmetic) ==="
 fi
-echo "REASON GATE PASS (gap_closed=\${GC} >= ${GATE}) — proceeding to CoT Stage-2 run."
 
-echo "=== STEP 2: CoT Stage-2 run (dataset=${DATASET} ndocs=${NDOCS} window=${WINDOW} dmodel=${DMODEL} layers=${LAYERS}) ==="
+DS_ARGS="--dataset ${DATASET} --unit ${UNIT}"
+[ -n "${DSCONFIG}" ] && DS_ARGS="\$DS_ARGS --dataset-config ${DSCONFIG}"
+[ -n "${TEXTFIELD}" ] && DS_ARGS="\$DS_ARGS --text-field ${TEXTFIELD}"
+echo "=== STEP 2: CoT Stage-2 run (dataset=${DATASET} unit=${UNIT} ndocs=${NDOCS} window=${WINDOW} dmodel=${DMODEL} layers=${LAYERS}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_stage2 \
-  --model-name ${MODEL} --repo ${REPO} --out-repo ${REPO} \
-  --corpus cot --dataset ${DATASET} \
+  --model-name ${MODEL} --repo ${REPO} --out-repo ${REPO} --out-subdir ${OUTSUBDIR} \
+  --corpus cot \$DS_ARGS \
   --n-docs ${NDOCS} --steps ${STEPS} --window ${WINDOW} \
   --d-model ${DMODEL} --layers ${LAYERS} --eval-every ${EVAL_EVERY} 2>&1 | tee /root/cot.log
 kill \$HB 2>/dev/null
