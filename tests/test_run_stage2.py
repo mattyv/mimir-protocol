@@ -190,6 +190,18 @@ def test_recall_subsampled_pool_is_easier_than_global():
     assert 0.0 <= sub <= 1.0
 
 
+def test_eval_smoke_runs_and_covers_subsample_branch(capsys):
+    # the pre-encode on-device eval probe (GRAD_OK philosophy): device bugs in
+    # the eval metrics must crash in minute 1, not after 90 min of encode.
+    # On CPU it just proves the probe runs and reaches the >128-pool branch.
+    from marker.run_stage2 import _eval_smoke
+
+    _eval_smoke("cpu")
+    out = capsys.readouterr().out
+    assert "EVAL_SMOKE_OK" in out
+    assert "recall@5_128" in out
+
+
 def test_evaluate_reports_gate_metrics():
     torch.manual_seed(0)
     m = NextThoughtPredictor(d=6, k=2, d_model=16, layers=1, heads=2)

@@ -285,6 +285,21 @@ def _recall_subsampled(p, t, topk=5, pool=128, seed=0):  # noqa: ANN001
     return float((beaten_by <= topk - 1).float().mean())
 
 
+def _eval_smoke(device):  # noqa: ANN001
+    """Exercise the FULL evaluate() path on `device` with a throwaway tiny
+    predictor BEFORE the expensive encode. GPU-only device bugs in the eval
+    metrics are invisible to CPU tests (twice now: to_leaf_param, the
+    _recall_subsampled cpu/cuda gather) — this crashes them in minute 1 for
+    ~$0.01 instead of after 90 min of encode+train. Pool is sized >128 so the
+    subsampled-decoy branch runs too. GRAD_OK philosophy: fail loudly, early."""
+    k, d = 2, 8
+    m = NextThoughtPredictor(d=d, k=k, d_model=16, layers=1, heads=2).to(device)
+    seqs = [torch.randn(140, k, d) for _ in range(2)]  # 210 pairs > 128
+    ev = evaluate(m, seqs, 4, IdentityWhitener(), device)
+    assert "recall@5_128" in ev and ev["pool"] > 128, f"eval smoke incomplete: {ev}"
+    print(f"EVAL_SMOKE_OK {ev}", flush=True)
+
+
 @torch.no_grad()
 def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
     """Retrieval eval, three pools: recall@5 over ALL eval targets (hardest,
@@ -403,6 +418,7 @@ def main() -> None:
         print(f"=== SMOKE (tiny model, corpus={args.corpus} unit={unit}) ===")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _eval_smoke(device)  # crash device bugs in the eval path NOW, not post-encode
     quantize = device == "cuda" and not args.smoke
     pm, gist, tok = _load_stage1(args.model_name, args.repo, device, quantize)
 
