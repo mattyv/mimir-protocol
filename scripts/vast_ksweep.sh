@@ -48,7 +48,7 @@ cd /root/mimir-protocol
 echo "=== pip ==="
 pip install 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -4 \
   || { sleep 20; pip install 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -4; }
-python -c "import torch,peft,bitsandbytes,datasets; print('CUDA', torch.cuda.is_available())" || { kill \$HB; echo "SETUPFAIL"; echo "ALLDONE"; exit 1; }
+python -c "import torch,peft,bitsandbytes,datasets; assert torch.cuda.is_available(), 'CUDA unavailable'; print('CUDA True')" || { kill \$HB; echo "SETUPFAIL (no CUDA — driver/image mismatch, e.g. error 804; relaunch for another node)"; echo "ALLDONE"; exit 1; }
 python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get('name'))" \
   || { kill \$HB; echo "SETUPFAIL (bad/revoked HF token)"; echo "ALLDONE"; exit 1; }
 echo "=== download ${MODEL} (20min cap) ==="

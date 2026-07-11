@@ -62,7 +62,7 @@ cd /root/mimir-protocol
 echo "=== pip ==="
 pip install 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -4 \
   || { sleep 20; pip install 'transformers>=4.45,<5' 'accelerate>=1.0' peft bitsandbytes datasets sentencepiece hf_transfer safetensors 2>&1 | tail -4; }
-python -c "import torch,peft,bitsandbytes,datasets; print('CUDA', torch.cuda.is_available())" || { kill \$HB; echo "SETUPFAIL"; echo "ALLDONE"; exit 1; }
+python -c "import torch,peft,bitsandbytes,datasets; assert torch.cuda.is_available(), 'CUDA unavailable'; print('CUDA True')" || { kill \$HB; echo "SETUPFAIL (no CUDA — driver/image mismatch, e.g. error 804; relaunch for another node)"; echo "ALLDONE"; exit 1; }
 echo "=== HF token check (fail fast) ==="
 python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get('name'))" \
   || { kill \$HB; echo "SETUPFAIL (bad/revoked HF token)"; echo "ALLDONE"; exit 1; }
@@ -83,10 +83,19 @@ timeout 30m env PYTHONPATH=src python -u -m marker.reason_check \
   --model-name ${MODEL} --repo ${REPO} --n-problems ${NPROB} \$CHECK_ARGS 2>&1 | tee /root/reason.log
 GC=\$(grep 'gap_closed=' /root/reason.log | tail -1 | sed -E 's/.*gap_closed=([-0-9.]+).*/\1/')
 echo "REASON_GAP_CLOSED=\${GC:-none}"
-PASS=\$(python3 -c "print('yes' if float('\${GC:-0}') >= ${GATE} else 'no')" 2>/dev/null || echo no)
+if [ -z "\${GC}" ]; then
+  # no gap_closed printed => reason_check never finished (infra: timeout, CPU
+  # fallback, crash). NOT an encoder verdict — flag as SETUPFAIL so it reads as
+  # "retry on another node", not "encoder blind, re-fit".
+  kill \$HB 2>/dev/null
+  echo "SETUPFAIL (reason_check produced no gap_closed — infra, not a gate verdict; relaunch)"
+  echo "ALLDONE"
+  exit 1
+fi
+PASS=\$(python3 -c "print('yes' if float('\${GC}') >= ${GATE} else 'no')" 2>/dev/null || echo no)
 if [ "\$PASS" != "yes" ]; then
   kill \$HB 2>/dev/null
-  echo "REASON GATE FAIL (gap_closed=\${GC:-none} < ${GATE}) — encoder is blind to this corpus; Stage-1 re-fit is the next fork, NOT this run."
+  echo "REASON GATE FAIL (gap_closed=\${GC} < ${GATE}) — encoder is blind to this corpus; Stage-1 re-fit is the next fork, NOT this run."
   echo "ALLDONE"
   exit 0
 fi
