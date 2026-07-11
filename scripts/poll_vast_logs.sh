@@ -13,8 +13,11 @@ log(){ echo "[$(date -u +%H:%M:%S)Z] $*" | tee -a "$STATUS"; }
 
 pull_one() { # port host tag
   local port=$1 host=$2 tag=$3
-  ssh "${SSHOPT[@]}" -p "$port" "root@$host" \
-    "cat /root/ksweep.log 2>/dev/null" > "runs/vast_logs/${tag}.log" 2>/dev/null
+  local out
+  out=$(ssh "${SSHOPT[@]}" -p "$port" "root@$host" "cat /root/ksweep.log 2>/dev/null" 2>/dev/null)
+  # ponytail: only overwrite if we actually got something — a dead/unreachable
+  # host must never truncate the last good snapshot (bit us on n2's final log).
+  [ -n "$out" ] && printf '%s\n' "$out" > "runs/vast_logs/${tag}.log"
 }
 
 alive_one() { # port host -> prints pid or empty
