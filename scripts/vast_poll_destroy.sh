@@ -36,7 +36,19 @@ destroy() {
   return 1
 }
 
-reason=""
+# is the instance in a healthy running/loading state? echoes yes|no|gone.
+instance_state() {
+  vastai show instances --raw 2>/dev/null | python3 -c "import sys,json
+try: d=json.load(sys.stdin)
+except Exception: print('yes'); sys.exit()  # API hiccup -> don't act on it
+m={str(i.get('id')): i for i in d}
+i=m.get('$ID')
+if i is None: print('gone'); sys.exit()
+st=str(i.get('actual_status')); it=str(i.get('intended_status'))
+print('no' if it=='stopped' or st in ('exited','offline') else 'yes')" 2>/dev/null || echo yes
+}
+
+reason=""; badstate=0
 while true; do
   now=$(date +%s)
   mins=$(( (now - start) / 60 ))
@@ -46,14 +58,16 @@ while true; do
   fi
   # pull recent logs (best-effort; a not-yet-booted node returns nothing)
   vastai logs "$ID" --tail 400 > "$LOG.new" 2>/dev/null && mv "$LOG.new" "$LOG"
-  if grep -q "ALLDONE" "$LOG" 2>/dev/null; then
-    reason="ALLDONE"
-    break
-  fi
-  if grep -q "SETUPFAIL" "$LOG" 2>/dev/null; then
-    reason="SETUPFAIL"
-    break
-  fi
+  if grep -q "ALLDONE" "$LOG" 2>/dev/null; then reason="ALLDONE"; break; fi
+  if grep -q "SETUPFAIL" "$LOG" 2>/dev/null; then reason="SETUPFAIL"; break; fi
+  # instance-state watch: a node whose onstart exited non-zero goes
+  # intent=stopped and NEVER emits ALLDONE — the log-only poller would spin to
+  # the hard cap. Require 2 consecutive bad reads (tolerate a transient).
+  case "$(instance_state)" in
+    gone) reason="INSTANCE GONE (already destroyed/expired)"; break ;;
+    no)   badstate=$((badstate+1)); [ "$badstate" -ge 2 ] && { reason="INSTANCE STOPPED (onstart exited / preempted)"; break; } ;;
+    *)    badstate=0 ;;
+  esac
   sleep "$POLL_SEC"
 done
 
