@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # Stage-2 CoT run on a Vast RTX 3090: TWO gated steps on ONE node.
-#   1. reason_check — does the FineWeb-trained gist encode reasoning steps?
-#      gap_closed >= GATE (default 0.4) -> proceed; below -> STOP (Stage-1
-#      re-fit on CoT data is the next fork, not this run). ~$0.30 if it stops.
+#   1. reason_check ON THIS RUN'S OWN CORPUS — does the FineWeb-trained gist
+#      encode these reasoning units? gap_closed >= GATE (default 0.4) ->
+#      proceed; below -> STOP (Stage-1 re-fit is the next fork, not this run).
+#      ~$0.30 if it stops. Always runs (Fable: an unchecked corpus makes a weak
+#      Stage-2 result uninterpretable — encoder-blind vs succession-failed).
 #   2. CoT Stage-2 run — encode reasoning traces into gist sequences, train the
 #      next-thought predictor, eval on the registered gates (recall@5_128 +
 #      within-doc succession control). Smaller predictor + finer eval than the
 #      raw-text run (which overfit by step 500).
+#
+#   A (GSM8K):  HF_TOKEN=... ./scripts/vast_cot.sh
+#   B (OpenR1): DATASET=open-r1/OpenR1-Math-220k UNIT=sentence NDOCS=2000 \
+#               WINDOW=6 OUTSUBDIR=stage2_cot_openr1 HF_TOKEN=... ./scripts/vast_cot.sh
 #
 # HF_TOKEN (from env) authenticates the 7B download + artifact push. Never
 # hardcoded. Disposable, repo-scoped; revoke after the campaign.
@@ -23,10 +29,12 @@ DATASET="${DATASET:-openai/gsm8k}"
 DSCONFIG="${DSCONFIG:-}"       # HF config (gsm8k auto-defaults to 'main')
 TEXTFIELD="${TEXTFIELD:-}"     # row field (gsm8k->answer, else->solution)
 UNIT="${UNIT:-line}"           # line (gsm8k step-per-line) | sentence (long solutions)
-SKIP_REASON="${SKIP_REASON:-0}"  # B (OpenR1 LaTeX) isn't what reason_check tests
+SPLIT="${SPLIT:-}"             # reason_check split (gsm8k->test, else->train)
 NPROB="${NPROB:-150}"          # reason_check problems
 GATE="${GATE:-0.4}"            # gap_closed threshold to proceed
-NDOCS="${NDOCS:-3000}"         # cot traces (GSM8K train has 7473)
+NDOCS="${NDOCS:-7000}"         # STREAMED docs, not kept: min_sents=window+1 drops
+                               # ~55% of GSM8K (median 3 steps) -> 7000 keeps ~3100.
+                               # More kept data is the cheapest overfit fix.
 STEPS="${STEPS:-4000}"
 WINDOW="${WINDOW:-3}"          # reasoning traces are short
 DMODEL="${DMODEL:-384}"        # smaller than the raw run's 640 (overfit)
@@ -62,27 +70,27 @@ echo "=== download ${MODEL} (authenticated, 20min cap) ==="
 timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2 \
   || { kill \$HB; echo "SETUPFAIL (download too slow)"; echo "ALLDONE"; exit 1; }
 
-if [ "${SKIP_REASON}" != "1" ]; then
-  echo "=== STEP 1: reason_check (encoder-on-reasoning gate, ${NPROB} problems) ==="
-  timeout 30m env PYTHONPATH=src python -u -m marker.reason_check \
-    --model-name ${MODEL} --repo ${REPO} --n-problems ${NPROB} 2>&1 | tee /root/reason.log
-  GC=\$(grep 'gap_closed=' /root/reason.log | tail -1 | sed -E 's/.*gap_closed=([-0-9.]+).*/\1/')
-  echo "REASON_GAP_CLOSED=\${GC:-none}"
-  PASS=\$(python3 -c "print('yes' if float('\${GC:-0}') >= ${GATE} else 'no')" 2>/dev/null || echo no)
-  if [ "\$PASS" != "yes" ]; then
-    kill \$HB 2>/dev/null
-    echo "REASON GATE FAIL (gap_closed=\${GC:-none} < ${GATE}) — Stage-1 re-fit on CoT is the next fork, NOT this run."
-    echo "ALLDONE"
-    exit 0
-  fi
-  echo "REASON GATE PASS (gap_closed=\${GC} >= ${GATE}) — proceeding to CoT Stage-2 run."
-else
-  echo "=== reason_check SKIPPED (SKIP_REASON=1; this corpus is not GSM8K arithmetic) ==="
-fi
-
 DS_ARGS="--dataset ${DATASET} --unit ${UNIT}"
 [ -n "${DSCONFIG}" ] && DS_ARGS="\$DS_ARGS --dataset-config ${DSCONFIG}"
 [ -n "${TEXTFIELD}" ] && DS_ARGS="\$DS_ARGS --text-field ${TEXTFIELD}"
+CHECK_ARGS="\$DS_ARGS"
+[ -n "${SPLIT}" ] && CHECK_ARGS="\$CHECK_ARGS --split ${SPLIT}"
+
+echo "=== STEP 1: reason_check ON THIS RUN'S CORPUS (${DATASET}, ${NPROB} problems) ==="
+# encoder gate on the run's own distribution — a weak Stage-2 result on an
+# unchecked corpus can't separate encoder-blind from succession-failed.
+timeout 30m env PYTHONPATH=src python -u -m marker.reason_check \
+  --model-name ${MODEL} --repo ${REPO} --n-problems ${NPROB} \$CHECK_ARGS 2>&1 | tee /root/reason.log
+GC=\$(grep 'gap_closed=' /root/reason.log | tail -1 | sed -E 's/.*gap_closed=([-0-9.]+).*/\1/')
+echo "REASON_GAP_CLOSED=\${GC:-none}"
+PASS=\$(python3 -c "print('yes' if float('\${GC:-0}') >= ${GATE} else 'no')" 2>/dev/null || echo no)
+if [ "\$PASS" != "yes" ]; then
+  kill \$HB 2>/dev/null
+  echo "REASON GATE FAIL (gap_closed=\${GC:-none} < ${GATE}) — encoder is blind to this corpus; Stage-1 re-fit is the next fork, NOT this run."
+  echo "ALLDONE"
+  exit 0
+fi
+echo "REASON GATE PASS (gap_closed=\${GC} >= ${GATE}) — proceeding to CoT Stage-2 run."
 echo "=== STEP 2: CoT Stage-2 run (dataset=${DATASET} unit=${UNIT} ndocs=${NDOCS} window=${WINDOW} dmodel=${DMODEL} layers=${LAYERS}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_stage2 \
   --model-name ${MODEL} --repo ${REPO} --out-repo ${REPO} --out-subdir ${OUTSUBDIR} \

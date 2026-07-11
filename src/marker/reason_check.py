@@ -53,6 +53,15 @@ def main() -> None:
     ap.add_argument("--n-problems", type=int, default=100)
     ap.add_argument("--max-span", type=int, default=64)
     ap.add_argument("--batch", type=int, default=8)
+    # check the encoder on the RUN'S OWN corpus (Fable batch review: skipping
+    # the check for a non-GSM8K corpus makes a weak Stage-2 result
+    # uninterpretable — encoder-blind vs succession-failed).
+    ap.add_argument("--dataset", default="openai/gsm8k")
+    ap.add_argument("--dataset-config", default=None)
+    ap.add_argument("--text-field", default=None)
+    ap.add_argument("--unit", choices=["line", "sentence"], default="line")
+    ap.add_argument("--split", default=None, help="gsm8k default test; others train")
+    ap.add_argument("--max-pairs", type=int, default=1500)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,18 +69,27 @@ def main() -> None:
 
     from datasets import load_dataset  # noqa: PLC0415
 
-    ds = load_dataset("openai/gsm8k", "main", split="test", streaming=True)
+    from marker.run_stage2 import _split_units  # noqa: PLC0415
+
+    is_gsm = args.dataset == "openai/gsm8k"
+    cfg = args.dataset_config or ("main" if is_gsm else None)
+    field = args.text_field or ("answer" if is_gsm else "solution")
+    split = args.split or ("test" if is_gsm else "train")
+    ds = load_dataset(args.dataset, cfg, split=split, streaming=True)
     spans, conts = [], []
     for i, row in enumerate(ds):
-        if i >= args.n_problems:
+        if i >= args.n_problems or len(spans) >= args.max_pairs:
             break
-        for a, b in step_pairs(split_solution_steps(row["answer"])):
+        for a, b in step_pairs(_split_units(row.get(field) or "", args.unit)):
             sa = tok(a, add_special_tokens=False).input_ids[: args.max_span]
             sb = tok(b, add_special_tokens=False).input_ids[: args.max_span]
             if sa and sb:
                 spans.append(sa)
                 conts.append(sb)
-    print(f"{len(spans)} reasoning-step pairs from {args.n_problems} problems", flush=True)
+    print(
+        f"{len(spans)} step pairs from {args.dataset} ({args.unit} units)",
+        flush=True,
+    )
 
     # mean CE per condition over all pairs -> one PPL each -> gap_closed
     sums = {"gist": 0.0, "full": 0.0, "none": 0.0}
