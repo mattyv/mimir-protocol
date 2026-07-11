@@ -22,6 +22,7 @@ from marker.run_stage2 import (
     _recall_subsampled,
     _recall_within_doc,
     _smoke_texts,
+    _split_units,
     _windows,
     evaluate,
 )
@@ -195,5 +196,35 @@ def test_evaluate_reports_gate_metrics():
     seqs = [torch.randn(9, 2, 6) for _ in range(4)]
     w = PerSlotWhitener.fit(torch.cat(seqs))
     ev = evaluate(m, seqs, 4, w, "cpu")
-    for key in ("recall@5", "recall@5_128", "recall@5_doc", "doc_pool", "tgt_sim", "diversity"):
+    for key in (
+        "recall@5",
+        "recall@5_128",
+        "recall@1_doc",
+        "recall@5_doc",
+        "doc_pool",
+        "tgt_sim",
+        "diversity",
+    ):
         assert key in ev, f"missing {key}"
+
+
+# ── CoT corpus wiring: reasoning-step splitter vs sentence splitter ──────────────
+
+
+def test_split_units_cot_uses_step_splitter():
+    sol = (
+        "Natalia sold 48/2 = <<48/2=24>>24 clips in May.\n"
+        "She sold 48+24 = <<48+24=72>>72 altogether.\n"
+        "#### 72"
+    )
+    units = _split_units(sol, "cot")
+    assert units == [
+        "Natalia sold 48/2 = 24 clips in May.",
+        "She sold 48+24 = 72 altogether.",
+    ]  # calc annotations stripped, answer line dropped
+
+
+def test_split_units_web_uses_sentence_splitter():
+    units = _split_units("The cat sat. The dog ran. Birds fly.", "web")
+    assert len(units) == 3
+    assert units[0].startswith("The cat")

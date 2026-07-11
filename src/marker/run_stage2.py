@@ -142,21 +142,34 @@ def _load_stage1(model_name, repo, device, quantize):  # noqa: ANN001
     return pm, gist, tok
 
 
-def _doc_sentence_spans(tok, text, max_span, max_sents):  # noqa: ANN001
+def _split_units(text, corpus):  # noqa: ANN001
+    """A document -> its ordered thought units. web = sentences (free +
+    deterministic); cot = reasoning steps (one per line, calculator
+    annotations stripped, answer line dropped — reason_check.split_solution_steps).
+    The unit of thought is the only thing that changes between corpora; the
+    encode/window/train machinery is shared (Fable steer: no runner fork)."""
+    if corpus == "cot":
+        from marker.reason_check import split_solution_steps  # noqa: PLC0415
+
+        return split_solution_steps(text)
     from marker.gist import split_sentences  # noqa: PLC0415
 
-    sents = split_sentences(text)[:max_sents]
-    spans = [tok(s, add_special_tokens=False).input_ids[:max_span] for s in sents]
+    return split_sentences(text)
+
+
+def _doc_sentence_spans(tok, text, max_span, max_sents, corpus="web"):  # noqa: ANN001
+    units = _split_units(text, corpus)[:max_sents]
+    spans = [tok(s, add_special_tokens=False).input_ids[:max_span] for s in units]
     return [s for s in spans if s]
 
 
 @torch.no_grad()
-def encode_corpus(pm, gist, tok, docs_text, max_span, max_sents, min_sents, device):  # noqa: ANN001
+def encode_corpus(pm, gist, tok, docs_text, max_span, max_sents, min_sents, device, corpus="web"):  # noqa: ANN001
     """Each document -> a gist sequence [n_sents, k, hidden] (encode every
-    sentence). Returns a list of per-document sequences (>= min_sents long)."""
+    unit). Returns a list of per-document sequences (>= min_sents long)."""
     seqs = []
     for i, text in enumerate(docs_text):
-        spans = _doc_sentence_spans(tok, text, max_span, max_sents)
+        spans = _doc_sentence_spans(tok, text, max_span, max_sents, corpus)
         if len(spans) < min_sents:
             continue
         # encode sentence-by-sentence (variable span lengths -> one at a time)
@@ -298,13 +311,18 @@ def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
     keep = _dedup_keep_idx(t)
     dropped = t.shape[0] - keep.shape[0]
     p, t, doc = p[keep], t[keep], doc[keep]
-    within = _recall_within_doc(p, t, doc, topk=5)
+    within1 = _recall_within_doc(p, t, doc, topk=1)
+    within5 = _recall_within_doc(p, t, doc, topk=5)
     return {
         "recall@1": round(recall_at_k(p, t, 1), 3),
         "recall@5": round(recall_at_k(p, t, 5), 3),
         "recall@5_128": round(_recall_subsampled(p, t, topk=5, pool=128), 3),
-        "recall@5_doc": round(within["recall"], 3),
-        "doc_pool": round(within["pool"], 1),
+        # recall@1_doc is the length-robust topic-shortcut control (chance =
+        # 1/doc_pool); recall@5_doc saturates to 1.0 when doc_pool <= 5 (short
+        # reasoning traces), so it only discriminates for long docs.
+        "recall@1_doc": round(within1["recall"], 3),
+        "recall@5_doc": round(within5["recall"], 3),
+        "doc_pool": round(within5["pool"], 1),
         "diversity": round(prediction_diversity(p), 3),
         "tgt_sim": round(prediction_diversity(t), 3),
         "pool": p.shape[0],
@@ -321,6 +339,20 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=8)
     ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--corpus", choices=["web", "cot"], default="web")
+    ap.add_argument("--dataset", default=None, help="cot: HF dataset (default openai/gsm8k)")
+    ap.add_argument("--dataset-config", default=None, help="cot: HF config (default main)")
+    ap.add_argument(
+        "--text-field", default=None, help="cot: row field with the trace (default answer)"
+    )
+    ap.add_argument(
+        "--eval-every",
+        type=int,
+        default=250,
+        help="finer than 500 (validation overfit peaked at 500)",
+    )
+    ap.add_argument("--d-model", type=int, default=640)
+    ap.add_argument("--layers", type=int, default=6)
     ap.add_argument(
         "--whiten",
         choices=["off", "shrunk", "zca"],
@@ -334,25 +366,37 @@ def main() -> None:
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
-    max_span, max_sents, min_sents = (
-        64,
-        24,
-        args.window + 1,
-    )  # 64 = stage-1 training cap; 48 tripled truncation (9.1% vs 3.4%)
+    if args.corpus == "cot":
+        # reasoning traces: shorter units-per-doc, steps can run longer than a
+        # sentence. min_sents = window+1 so every kept trace yields >=1 window.
+        max_span, max_sents, min_sents = 96, 16, args.window + 1
+    else:
+        max_span, max_sents, min_sents = (
+            64,
+            24,
+            args.window + 1,
+        )  # 64 = stage-1 training cap; 48 tripled truncation (9.1% vs 3.4%)
     if args.smoke:
         args.model_name, args.repo, args.n_docs, args.steps = "Qwen/Qwen2.5-0.5B", None, 40, 300
-        args.window = 4
-        max_span, max_sents, min_sents = 24, 12, 5
-        print("=== SMOKE (tiny model, synthetic corpus) ===")
+        args.window = 4 if args.corpus == "web" else 3
+        max_span, max_sents, min_sents = 24, 12, args.window + 1
+        print(f"=== SMOKE (tiny model, corpus={args.corpus}) ===")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     quantize = device == "cuda" and not args.smoke
     pm, gist, tok = _load_stage1(args.model_name, args.repo, device, quantize)
 
     # ── encode corpus into gist sequences ────────────────────────────────────
-    docs_text = _smoke_texts(args.n_docs) if args.smoke else list(_doc_texts(args.n_docs))
+    if args.smoke:
+        docs_text = (
+            _smoke_cot_texts(args.n_docs) if args.corpus == "cot" else _smoke_texts(args.n_docs)
+        )
+    else:
+        docs_text = list(
+            _doc_texts(args.n_docs, args.corpus, args.dataset, args.dataset_config, args.text_field)
+        )
     seqs = encode_corpus(
-        pm, gist, tok, docs_text[: args.n_docs], max_span, max_sents, min_sents, device
+        pm, gist, tok, docs_text[: args.n_docs], max_span, max_sents, min_sents, device, args.corpus
     )
     print(f"encoded {len(seqs)} gist sequences", flush=True)
     # document-disjoint split
@@ -377,8 +421,8 @@ def main() -> None:
     model = NextThoughtPredictor(
         d=hidden,
         k=k,
-        d_model=256 if args.smoke else 640,
-        layers=2 if args.smoke else 6,
+        d_model=256 if args.smoke else args.d_model,
+        layers=2 if args.smoke else args.layers,
         heads=4 if args.smoke else 8,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
@@ -396,7 +440,7 @@ def main() -> None:
             loss.backward()
             opt.step()
             step += 1
-            if step % (20 if args.smoke else 500) == 0:
+            if step % (20 if args.smoke else args.eval_every) == 0:
                 ev = evaluate(model, eval_seqs, args.window, whitener, device)
                 print(f"[step {step}] loss {loss.item():.4f}  eval {ev}", flush=True)
                 # gate reads the BEST eval checkpoint (pre-registered before
@@ -419,10 +463,13 @@ def main() -> None:
         best_state = None  # final model IS the best
     print(f"[FINAL] {ev}", flush=True)
     print(f"[BEST]  {best}", flush=True)
+    dp = best.get("doc_pool", 0) or 0
+    doc_chance = round(1.0 / dp, 3) if dp else None
     print(
-        "GATE (on BEST): recall@5_128 > 0.40 AND diversity < tgt_sim AND "
-        "recall@5_doc > 5/doc_pool (the topic-shortcut control: beating "
-        "within-doc chance is succession, not document identification)."
+        f"GATE (on BEST): recall@5_128 > 0.40 AND diversity < tgt_sim ({best.get('tgt_sim')}) "
+        f"AND within-doc succession: recall@1_doc ({best.get('recall@1_doc')}) > "
+        f"1/doc_pool ({doc_chance}). recall@1_doc is the length-robust control "
+        "(recall@5_doc saturates when doc_pool <= 5)."
     )
 
     if args.out_repo:
@@ -433,17 +480,48 @@ def main() -> None:
         )
 
 
-def _doc_texts(n):  # noqa: ANN001
-    """Stream n raw document texts from FineWeb-Edu."""
+def _doc_texts(n, corpus="web", dataset=None, config=None, field=None):  # noqa: ANN001
+    """Stream n documents. web = FineWeb-Edu prose (field 'text'); cot =
+    reasoning traces (default openai/gsm8k 'main' split 'train', field
+    'answer' — the step-delimited solution)."""
     from datasets import load_dataset  # noqa: PLC0415
 
-    ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True
-    )
+    if corpus == "cot":
+        ds = load_dataset(
+            dataset or "openai/gsm8k", config or "main", split="train", streaming=True
+        )
+        field = field or "answer"
+    else:
+        ds = load_dataset(
+            "HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True
+        )
+        field = field or "text"
     for seen, row in enumerate(ds):
-        yield row.get("text") or ""
+        yield row.get(field) or ""
         if seen + 1 >= n:
             break
+
+
+_COT_TEMPLATES = [
+    "Start with {a} items.\nAdd {b} more to get {a}+{b} = <<{a}+{b}={c}>>{c}.\n"
+    "Double it: {c}*2 = <<{c}*2={d}>>{d}.\nRemove {b}: {d}-{b} = <<{d}-{b}={e}>>{e}.\n"
+    "Split in half: {e}/2 = <<{e}/2={f}>>{f}.\n#### {f}",
+]
+
+
+def _smoke_cot_texts(n):  # noqa: ANN001
+    """n DISTINCT synthetic GSM8K-style traces (multi-step, deterministic
+    arithmetic succession, calc annotations + #### answer). Proves the cot
+    split/encode/window path without a network dataset."""
+    out = []
+    for i in range(n):
+        a, b = 3 + i, 2 + (i % 9)  # a strictly increasing -> every trace distinct
+        c = a + b
+        d = c * 2
+        e = d - b
+        f = e // 2
+        out.append(_COT_TEMPLATES[0].format(a=a, b=b, c=c, d=d, e=e, f=f))
+    return out
 
 
 def _push_artifacts(model, whitener, repo, manifest):  # noqa: ANN001
