@@ -87,6 +87,28 @@ Predictor must beat these on held-out (document-disjoint) gist sequences:
 3. run_stage2.py — encode/fit/train/eval runner (smoke on tiny model+corpus).
 4. Launcher. Then: write final gate numbers here, launch.
 
+## Parked: gist granularity (user idea 2026-07-12 — one vector per construct)
+
+Current unit of thought = one SENTENCE -> 8 slots (sentence splits are free +
+deterministic). Proposal: one vector per language CONSTRUCT (clause / entity /
+relation) — capacity matched to content, discourse-referent tracking, maybe
+better retention of exact elements. Costs: needs a segmenter (parser
+dependency or learned segmentation = open research), and variable-length
+units break the fixed-[8,d] prediction target (set-matching losses).
+Sequenced empirically, cheapest first:
+1. SLOT-SPECIALIZATION PROBE (piggyback on next eval node): ablate each slot,
+   decode from single slots — did construct-like specialization EMERGE in the
+   learned 8 slots? Entangled slots = evidence for the redesign.
+2. K-SWEEP (already owed, Stage-1-real): k=4~=k=8 => coarse units suffice;
+   k=16>>k=8 => sentences underfunded, finer granularity helps. Also answers
+   the recurring one-vector-per-thought question (prediction on record:
+   k=1 collapses — single-slot attention has no query-dependent readout).
+3. If 1+2 both point finer: CLAUSE-level gisting (comma/conjunction splits,
+   parser-free, k=2-4 per clause) before any full construct/parser fork.
+Note: if the motivation is exact-element retention (ILP_END_RETURN), that is
+not a granularity fix — lossy is lossy at any grain; exact syntax stays on
+the Mimir KV/prefix side.
+
 ## Non-goals (defer)
 
 Diffusion head (phase B); the CoT-distillation data variant (parked in
