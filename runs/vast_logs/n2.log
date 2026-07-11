@@ -93,3 +93,10 @@ GRAD_OK (lora + gist gradients flowing)
     ...eval batch 50
     ...eval batch 60
 [step  6000] loss 2.0069  ppl gist=11.67 full=11.02 none=15.41  gap_closed=0.853
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  6500] loss 2.3587  ppl gist=11.64 full=10.99 none=15.33  gap_closed=0.851
