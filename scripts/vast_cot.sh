@@ -43,11 +43,11 @@ EVAL_EVERY="${EVAL_EVERY:-250}"
 OUTSUBDIR="${OUTSUBDIR:-stage2_predictor}"  # distinct per parallel run (no clobber)
 TIMEOUT="${TIMEOUT:-3h}"
 
-echo "→ Searching RTX 3090 (rel>=0.98, inet>=500, driver>=535)..."
+echo "→ Searching RTX 3090 (rel>=0.98 inet>=500 cuda>=12.4)..."
 OFFER_ID=""
 for try in 1 2 3 4 5; do
   OFFER_ID=$(vastai search offers \
-    'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cuda_vers>=12.4 driver_version>=535 disk_space>=100 reliability>=0.98 inet_down>=500 rentable=true' \
+    'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cuda_vers>=12.4 disk_space>=100 reliability>=0.98 inet_down>=500 rentable=true' \
     --order dph_total --limit 1 --raw 2>/dev/null | \
     python3 -c "import sys,json
 try: o=json.load(sys.stdin); print(o[0]['id'] if o else '')
