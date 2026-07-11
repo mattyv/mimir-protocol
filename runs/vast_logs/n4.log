@@ -1,0 +1,53 @@
+device: cuda  model: Qwen/Qwen2.5-7B  gist_k: 8  quantize: True
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:07<00:22,  7.64s/it]Loading checkpoint shards:  50%|█████     | 2/4 [00:16<00:16,  8.30s/it]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:24<00:08,  8.21s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:30<00:00,  7.29s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:30<00:00,  7.60s/it]
+'(ReadTimeoutError("HTTPSConnectionPool(host='huggingface.co', port=443): Read timed out. (read timeout=10)"), '(Request ID: 10f544e1-b448-43c3-bb07-60bdd38a63a9)')' thrown while requesting HEAD https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/generation_config.json
+Retrying in 1s [Retry 1/5].
+'(ReadTimeoutError("HTTPSConnectionPool(host='huggingface.co', port=443): Read timed out. (read timeout=10)"), '(Request ID: d7a78238-36f0-4a41-b758-a0ba38c1d61d)')' thrown while requesting HEAD https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/generation_config.json
+Retrying in 2s [Retry 2/5].
+'(ReadTimeoutError("HTTPSConnectionPool(host='huggingface.co', port=443): Read timed out. (read timeout=10)"), '(Request ID: 0aabe986-030d-422c-b417-8bb2e9ea5a79)')' thrown while requesting HEAD https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/generation_config.json
+Retrying in 4s [Retry 3/5].
+'(ReadTimeoutError("HTTPSConnectionPool(host='huggingface.co', port=443): Read timed out. (read timeout=10)"), '(Request ID: 788a39c2-2c0d-4cf5-bb0e-81c0f64251d6)')' thrown while requesting HEAD https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/generation_config.json
+Retrying in 8s [Retry 4/5].
+'(MaxRetryError('HTTPSConnectionPool(host=\'huggingface.co\', port=443): Max retries exceeded with url: /Qwen/Qwen2.5-7B/resolve/main/generation_config.json (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x738219bb5290>: Failed to resolve \'huggingface.co\' ([Errno -3] Temporary failure in name resolution)"))'), '(Request ID: 98844326-5512-4ded-8d85-d57e7c72fa5c)')' thrown while requesting HEAD https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/generation_config.json
+Retrying in 8s [Retry 5/5].
+'(ReadTimeoutError("HTTPSConnectionPool(host='huggingface.co', port=443): Read timed out. (read timeout=10)"), '(Request ID: dded8a01-a53f-44fa-895d-5108a2da1915)')' thrown while requesting HEAD https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/generation_config.json
+'(ReadTimeoutError("HTTPSConnectionPool(host='huggingface.co', port=443): Read timed out. (read timeout=10)"), '(Request ID: 819292b0-efef-4a4c-972b-2f501d83b68c)')' thrown while requesting HEAD https://huggingface.co/Qwen/Qwen2.5-7B/resolve/main/custom_generate/generate.py
+Retrying in 1s [Retry 1/5].
+heldout pairs: 519 (document-disjoint from training)
+GRAD_OK (lora + gist gradients flowing)
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step     0] loss 3.4723  ppl gist=38.13 full=15.64 none=19.88  gap_closed=-4.299
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step   500] loss 2.7314  ppl gist=12.50 full=11.12 none=15.94  gap_closed=0.715
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  1000] loss 2.5120  ppl gist=12.25 full=11.43 none=15.73  gap_closed=0.809
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/root/mimir-protocol/src/marker/run_gist_pilot.py", line 235, in <module>
+    main()
+  File "/root/mimir-protocol/src/marker/run_gist_pilot.py", line 175, in main
+    loss.backward()
+  File "/opt/conda/lib/python3.11/site-packages/torch/_tensor.py", line 581, in backward
+    torch.autograd.backward(
+  File "/opt/conda/lib/python3.11/site-packages/torch/autograd/__init__.py", line 347, in backward
+    _engine_run_backward(
+  File "/opt/conda/lib/python3.11/site-packages/torch/autograd/graph.py", line 825, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 632.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 591.12 MiB is free. Including non-PyTorch memory, this process has 22.97 GiB memory in use. Of the allocated memory 20.97 GiB is allocated by PyTorch, and 1.69 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

@@ -174,6 +174,31 @@ Note: if the motivation is exact-element retention (ILP_END_RETURN), that is
 not a granularity fix — lossy is lossy at any grain; exact syntax stays on
 the Mimir KV/prefix side.
 
+## Parallel batch outcome (2026-07-11 — A/B/k-sweep; logs in runs/vast_logs/)
+
+Money: all nodes destroyed+verified, $0 idle burn, ~$5 spent, $10.34 credit left.
+- **A (GSM8K CoT): DONE** — result + post-mortem above (succession real but
+  small; gate rework landed).
+- **k-sweep: 1 of 4 arms survived.** k=4 COMPLETE: gap_closed 0.863 @ 8000
+  steps. NOT directly comparable to k=8's 0.887 (that was 16000 steps; the
+  sweep's own k=8 arm died). k=8 arm: CUDA OOM at step 1000 (24GB 3090,
+  backward pass; partial 0.809 and climbing). k=1 and k=16: produced NOTHING
+  (CN-geolocated hosts, huggingface unreachable — hours of dead download).
+  Granularity question still OPEN: no k=1 collapse test, no k=16 headroom
+  test, no budget-matched k=8. Salvage-session relaunch notes (DEAD_NODES.md):
+  curl-check huggingface reachability in onstart BEFORE burning hours;
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (or smaller batch / 48GB
+  card) for k>=8.
+- **B (OpenR1): never produced a read** — 1x real infra (CUDA 804), then
+  SETUPFAILs on HEALTHY nodes traced to OUR config: reason_check at
+  --max-pairs 1500 ≈ 560 forwards of the 4-bit 7B ≈ the whole 30m step
+  timeout (GSM8K's ~350 pairs fit; OpenR1's don't). Relaunch with
+  --max-pairs ~600 or a 45m step-1 timeout. The sharp succession test is
+  still the most important pending read.
+- A session on another account salvaged during the usage outage: destroyed 3
+  dead nodes, recovered n2's log to completion, pushed branch vast-logs
+  (merged here). No secrets in its commits (scanned).
+
 ## QUEUED: Stage-1-real sweep (teed up 2026-07-12, runs after the Stage-2 result)
 
 One node, ~6-8h, ~$1.5-2. Order of runs after the current Stage-2 shakedown:
