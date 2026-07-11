@@ -109,6 +109,31 @@ Note: if the motivation is exact-element retention (ILP_END_RETURN), that is
 not a granularity fix — lossy is lossy at any grain; exact syntax stays on
 the Mimir KV/prefix side.
 
+## QUEUED: Stage-1-real sweep (teed up 2026-07-12, runs after the Stage-2 result)
+
+One node, ~6-8h, ~$1.5-2. Order of runs after the current Stage-2 shakedown:
+(1) if recall@5 shows signal -> full Stage-2 run (scale the predictor);
+(2) THIS sweep; (3) Mimir confirmations (gate 3, ~$2, still owed).
+
+Arms (all 8000 steps — the pilot plateaued by ~7500, no need for 16000):
+- k-sweep: k ∈ {1, 4, 8, 16} — capacity curve for gist slots. Pre-registered
+  prediction (Fable, on record): k=1 COLLAPSES (single-slot attention has no
+  query-dependent readout); k=4 vs 8 tells whether sentence content is
+  low-rank; k=16 >> 8 would mean sentences are underfunded.
+- clause-snap arm (k=8): truncate at the last clause boundary inside the cap
+  instead of mid-token (55% of over-cap cuts orphan clause material). Beats
+  plain k=8 -> construct-aware boundaries matter; ~= k=8 -> truncation noise
+  was negligible after the 48->64 cap fix.
+- slot-specialization probe (eval-only, rides the same node at start, on the
+  EXISTING step-16000 checkpoint): per-slot ablation + single-slot decode.
+  Specialized slots -> construct structure emerged; entangled -> evidence for
+  the clause/construct redesign.
+Also: widen heldout to 40+ docs (small-n caveat from the xdoc control).
+
+Success shape: a capacity curve + a boundary-policy verdict + a slot anatomy,
+for the price of one pilot. Feeds directly into whether the "one vector per
+construct" idea (parked above) gets built.
+
 ## Non-goals (defer)
 
 Diffusion head (phase B); the CoT-distillation data variant (parked in
