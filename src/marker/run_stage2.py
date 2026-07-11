@@ -198,13 +198,12 @@ def _batches(seqs, length, batch, whitener, seed=0):  # noqa: ANN001
         yield wz
 
 
-def _dedup_pairs(p, t):  # noqa: ANN001
-    """Drop (pred, target) pairs whose target is a bitwise duplicate of an
-    earlier one (keep first occurrence). Web text repeats boilerplate sentences
-    across documents; the deterministic encode makes their gists identical, and
-    twin targets in the retrieval pool fake false negatives — the same
-    deflation the non-overlapping-window fix removed within-document. Returns
-    (p, t, n_dropped)."""
+def _dedup_keep_idx(t):  # noqa: ANN001
+    """Indices of first occurrences of each distinct target row (bitwise).
+    Web text repeats boilerplate sentences across documents; the deterministic
+    encode makes their gists identical, and twin targets in the retrieval pool
+    fake false negatives — the same deflation the non-overlapping-window fix
+    removed within-document."""
     _, inv = torch.unique(t, dim=0, return_inverse=True)
     seen: set[int] = set()
     keep = []
@@ -212,18 +211,74 @@ def _dedup_pairs(p, t):  # noqa: ANN001
         if grp not in seen:
             seen.add(grp)
             keep.append(i)
-    idx = torch.tensor(keep, device=t.device)
-    return p[idx], t[idx], t.shape[0] - len(keep)
+    return torch.tensor(keep, device=t.device)
+
+
+def _dedup_pairs(p, t):  # noqa: ANN001
+    """(p, t) filtered to first-occurrence targets + n_dropped. See _dedup_keep_idx."""
+    idx = _dedup_keep_idx(t)
+    return p[idx], t[idx], t.shape[0] - idx.shape[0]
+
+
+def _recall_within_doc(p, t, doc, topk=5):  # noqa: ANN001
+    """Recall@k with the candidate pool restricted to SAME-DOCUMENT targets —
+    the topic-shortcut control (Fable result review). Global-pool recall is
+    inflated by 'found the right document' (doc topic = ~2/3 of predictive
+    value, neighbor=0.632); within-doc, topic is shared by construction, so
+    beating within-doc chance (topk/pool) is pure succession signal. Returns
+    {'recall', 'pool'} (pool = mean same-doc candidates)."""
+    pn = torch.nn.functional.normalize(p, dim=-1)
+    tn = torch.nn.functional.normalize(t, dim=-1)
+    sims = pn @ tn.T  # [N, N]
+    same = doc.unsqueeze(0) == doc.unsqueeze(1)
+    sims = sims.masked_fill(~same, float("-inf"))
+    n = sims.shape[0]
+    top = sims.topk(min(topk, n), dim=-1).indices
+    hits = (top == torch.arange(n, device=sims.device).unsqueeze(1)).any(-1)
+    return {
+        "recall": float(hits.float().mean()),
+        "pool": float(same.float().sum(1).mean()),
+    }
+
+
+def _recall_subsampled(p, t, topk=5, pool=128, seed=0):  # noqa: ANN001
+    """Recall@k against a fixed-size pool: the true target + (pool-1) seeded
+    random decoys. THIS is the number comparable to the pre-registered gate
+    (recall@5 > 0.40 @ 128) — full-pool recall at N~2000 is a ~15x harder task
+    and understates gate performance. Falls back to the full pool if N <= pool."""
+    from marker.predictor import recall_at_k  # noqa: PLC0415
+
+    n = p.shape[0]
+    if n <= pool:
+        return recall_at_k(p, t, topk)
+    pn = torch.nn.functional.normalize(p, dim=-1)
+    tn = torch.nn.functional.normalize(t, dim=-1)
+    sims = pn @ tn.T  # [N, N]
+    true = sims.diag()
+    g = torch.Generator()
+    g.manual_seed(seed)
+    r = torch.rand(n, n, generator=g)
+    r.fill_diagonal_(2.0)  # the true target is never its own decoy
+    decoy_idx = r.argsort(dim=1)[:, : pool - 1]
+    decoy_sims = sims.gather(1, decoy_idx)
+    beaten_by = (decoy_sims > true.unsqueeze(1)).sum(1)
+    return float((beaten_by <= topk - 1).float().mean())
 
 
 @torch.no_grad()
 def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
-    """Retrieval over the FULL eval pool: gather every window's predicted and
-    true next-gist, then recall@k against ALL eval targets (bigger candidate
-    pool = harder, the pre-registered gate wants >=128). Runs in eval mode
-    (no_grad does NOT disable dropout) and restores the caller's mode.
-    Duplicate targets (cross-doc boilerplate) are deduped before recall."""
-    wins = [w for s in seqs for w in _windows(s, length)]
+    """Retrieval eval, three pools: recall@5 over ALL eval targets (hardest,
+    context), recall@5_128 over true+127 seeded decoys (THE gate-comparable
+    number), recall@5_doc over same-doc targets only (the topic-shortcut
+    control — succession signal, not document identification). tgt_sim = mean
+    pairwise target similarity, the platitude-gate reference for diversity.
+    Runs in eval mode (no_grad does NOT disable dropout), restores the caller's
+    mode; duplicate targets (cross-doc boilerplate) deduped before recall."""
+    wins, win_doc = [], []
+    for di, s in enumerate(seqs):
+        for w in _windows(s, length):
+            wins.append(w)
+            win_doc.append(di)
     if not wins:
         return {}
     was_training = model.training
@@ -237,11 +292,21 @@ def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
         preds.append(model.pool(pred).reshape(-1, model.pool_proj.out_features))
         tgts.append(model.pool(wz[:, 1:]).reshape(-1, model.pool_proj.out_features))
     model.train(was_training)
-    p, t, dropped = _dedup_pairs(torch.cat(preds), torch.cat(tgts))
+    p, t = torch.cat(preds), torch.cat(tgts)
+    # each window contributes length-1 (pred, target) pairs, all from its doc
+    doc = torch.tensor(win_doc, device=t.device).repeat_interleave(length - 1)
+    keep = _dedup_keep_idx(t)
+    dropped = t.shape[0] - keep.shape[0]
+    p, t, doc = p[keep], t[keep], doc[keep]
+    within = _recall_within_doc(p, t, doc, topk=5)
     return {
         "recall@1": round(recall_at_k(p, t, 1), 3),
         "recall@5": round(recall_at_k(p, t, 5), 3),
+        "recall@5_128": round(_recall_subsampled(p, t, topk=5, pool=128), 3),
+        "recall@5_doc": round(within["recall"], 3),
+        "doc_pool": round(within["pool"], 1),
         "diversity": round(prediction_diversity(p), 3),
+        "tgt_sim": round(prediction_diversity(t), 3),
         "pool": p.shape[0],
         "dup_dropped": dropped,
     }
@@ -338,7 +403,8 @@ def main() -> None:
                 # launch): the predictor can peak then overfit, and "did it
                 # ever find structure" is the Stage-2 question. FINAL is
                 # reported alongside for honesty about the overfit gap.
-                if ev.get("recall@5", -1.0) > best.get("recall@5", -1.0):
+                # Keyed on recall@5_128 — the gate-comparable pool.
+                if ev.get("recall@5_128", -1.0) > best.get("recall@5_128", -1.0):
                     best = {**ev, "step": step}
                     best_state = {
                         n: v.detach().cpu().clone() for n, v in model.state_dict().items()
@@ -348,12 +414,16 @@ def main() -> None:
         epoch += 1
 
     ev = evaluate(model, eval_seqs, args.window, whitener, device)
-    if ev.get("recall@5", -1.0) > best.get("recall@5", -1.0):
+    if ev.get("recall@5_128", -1.0) > best.get("recall@5_128", -1.0):
         best = {**ev, "step": step}
         best_state = None  # final model IS the best
     print(f"[FINAL] {ev}", flush=True)
     print(f"[BEST]  {best}", flush=True)
-    print("GATE (on BEST): recall@5 > 0.40 AND diversity < corpus-mean-sim ⇒ predictor real.")
+    print(
+        "GATE (on BEST): recall@5_128 > 0.40 AND diversity < tgt_sim AND "
+        "recall@5_doc > 5/doc_pool (the topic-shortcut control: beating "
+        "within-doc chance is succession, not document identification)."
+    )
 
     if args.out_repo:
         if best_state is not None:

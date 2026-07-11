@@ -16,7 +16,15 @@ from __future__ import annotations
 import torch
 
 from marker.predictor import NextThoughtPredictor
-from marker.run_stage2 import _batches, _dedup_pairs, _smoke_texts, _windows, evaluate
+from marker.run_stage2 import (
+    _batches,
+    _dedup_pairs,
+    _recall_subsampled,
+    _recall_within_doc,
+    _smoke_texts,
+    _windows,
+    evaluate,
+)
 from marker.whiten import PerSlotWhitener
 
 
@@ -113,3 +121,79 @@ def test_dedup_pairs_noop_when_all_distinct():
     p2, t2, dropped = _dedup_pairs(p, t)
     assert dropped == 0
     assert torch.equal(p2, p) and torch.equal(t2, t)
+
+
+# ── the topic-shortcut control + gate-comparable pool (Fable result review) ─────
+
+
+def _two_doc_setup():
+    """Doc 0's predictions point at doc 0's WRONG targets globally but the RIGHT
+    one within-doc; used to separate 'found the document' from 'found the next
+    thought'. 4 targets per doc, orthogonal-ish dims."""
+    torch.manual_seed(0)
+    t = torch.eye(8) + 0.01 * torch.randn(8, 8)  # 8 distinct targets
+    doc = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+    return t, doc
+
+
+def test_recall_within_doc_isolates_succession_from_topic():
+    t, doc = _two_doc_setup()
+    # prediction i = its true target -> perfect both globally and within-doc
+    perfect = _recall_within_doc(t.clone(), t, doc, topk=1)
+    assert perfect["recall"] == 1.0
+    assert perfect["pool"] == 4.0  # mean same-doc candidates
+    # prediction = the doc centroid (pure topic, no succession): within-doc
+    # recall@1 must be ~chance (1/4), nowhere near 1.0
+    centroid = torch.stack([t[doc == d].mean(0) for d in doc.tolist()])
+    topic_only = _recall_within_doc(centroid, t, doc, topk=1)
+    assert topic_only["recall"] < 0.6  # centroid ties, not a real hit pattern
+
+
+def test_recall_within_doc_beats_global_when_topic_is_shared():
+    # pred points at the true target but a decoy in the OTHER doc is globally
+    # closer: global recall@1 fails, within-doc recall@1 succeeds.
+    t = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.9, 0.1, 0.0]])
+    doc = torch.tensor([0, 0, 1, 1])
+    p = torch.tensor([[0.94, 0.05, 0.0]])  # closest globally = target 3 (doc 1)
+    from marker.predictor import recall_at_k
+
+    assert recall_at_k(p, t[:1].expand(1, -1), 1) == 1.0  # sanity: self-match works
+    got = _recall_within_doc(p.expand(4, -1).clone(), t, doc, topk=1)
+    # rows 0 (doc 0): decoy row 3 is masked out -> row 0 wins within-doc
+    assert got["recall"] >= 0.25
+
+
+def test_recall_subsampled_matches_full_when_pool_small():
+    torch.manual_seed(3)
+    t = torch.randn(20, 8)
+    from marker.predictor import recall_at_k
+
+    full = recall_at_k(t, t, 5)
+    sub = _recall_subsampled(t, t, topk=5, pool=128, seed=0)
+    assert sub == full == 1.0  # N < pool -> falls back to the full pool
+
+
+def test_recall_subsampled_pool_is_easier_than_global():
+    # with many hard decoys, a fixed-128 pool must give recall >= the full-pool
+    # number (fewer decoys can only help) — this is what makes it comparable to
+    # the @128 pre-registered gate.
+    torch.manual_seed(4)
+    t = torch.randn(600, 16)
+    p = t + 1.5 * torch.randn(600, 16)  # noisy predictions
+    from marker.predictor import recall_at_k
+
+    full = recall_at_k(p, t, 5)
+    sub = _recall_subsampled(p, t, topk=5, pool=128, seed=0)
+    assert sub >= full
+    # decoys exclude the true target (never sampled as its own decoy)
+    assert 0.0 <= sub <= 1.0
+
+
+def test_evaluate_reports_gate_metrics():
+    torch.manual_seed(0)
+    m = NextThoughtPredictor(d=6, k=2, d_model=16, layers=1, heads=2)
+    seqs = [torch.randn(9, 2, 6) for _ in range(4)]
+    w = PerSlotWhitener.fit(torch.cat(seqs))
+    ev = evaluate(m, seqs, 4, w, "cpu")
+    for key in ("recall@5", "recall@5_128", "recall@5_doc", "doc_pool", "tgt_sim", "diversity"):
+        assert key in ev, f"missing {key}"

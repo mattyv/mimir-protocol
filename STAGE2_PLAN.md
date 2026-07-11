@@ -94,6 +94,32 @@ Predictor must beat these on held-out (document-disjoint) gist sequences:
   reads the BEST eval checkpoint over training, FINAL reported alongside. The
   smoke peaks then overfits; "did it ever find structure" is the Stage-2
   question, and the pushed artifact is the best checkpoint.
+- **Metric spec (registered 2026-07-11 after the validation run, BEFORE the
+  CoT run):** the gate number is recall@5_128 (true + 127 seeded decoys) —
+  full-pool recall at N~2000 is ~15x harder than the registered gate and not
+  comparable. PLUS the topic-shortcut control: recall@5_doc (same-doc
+  candidates only) must beat within-doc chance (5/doc_pool). Global-pool
+  recall is inflated by "found the right document" (neighbor=0.632 says doc
+  topic is ~2/3 of predictive value); within-doc, topic is shared by
+  construction, so anything above chance is succession. Platitude gate reads
+  diversity < tgt_sim (now logged).
+
+## Raw-text validation result (2026-07-11, n=1500, whiten off — MECHANISM OK)
+
+recall@5 = 0.237 @ pool 1990 (chance 0.0025), peak at step 500 then monotonic
+overfit decline (train loss 0.03 by step 4000; 1149 train seqs vs ~50M params).
+diversity 0.04, not collapsed. Artifacts (best ckpt) in
+mattyvee/mimir-artifacts/stage2_predictor.
+- NOT a clean gate pass and NOT a kill. Two caveats, both Fable-review flagged:
+  (1) 0.237@1990 is not gate-comparable (gate was @128; recall@5_128 wasn't
+  logged yet); (2) TOPIC-SHORTCUT CONFOUND — with ~16 same-doc targets in the
+  pool, a topic-centroid-only predictor scores ~0.31 within-doc-random, so
+  0.237 does not yet separate "predicts the next thought" from "identifies the
+  document". recall@5_doc (added after) is the control.
+- Decision: raw-text run did its job (mechanism works at some level); full
+  n=4000 raw run SKIPPED in favor of the CoT main line with the fixed metrics
+  + regularization (the step-500 peak says the current recipe overfits long
+  before the token budget).
 
 ## Fable pre-spend review (2026-07-11, after the window fix — all landed)
 
