@@ -193,6 +193,20 @@ def test_adapter_save_load_round_trip(tmp_path):
 
 
 @pytest.mark.slow
+def test_encode_gist_shape_and_span_dependence():
+    from marker.gist_model import encode_gist
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    g = encode_gist(pm, gist, [[1, 2, 3], [4, 5]])
+    assert g.shape == (2, 4, base.config.hidden_size)  # [B, k, hidden]
+    # the gist encodes the span: a different span gives different gist vectors
+    g2 = encode_gist(pm, gist, [[9, 8, 7], [4, 5]])
+    assert not torch.allclose(g[0], g2[0], atol=1e-4)  # span 0 changed
+    assert torch.allclose(g[1], g2[1], atol=1e-4)  # span 1 unchanged
+
+
+@pytest.mark.slow
 def test_generate_from_gist_runs_and_respects_max_new():
     base = _tiny_base()
     pm, gist = attach_gist(base, gist_k=4, r=4)

@@ -177,6 +177,40 @@ def roll_spans(spans: list[list[int]]) -> list[list[int]]:
 
 
 @torch.no_grad()
+def encode_gist(
+    peft_model,  # noqa: ANN001
+    gist_param: torch.nn.Parameter,
+    spans: list[list[int]],
+    pad_id: int = 0,
+) -> torch.Tensor:
+    """The Stage-2 encode: run [span | gist] through the Stage-1 model and read
+    the final-layer hidden states at the k gist positions — a sentence's gist
+    'thought' vector [B, k, hidden]. No continuation (encoding only); the gist
+    attends to the span + causal-gist exactly as in training."""
+    device = next(peft_model.parameters()).device
+    k = gist_param.shape[0]
+    span_lens = [len(s) for s in spans]
+    max_s = max(span_lens)
+    embed = peft_model.get_input_embeddings()
+    span_e = embed(_pad(spans, max_s, pad_id, device))
+    gist_e = gist_param.to(span_e.dtype).unsqueeze(0).expand(len(spans), -1, -1)
+    inputs_embeds = torch.cat([span_e, gist_e], dim=1)  # [B, max_s+k, hidden]
+
+    mask = build_batch_mask(span_lens, [0] * len(spans), k, max_s, 0, dtype=inputs_embeds.dtype).to(
+        device
+    )
+    pos = torch.arange(inputs_embeds.shape[1], device=device).unsqueeze(0).expand(len(spans), -1)
+    out = peft_model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=mask,
+        position_ids=pos,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    return out.hidden_states[-1][:, max_s : max_s + k, :]  # [B, k, hidden]
+
+
+@torch.no_grad()
 def generate_from_gist(
     peft_model,  # noqa: ANN001
     gist_param: torch.nn.Parameter,
