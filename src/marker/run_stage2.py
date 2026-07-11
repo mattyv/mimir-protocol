@@ -34,12 +34,76 @@ from marker.predictor import (
 )
 from marker.whiten import PerSlotWhitener
 
-SMOKE_TEXTS = [
-    "The bus polls the queue. It waits for a message. It fires the handler. "
-    "The handler runs. Then it returns to waiting. The cycle repeats forever.",
-    "Water boils at a temperature. The temperature depends on pressure. At sea "
-    "level it is high. Higher up it is lower. Cooks must adjust their timing.",
-] * 15
+_SMOKE_SUBJECTS = [
+    "robot",
+    "gardener",
+    "engine",
+    "river",
+    "market",
+    "printer",
+    "climber",
+    "baker",
+    "sailor",
+    "furnace",
+    "glacier",
+    "orchard",
+    "beacon",
+    "reactor",
+    "surgeon",
+    "pianist",
+    "harbor",
+    "volcano",
+    "telescope",
+    "vineyard",
+    "foundry",
+    "aquifer",
+    "comet",
+    "loom",
+    "kiln",
+    "trawler",
+    "windmill",
+    "quarry",
+    "lantern",
+    "turbine",
+    "meadow",
+    "cistern",
+    "anvil",
+    "spindle",
+    "cavern",
+    "delta",
+    "geyser",
+    "prairie",
+    "canyon",
+    "atoll",
+]
+
+
+def _smoke_texts(n):  # noqa: ANN001
+    """n DISTINCT short documents, each a fixed ordinal progression over a
+    unique subject. Distinct subjects -> every sentence differs across docs
+    (no identical-twin targets), and the shared step order gives a learnable
+    succession the smoke can retrieve above chance. Replaces the old
+    2-unique-texts x15 corpus that guaranteed chance recall."""
+    steps = [
+        "The {s} begins the task at dawn.",
+        "Next the {s} gathers the parts.",
+        "Then the {s} inspects each piece.",
+        "After that the {s} assembles them carefully.",
+        "Soon the {s} tightens every joint.",
+        "Midway the {s} calibrates the machine.",
+        "Later the {s} tests the result.",
+        "Then the {s} records the numbers.",
+        "Near the end the {s} cleans the bench.",
+        "Finally the {s} reports it done.",
+        "The {s} rests until morning.",
+        "At last the {s} locks the door.",
+    ]
+    subjects = [
+        _SMOKE_SUBJECTS[i % len(_SMOKE_SUBJECTS)]
+        + (f" {i // len(_SMOKE_SUBJECTS)}" if i >= len(_SMOKE_SUBJECTS) else "")
+        for i in range(n)
+    ]
+    return [" ".join(step.format(s=s) for step in steps) for s in subjects]
 
 
 def _load_stage1(model_name, repo, device, quantize):  # noqa: ANN001
@@ -103,9 +167,18 @@ def encode_corpus(pm, gist, tok, docs_text, max_span, max_sents, min_sents, devi
     return seqs
 
 
-def _windows(seq, length):  # noqa: ANN001
-    """All length-L windows of a [n_sents, k, d] sequence."""
-    return [seq[i : i + length] for i in range(len(seq) - length + 1)]
+def _windows(seq, length, stride=None):  # noqa: ANN001
+    """Length-L windows of a [n_sents, k, d] sequence.
+
+    Default stride = length (NON-overlapping). Overlapping (stride < length)
+    re-emits each interior sentence as a next-thought target in multiple
+    windows, filling the retrieval pool with identical-content duplicates —
+    which deflates recall@k (exact-index match) toward chance and injects
+    false negatives into InfoNCE. Non-overlapping keeps every target distinct.
+    """
+    if stride is None:
+        stride = length
+    return [seq[i : i + length] for i in range(0, len(seq) - length + 1, stride)]
 
 
 def _batches(seqs, length, batch, whitener):  # noqa: ANN001
@@ -157,11 +230,15 @@ def main() -> None:
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
-    max_span, max_sents, min_sents = 64, 24, args.window + 1  # 64 = stage-1 training cap; 48 tripled truncation (9.1% vs 3.4%)
+    max_span, max_sents, min_sents = (
+        64,
+        24,
+        args.window + 1,
+    )  # 64 = stage-1 training cap; 48 tripled truncation (9.1% vs 3.4%)
     if args.smoke:
-        args.model_name, args.repo, args.n_docs, args.steps = "Qwen/Qwen2.5-0.5B", None, 30, 60
+        args.model_name, args.repo, args.n_docs, args.steps = "Qwen/Qwen2.5-0.5B", None, 40, 300
         args.window = 4
-        max_span, max_sents, min_sents = 24, 8, 5
+        max_span, max_sents, min_sents = 24, 12, 5
         print("=== SMOKE (tiny model, synthetic corpus) ===")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -169,7 +246,7 @@ def main() -> None:
     pm, gist, tok = _load_stage1(args.model_name, args.repo, device, quantize)
 
     # ── encode corpus into gist sequences ────────────────────────────────────
-    docs_text = SMOKE_TEXTS if args.smoke else list(_doc_texts(args.n_docs))
+    docs_text = _smoke_texts(args.n_docs) if args.smoke else list(_doc_texts(args.n_docs))
     seqs = encode_corpus(
         pm, gist, tok, docs_text[: args.n_docs], max_span, max_sents, min_sents, device
     )
