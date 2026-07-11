@@ -271,11 +271,15 @@ def _recall_subsampled(p, t, topk=5, pool=128, seed=0):  # noqa: ANN001
     tn = torch.nn.functional.normalize(t, dim=-1)
     sims = pn @ tn.T  # [N, N]
     true = sims.diag()
+    # seeded decoy sampling stays on CPU (a torch.Generator is CPU-only, so
+    # torch.rand(generator=) MUST be CPU) — then move the indices to sims'
+    # device before gather, or GPU eval dies with a cpu/cuda mismatch. This
+    # bug is invisible to CPU tests (same trap as to_leaf_param).
     g = torch.Generator()
     g.manual_seed(seed)
     r = torch.rand(n, n, generator=g)
     r.fill_diagonal_(2.0)  # the true target is never its own decoy
-    decoy_idx = r.argsort(dim=1)[:, : pool - 1]
+    decoy_idx = r.argsort(dim=1)[:, : pool - 1].to(sims.device)
     decoy_sims = sims.gather(1, decoy_idx)
     beaten_by = (decoy_sims > true.unsqueeze(1)).sum(1)
     return float((beaten_by <= topk - 1).float().mean())
