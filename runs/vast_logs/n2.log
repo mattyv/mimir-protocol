@@ -1,0 +1,95 @@
+device: cuda  model: Qwen/Qwen2.5-7B  gist_k: 4  quantize: True
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██▌       | 1/4 [00:07<00:22,  7.54s/it]Loading checkpoint shards:  50%|█████     | 2/4 [00:13<00:13,  6.54s/it]Loading checkpoint shards:  75%|███████▌  | 3/4 [00:19<00:06,  6.31s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:23<00:00,  5.50s/it]Loading checkpoint shards: 100%|██████████| 4/4 [00:23<00:00,  5.92s/it]
+heldout pairs: 519 (document-disjoint from training)
+GRAD_OK (lora + gist gradients flowing)
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step     0] loss 3.5246  ppl gist=42.54 full=16.40 none=19.53  gap_closed=-7.359
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step   500] loss 2.7013  ppl gist=12.14 full=11.09 none=15.79  gap_closed=0.777
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  1000] loss 2.4877  ppl gist=12.34 full=11.36 none=15.57  gap_closed=0.767
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  1500] loss 2.7014  ppl gist=12.02 full=11.18 none=15.60  gap_closed=0.809
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  2000] loss 2.9822  ppl gist=11.94 full=11.08 none=15.67  gap_closed=0.813
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  2500] loss 3.4029  ppl gist=11.82 full=11.04 none=15.54  gap_closed=0.828
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  3000] loss 3.0250  ppl gist=11.87 full=11.10 none=15.46  gap_closed=0.823
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  3500] loss 2.4366  ppl gist=12.15 full=11.33 none=15.70  gap_closed=0.813
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  4000] loss 1.5767  ppl gist=11.75 full=11.05 none=15.46  gap_closed=0.841
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  4500] loss 2.6234  ppl gist=11.74 full=11.07 none=15.51  gap_closed=0.848
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  5000] loss 1.8857  ppl gist=11.64 full=10.97 none=15.38  gap_closed=0.849
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  5500] loss 2.6231  ppl gist=11.84 full=11.08 none=15.56  gap_closed=0.829
+    ...eval batch 10
+    ...eval batch 20
+    ...eval batch 30
+    ...eval batch 40
+    ...eval batch 50
+    ...eval batch 60
+[step  6000] loss 2.0069  ppl gist=11.67 full=11.02 none=15.41  gap_closed=0.853

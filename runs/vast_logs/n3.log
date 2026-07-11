@@ -1,0 +1,1 @@
+device: cuda  model: Qwen/Qwen2.5-7B  gist_k: 1  quantize: True
