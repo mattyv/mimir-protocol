@@ -7,7 +7,7 @@ cd /Users/matthew/Code/mimir-protocol
 SSHOPT=(-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes)
 NODES=("18250 ssh5.vast.ai n1" "23804 ssh2.vast.ai n2" "24118 ssh6.vast.ai n3" "24126 ssh5.vast.ai n4")
 STATUS=/tmp/vast_poll_status.txt
-declare -A DONE
+DONE=""  # space-separated tags; bash 3.2 (macOS default) has no associative arrays
 
 log(){ echo "[$(date -u +%H:%M:%S)Z] $*" | tee -a "$STATUS"; }
 
@@ -31,18 +31,21 @@ commit_if_changed() {
   fi
 }
 
+is_done() { case " $DONE " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+count_done() { echo $DONE | wc -w | tr -d ' '; }
+
 log "poller starting"
-while [ ${#DONE[@]} -lt ${#NODES[@]} ]; do
+while [ "$(count_done)" -lt 4 ]; do
   for n in "${NODES[@]}"; do
     read -r port host tag <<< "$n"
-    [ -n "${DONE[$tag]:-}" ] && continue
+    is_done "$tag" && continue
     pull_one "$port" "$host" "$tag"
     pid=$(alive_one "$port" "$host")
     if [ -z "$pid" ]; then
       reachable=$(ssh "${SSHOPT[@]}" -p "$port" "root@$host" "echo ok" 2>/dev/null)
       if [ "$reachable" = "ok" ]; then
         log "$tag: FINISHED (process exited)"
-        DONE[$tag]=1
+        DONE="$DONE $tag"
       else
         log "$tag: unreachable, will retry"
       fi
@@ -51,6 +54,6 @@ while [ ${#DONE[@]} -lt ${#NODES[@]} ]; do
     fi
   done
   commit_if_changed
-  [ ${#DONE[@]} -lt ${#NODES[@]} ] && sleep 900
+  [ "$(count_done)" -lt 4 ] && sleep 900
 done
 log "ALL NODES DONE. Logs on vast-logs branch. Instances still running/billing — awaiting your shutdown decision."
