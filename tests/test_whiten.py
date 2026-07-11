@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from marker.whiten import PerSlotWhitener, Whitener
+from marker.whiten import IdentityWhitener, PerSlotWhitener, Whitener
 
 
 def _anisotropic_gists(n=2000, d=16):
@@ -102,3 +102,62 @@ def test_per_slot_round_trip():
     g = _per_slot_gists()
     w = PerSlotWhitener.fit(g)
     assert torch.allclose(w.inverse(w.transform(g)), g, atol=1e-3)
+
+
+# ── shrinkage: bound the amplification of badly-estimated directions ─────────────
+
+
+def _subspace_gists(n=40, d=32):
+    """Data confined to the first 2 dims — the remaining 30 have ZERO variance,
+    the worst case of the underestimated-tail problem."""
+    torch.manual_seed(2)
+    g = torch.zeros(n, d)
+    g[:, 0] = torch.randn(n) * 3.0
+    g[:, 1] = torch.randn(n)
+    return g
+
+
+def test_unshrunk_fit_explodes_out_of_subspace_directions():
+    # documents the failure mode: eps-clamped zero eigenvalues amplify an
+    # out-of-subspace eval component by ~eps^-1/2 (~316x at 1e-5). Measured
+    # consequence: full-rank-but-tight ZCA cut smoke recall@5 from 1.0 to 0.3.
+    w = Whitener.fit(_subspace_gists())
+    null_dir = torch.zeros(1, 32)
+    null_dir[0, -1] = 1.0
+    amp = (w.transform(null_dir) - w.transform(torch.zeros(1, 32))).norm()
+    assert amp > 100  # exploded
+
+
+def test_shrink_bounds_out_of_subspace_amplification():
+    w = Whitener.fit(_subspace_gists(), shrink=0.1)
+    null_dir = torch.zeros(1, 32)
+    null_dir[0, -1] = 1.0
+    amp = (w.transform(null_dir) - w.transform(torch.zeros(1, 32))).norm()
+    # floor = shrink * mean_eig -> amplification <= (shrink*mean_eig)^-1/2, O(1)
+    assert amp < 10, f"shrunk whitener still amplifies null directions {amp:.1f}x"
+
+
+def test_shrink_zero_matches_default():
+    g = _anisotropic_gists()
+    assert torch.allclose(
+        Whitener.fit(g).transform(g), Whitener.fit(g, shrink=0.0).transform(g), atol=1e-6
+    )
+
+
+def test_per_slot_shrink_passes_through():
+    g = torch.zeros(30, 2, 16)
+    g[:, :, 0] = torch.randn(30, 2)  # rank-1 per slot
+    w = PerSlotWhitener.fit_streaming(iter([g]), k=2, shrink=0.1)
+    null_dir = torch.zeros(1, 2, 16)
+    null_dir[0, :, -1] = 1.0
+    amp = (w.transform(null_dir) - w.transform(torch.zeros(1, 2, 16))).norm()
+    # floor = shrink*mean_eig = 0.1/16 -> ~12.6x per slot, x sqrt(2) slots ~ 18
+    # (vs ~316x unshrunk) — bounded is the invariant, not small
+    assert amp < 25
+
+
+def test_identity_whitener_is_noop():
+    g = torch.randn(5, 3, 4)
+    w = IdentityWhitener()
+    assert torch.equal(w.transform(g), g)
+    assert torch.equal(w.inverse(g), g)

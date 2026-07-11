@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Stage-1 gist pilot on a Vast RTX 3090 (4-bit QLoRA Qwen2.5-7B).
+# Stage-2 next-thought predictor on a Vast RTX 3090 (loads the Stage-1 gist
+# adapter, encodes the corpus, trains + evals the predictor — run_stage2.py).
 #
 # HF_TOKEN (from the launching shell) is injected as a container env var: it
-# authenticates the 7B download AND the checkpoint push to the private repo.
+# authenticates the 7B download AND the artifact push to the private repo.
 # Read from env ONLY — never hardcoded. Disposable, repo-scoped; revoke after.
 #
-#   Shakedown (~$0.15, proves push+resume): STEPS=500 CKPT_EVERY=200 HF_TOKEN=... ./scripts/vast_gist.sh
-#   Pilot     (20M tokens):                 HF_TOKEN=... ./scripts/vast_gist.sh
-#   Resume:                                 RESUME=1 HF_TOKEN=... ./scripts/vast_gist.sh
+# ENCODE DOMINATES WALL-CLOCK (1 sentence/forward on the 4-bit 7B): n-docs
+# 1500 ≈ 30k forwards fits the default 4h TIMEOUT; the full 4000-doc run
+# needs TIMEOUT=8h (or a batched encode) or it dies mid-encode.
+#
+#   Validation (~$1-2): NDOCS=1500 HF_TOKEN=... ./scripts/vast_stage2.sh
+#   Full run:           NDOCS=4000 TIMEOUT=8h HF_TOKEN=... ./scripts/vast_stage2.sh
 set -euo pipefail
 
 IMAGE="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"

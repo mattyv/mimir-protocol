@@ -32,7 +32,7 @@ from marker.predictor import (
     recall_at_k,
     regression_loss,
 )
-from marker.whiten import PerSlotWhitener
+from marker.whiten import IdentityWhitener, PerSlotWhitener
 
 _SMOKE_SUBJECTS = [
     "robot",
@@ -181,10 +181,15 @@ def _windows(seq, length, stride=None):  # noqa: ANN001
     return [seq[i : i + length] for i in range(0, len(seq) - length + 1, stride)]
 
 
-def _batches(seqs, length, batch, whitener):  # noqa: ANN001
+def _batches(seqs, length, batch, whitener, seed=0):  # noqa: ANN001
+    """Shuffled whitened training batches. `seed` should vary per epoch so the
+    batch composition (= the InfoNCE negative sets) varies across epochs; a
+    local Generator keeps the global RNG stream untouched (a fixed
+    manual_seed(0) here froze both the order AND the dropout masks)."""
     wins = [w for s in seqs for w in _windows(s, length)]
-    torch.manual_seed(0)
-    order = torch.randperm(len(wins))
+    g = torch.Generator()
+    g.manual_seed(seed)
+    order = torch.randperm(len(wins), generator=g)
     for i in range(0, len(wins) - batch + 1, batch):
         idx = order[i : i + batch]
         stack = torch.stack([wins[j] for j in idx])  # [B, L, k, d]
@@ -193,14 +198,36 @@ def _batches(seqs, length, batch, whitener):  # noqa: ANN001
         yield wz
 
 
+def _dedup_pairs(p, t):  # noqa: ANN001
+    """Drop (pred, target) pairs whose target is a bitwise duplicate of an
+    earlier one (keep first occurrence). Web text repeats boilerplate sentences
+    across documents; the deterministic encode makes their gists identical, and
+    twin targets in the retrieval pool fake false negatives — the same
+    deflation the non-overlapping-window fix removed within-document. Returns
+    (p, t, n_dropped)."""
+    _, inv = torch.unique(t, dim=0, return_inverse=True)
+    seen: set[int] = set()
+    keep = []
+    for i, grp in enumerate(inv.tolist()):
+        if grp not in seen:
+            seen.add(grp)
+            keep.append(i)
+    idx = torch.tensor(keep, device=t.device)
+    return p[idx], t[idx], t.shape[0] - len(keep)
+
+
 @torch.no_grad()
 def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
     """Retrieval over the FULL eval pool: gather every window's predicted and
     true next-gist, then recall@k against ALL eval targets (bigger candidate
-    pool = harder, the pre-registered gate wants >=128)."""
+    pool = harder, the pre-registered gate wants >=128). Runs in eval mode
+    (no_grad does NOT disable dropout) and restores the caller's mode.
+    Duplicate targets (cross-doc boilerplate) are deduped before recall."""
     wins = [w for s in seqs for w in _windows(s, length)]
     if not wins:
         return {}
+    was_training = model.training
+    model.eval()
     preds, tgts = [], []
     for i in range(0, len(wins), 64):
         stack = torch.stack(wins[i : i + 64])
@@ -209,12 +236,14 @@ def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
         pred = model(wz)
         preds.append(model.pool(pred).reshape(-1, model.pool_proj.out_features))
         tgts.append(model.pool(wz[:, 1:]).reshape(-1, model.pool_proj.out_features))
-    p, t = torch.cat(preds), torch.cat(tgts)
+    model.train(was_training)
+    p, t, dropped = _dedup_pairs(torch.cat(preds), torch.cat(tgts))
     return {
         "recall@1": round(recall_at_k(p, t, 1), 3),
         "recall@5": round(recall_at_k(p, t, 5), 3),
         "diversity": round(prediction_diversity(p), 3),
         "pool": p.shape[0],
+        "dup_dropped": dropped,
     }
 
 
@@ -227,6 +256,16 @@ def main() -> None:
     ap.add_argument("--window", type=int, default=8)
     ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument(
+        "--whiten",
+        choices=["off", "shrunk", "zca"],
+        default="off",
+        help="gist-space whitening: measured on smoke, raw recall@5=1.0 vs "
+        "zca=0.3 (ZCA equalizes ~800 near-noise dims with the signal dims and "
+        "amplifies the worst-estimated directions) — OFF until the real corpus "
+        "shows anisotropy actually hurts; shrunk (0.1 toward spherical) is the "
+        "bounded middle ground",
+    )
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -255,11 +294,19 @@ def main() -> None:
     n_eval = max(1, len(seqs) // 10)
     eval_seqs, train_seqs = seqs[:n_eval], seqs[n_eval:]
 
-    # ── fit per-slot whiteners on TRAIN gists only ───────────────────────────
+    # ── whitening (opt-in; fit per-slot on TRAIN gists only) ─────────────────
     k, hidden = train_seqs[0].shape[1], train_seqs[0].shape[2]
-    flat = torch.cat([s.reshape(-1, k, hidden) for s in train_seqs])  # [N, k, hidden]
-    whitener = PerSlotWhitener.fit_streaming(iter(flat.split(4096)), k=k)
-    print(f"fit {k} per-slot whiteners on {flat.shape[0]} train gists", flush=True)
+    if args.whiten == "off":
+        whitener = IdentityWhitener()
+        print("whitening OFF (raw gist space)", flush=True)
+    else:
+        shrink = 0.1 if args.whiten == "shrunk" else 0.0
+        flat = torch.cat([s.reshape(-1, k, hidden) for s in train_seqs])  # [N, k, hidden]
+        whitener = PerSlotWhitener.fit_streaming(iter(flat.split(4096)), k=k, shrink=shrink)
+        print(
+            f"fit {k} per-slot whiteners ({args.whiten}) on {flat.shape[0]} train gists",
+            flush=True,
+        )
 
     # ── train the predictor ──────────────────────────────────────────────────
     model = NextThoughtPredictor(
@@ -270,9 +317,10 @@ def main() -> None:
         heads=4 if args.smoke else 8,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    step = 0
+    step, epoch = 0, 0
+    best, best_state = {}, None
     while step < args.steps:
-        for wz in _batches(train_seqs, args.window, 8 if args.smoke else 64, whitener):
+        for wz in _batches(train_seqs, args.window, 8 if args.smoke else 64, whitener, seed=epoch):
             wz = wz.to(device)
             pred = model(wz)
             tgt = wz[:, 1:]
@@ -286,15 +334,33 @@ def main() -> None:
             if step % (20 if args.smoke else 500) == 0:
                 ev = evaluate(model, eval_seqs, args.window, whitener, device)
                 print(f"[step {step}] loss {loss.item():.4f}  eval {ev}", flush=True)
+                # gate reads the BEST eval checkpoint (pre-registered before
+                # launch): the predictor can peak then overfit, and "did it
+                # ever find structure" is the Stage-2 question. FINAL is
+                # reported alongside for honesty about the overfit gap.
+                if ev.get("recall@5", -1.0) > best.get("recall@5", -1.0):
+                    best = {**ev, "step": step}
+                    best_state = {
+                        n: v.detach().cpu().clone() for n, v in model.state_dict().items()
+                    }
             if step >= args.steps:
                 break
+        epoch += 1
 
     ev = evaluate(model, eval_seqs, args.window, whitener, device)
+    if ev.get("recall@5", -1.0) > best.get("recall@5", -1.0):
+        best = {**ev, "step": step}
+        best_state = None  # final model IS the best
     print(f"[FINAL] {ev}", flush=True)
-    print("GATE: recall@5 > 0.40 AND diversity < corpus-mean-sim ⇒ predictor real.")
+    print(f"[BEST]  {best}", flush=True)
+    print("GATE (on BEST): recall@5 > 0.40 AND diversity < corpus-mean-sim ⇒ predictor real.")
 
     if args.out_repo:
-        _push_artifacts(model, whitener, args.out_repo, ev)
+        if best_state is not None:
+            model.load_state_dict(best_state)  # push the gated checkpoint
+        _push_artifacts(
+            model, whitener, args.out_repo, {"best": best, "final": ev, "whiten": args.whiten}
+        )
 
 
 def _doc_texts(n):  # noqa: ANN001
@@ -310,7 +376,7 @@ def _doc_texts(n):  # noqa: ANN001
             break
 
 
-def _push_artifacts(model, whitener, repo, ev):  # noqa: ANN001
+def _push_artifacts(model, whitener, repo, manifest):  # noqa: ANN001
     import json  # noqa: PLC0415
     from pathlib import Path  # noqa: PLC0415
 
@@ -320,7 +386,7 @@ def _push_artifacts(model, whitener, repo, ev):  # noqa: ANN001
     d.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), d / "predictor.pt")
     whitener.save(d / "whiteners.pt")
-    (d / "manifest.json").write_text(json.dumps({"eval": ev}, indent=2))
+    (d / "manifest.json").write_text(json.dumps(manifest, indent=2))
     upload_folder(repo_id=repo, folder_path=str(d), path_in_repo="stage2_predictor")
     print(f"pushed predictor artifacts to {repo}/stage2_predictor", flush=True)
 

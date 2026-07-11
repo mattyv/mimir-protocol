@@ -34,15 +34,27 @@ predictor's OUTPUT must be 8 slot vectors.
 - **NO unpooling expander** — a pooled-vector predictor + expander is a second
   lossy stage nobody asked for.
 
-## Whitening (Fable steer #3 + the streaming to-do)
+## Whitening (Fable steer #3 — REVERSED BY MEASUREMENT 2026-07-11)
 
-- **Per-slot-index whiteners (8 of them):** slot 1 and slot 8 are
-  distributionally different by construction. Default to 8 ZCA whiteners.
-- **Streaming fit:** at real scale (>=300k gists x slot-d) a double-precision
-  materialization is tens of GB. Accumulate running mean + outer-product sums
-  in chunks; never hold the full matrix. (whiten.py fit() is the in-memory
-  version for tests; add fit_streaming for the corpus.)
-- **Fit on TRAIN gists only, never heldout** (same leak discipline as Stage 1).
+**Whitening is now OPT-IN (--whiten off|shrunk|zca, default off).** Isolation
+experiment on the smoke (same predictor, same data, only the lens varies),
+best recall@5 vs chance 0.046:
+| lens | recall@5 |
+|---|---|
+| raw (off) | 1.00 |
+| shrink 0.5 | 1.00 |
+| shrink 0.1 | 0.95 (slower) |
+| pure ZCA | 0.30 |
+Why: ZCA equalizes variance across all 896 dims, amplifying ~800 near-noise
+directions to parity with the signal dims — cosine/InfoNCE then weight noise
+equally — and rsqrt blows up the worst-estimated tail eigenvalues (~316x at
+the 1e-5 eps floor for out-of-subspace eval components). Full-rank fit (1296
+samples > 896 dims) did NOT save it. Shrinkage (blend cov toward spherical,
+bounding amplification at (shrink*mean_eig)^-1/2) recovers the signal.
+- The anisotropy worry (spec killer #2) stays real in principle; if the raw
+  run platitude-collapses (diversity gate), the shrunk arm is the follow-up.
+- Original steers kept for when whitening is on: per-slot-index whiteners,
+  streaming fit (running moments, never materialize), fit on TRAIN only.
 
 ## Loss (spec §3.2 killers)
 
@@ -78,6 +90,33 @@ Predictor must beat these on held-out (document-disjoint) gist sequences:
 - **KILL:** recall@5 <= random (~4%) after the token budget ⇒ the predictor
   learned nothing; the raw-text signal may be too weak (⇒ the parked CoT
   distillation variant).
+- **Checkpoint policy (registered 2026-07-11, BEFORE the real run):** the gate
+  reads the BEST eval checkpoint over training, FINAL reported alongside. The
+  smoke peaks then overfits; "did it ever find structure" is the Stage-2
+  question, and the pushed artifact is the best checkpoint.
+
+## Fable pre-spend review (2026-07-11, after the window fix — all landed)
+
+The shakedown's chance-flat recall was DATA bugs, not the predictor: stride-1
+windows duplicated every target ~8x (recall-by-index deflation + InfoNCE
+false negatives) and the smoke corpus was 2 texts x15 (14 identical twins per
+target). Fixed: non-overlapping windows + distinct smoke docs. Review then
+caught, all fixed same day:
+1. evaluate() ran with dropout ON (no_grad doesn't disable it; trunk default
+   dropout=0.1) — every earlier eval number was deflated/noisy. Now eval-mode
+   with caller-mode restore.
+2. manual_seed(0) in _batches froze batch order AND dropout masks across
+   epochs (InfoNCE negatives never varied). Now epoch-seeded local Generator.
+3. Cross-doc boilerplate ("All rights reserved.") = identical sentences =
+   bitwise-identical gists = twin eval targets — the window bug reborn at
+   corpus scale. Now exact-deduped in eval (dup_dropped logged).
+4. Encode is 1 sentence/forward on the 4-bit 7B: n=4000 x ~20 sents ~= 80k
+   forwards can eat the 4h timeout BEFORE training. Validation run n=1500
+   fits; the full run needs a longer timeout or a batched encode.
+5. Dropout-off eval exposed the earlier smoke "signal" (recall@5 0.306) as
+   dropout-noise peak-picking — clean eval was chance. Isolating that led to
+   the whitening reversal above; with whitening off the runner smoke shows
+   real retrieval (see Whitening section).
 
 ## Build order (model-free first, no spend)
 
