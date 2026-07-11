@@ -20,7 +20,10 @@ echo "poll+destroy watching instance $ID (hard cap ${MAX_MIN}m, log $LOG)"
 destroy() {
   echo "→ destroying instance $ID ..."
   for attempt in 1 2 3 4 5; do
-    vastai destroy instance "$ID" 2>&1 | tail -1
+    # `vastai destroy` prompts "[y/N]" and ABORTS on EOF non-interactively —
+    # pipe `yes` so the confirmation is answered (this bit us once: run done,
+    # node idle-billing, 5 aborted destroys).
+    yes | vastai destroy instance "$ID" 2>&1 | tail -1
     sleep 5
     if ! vastai show instances --raw 2>/dev/null | python3 -c "import sys,json; ids=[str(i.get('id')) for i in json.load(sys.stdin)]; sys.exit(0 if '$ID' in ids else 1)"; then
       echo "✓ instance $ID gone (verified not in instance list)"
