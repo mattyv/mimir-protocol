@@ -5,7 +5,7 @@
 set -u
 cd /tmp/vast-logs-wt
 SSHOPT=(-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes)
-NODES=("18250 ssh5.vast.ai n1" "23804 ssh2.vast.ai n2" "24118 ssh6.vast.ai n3" "24126 ssh5.vast.ai n4")
+NODES=("23804 ssh2.vast.ai n2")
 STATUS=/tmp/vast_poll_status.txt
 DONE=""  # space-separated tags; bash 3.2 (macOS default) has no associative arrays
 
@@ -35,7 +35,7 @@ is_done() { case " $DONE " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 count_done() { echo $DONE | wc -w | tr -d ' '; }
 
 log "poller starting"
-while [ "$(count_done)" -lt 4 ]; do
+while [ "$(count_done)" -lt 1 ]; do
   for n in "${NODES[@]}"; do
     read -r port host tag <<< "$n"
     is_done "$tag" && continue
@@ -54,6 +54,6 @@ while [ "$(count_done)" -lt 4 ]; do
     fi
   done
   commit_if_changed
-  [ "$(count_done)" -lt 4 ] && sleep 900
+  [ "$(count_done)" -lt 1 ] && sleep 900
 done
 log "ALL NODES DONE. Logs on vast-logs branch. Instances still running/billing — awaiting your shutdown decision."
