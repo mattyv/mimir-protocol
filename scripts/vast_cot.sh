@@ -31,6 +31,9 @@ TEXTFIELD="${TEXTFIELD:-}"     # row field (gsm8k->answer, else->solution)
 UNIT="${UNIT:-line}"           # line (gsm8k step-per-line) | sentence (long solutions)
 SPLIT="${SPLIT:-}"             # reason_check split (gsm8k->test, else->train)
 NPROB="${NPROB:-150}"          # reason_check problems
+MAXPAIRS="${MAXPAIRS:-500}"    # cap reason_check pairs — OpenR1's long solutions
+                               # yield ~1500 pairs (vs GSM8K ~450), which blew
+                               # the step-1 timeout. 500 keeps step 1 fast+bounded.
 GATE="${GATE:-0.4}"            # gap_closed threshold to proceed
 NDOCS="${NDOCS:-7000}"         # STREAMED docs, not kept: min_sents=window+1 drops
                                # ~55% of GSM8K (median 3 steps) -> 7000 keeps ~3100.
@@ -65,6 +68,8 @@ export HF_HUB_ETAG_TIMEOUT=60      # default 10s HEAD timeout blows on flaky nod
 export HF_HUB_DOWNLOAD_TIMEOUT=60
 ( while true; do echo "  ...setup heartbeat \$(date -u +%H:%M:%S)"; sleep 40; done ) &
 HB=\$!
+# HF-reachability preflight — fail in 10s on CN hosts that can't reach HF.
+curl -sS -m 10 -o /dev/null https://huggingface.co || { kill \$HB; echo "SETUPFAIL (huggingface.co unreachable from this node — CN geolocation; relaunch)"; echo "ALLDONE"; exit 1; }
 cd /root
 echo "=== clone ==="
 git clone --branch claude/project-review-6rx97z --single-branch https://github.com/mattyv/mimir-protocol.git 2>&1 | tail -2
@@ -92,8 +97,8 @@ CHECK_ARGS="\$DS_ARGS"
 echo "=== STEP 1: reason_check ON THIS RUN'S CORPUS (${DATASET}, ${NPROB} problems) ==="
 # encoder gate on the run's own distribution — a weak Stage-2 result on an
 # unchecked corpus can't separate encoder-blind from succession-failed.
-timeout 30m env PYTHONPATH=src python -u -m marker.reason_check \
-  --model-name ${MODEL} --repo ${REPO} --n-problems ${NPROB} \$CHECK_ARGS 2>&1 | tee /root/reason.log
+timeout 45m env PYTHONPATH=src python -u -m marker.reason_check \
+  --model-name ${MODEL} --repo ${REPO} --n-problems ${NPROB} --max-pairs ${MAXPAIRS} \$CHECK_ARGS 2>&1 | tee /root/reason.log
 GC=\$(grep 'gap_closed=' /root/reason.log | tail -1 | sed -E 's/.*gap_closed=([-0-9.]+).*/\1/')
 echo "REASON_GAP_CLOSED=\${GC:-none}"
 if [ -z "\${GC}" ]; then

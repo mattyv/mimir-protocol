@@ -48,8 +48,12 @@ exec > /proc/1/fd/1 2>&1
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export HF_HUB_ETAG_TIMEOUT=60      # default 10s HEAD timeout blows on flaky nodes
 export HF_HUB_DOWNLOAD_TIMEOUT=60
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # k>=8 OOM'd at step 1000 on 24GB
 ( while true; do echo "  ...setup heartbeat \$(date -u +%H:%M:%S)"; sleep 40; done ) &
 HB=\$!
+# HF-reachability preflight: 3 dead nodes burned hours on CN hosts that can't
+# reach huggingface.co. Fail in 10s instead.
+curl -sS -m 10 -o /dev/null https://huggingface.co || { kill \$HB; echo "SETUPFAIL (huggingface.co unreachable from this node — CN geolocation; relaunch)"; echo "ALLDONE"; exit 1; }
 cd /root
 echo "=== [k=$K] clone ==="
 git clone --branch claude/project-review-6rx97z --single-branch https://github.com/mattyv/mimir-protocol.git 2>&1 | tail -2
