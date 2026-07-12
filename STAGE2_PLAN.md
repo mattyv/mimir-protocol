@@ -450,3 +450,26 @@ Node 44588589 (run_mimir_decode, GSM8K, step-16000 k=8 adapter). Predictions:
   registered); (3) accept thoughts are lossy-for-generation and reposition the
   win as memory/KV-compression (already proven: k-sweep) rather than latent
   reasoning. Needs a strategy review, not another launcher.
+
+## Direction reset after 3b (2026-07-12, user + Fable) — two paths, different jobs
+
+User calls, agreed: (1) STAY LATENT is the default runtime — the speed path
+never regenerates text mid-chain (the thing that failed twice). (2) But some
+usage must SEE thoughts, so an accurate render path is a requirement, not a
+nice-to-have. (3) Averages hid too much — future evals report quantiles and a
+number-dense slice, not just means.
+
+- FAST PATH (default): latent chaining — predict next thought from the chain
+  of thoughts, inject, repeat; decode text only at the end (or on demand).
+  Needs: the Stage-2 predictor in the loop + thought-level verification.
+- RENDER PATH (on demand, out of the inner loop): reconstruct THE STEP ITSELF
+  from its thought. Key insight: all decode tests so far ran the CONTINUATION
+  direction (what the encoder was trained for); render = transcription, an
+  easier task we never trained. Untrained own-span overlap was already 0.458.
+  Build: small render decoder (LoRA/adapter on the frozen model, CE on the
+  source span given the injected thought) ~ $2 training run.
+- LITERALS LEDGER (answer to exact-detail lossiness + the user's dynamic-
+  capacity instinct): at encode time store the step's literal tokens (numbers,
+  names) beside the thought — a few tokens, deterministic; render splices them
+  in. Meaning from the thought, exact digits from the ledger. Lossy-at-any-k
+  stops applying to the details that matter.
