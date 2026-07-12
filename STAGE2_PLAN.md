@@ -380,3 +380,24 @@ Node 44588589 (run_mimir_decode, GSM8K, step-16000 k=8 adapter). Predictions:
   predictor's final-layer output (under-determined). Train the bridge THROUGH
   the injection loss that 3a-i just validated: convert -> inject -> minimize
   the true next step's NLL. Optimize what we measure.
+
+## Stage-3b-i RESULT (2026-07-12, node 44594162): BOTH GATES FAIL — informative negative
+
+167 pairs, k=8 drafts @ temp 0.9, trivial-guard on. Node destroyed clean, ~$0.5.
+- F1(next): picked 0.391 vs greedy 0.390 — LIKELIHOOD-VERIFY ADDS NOTHING.
+  The self-diagnosing design did its job: picking the draft the model finds
+  most likely under the real prior does not find better steps than greedy
+  (verify frequently just re-picks the greedy draft; when it differs, the
+  pick is fluent-shaped but not more correct).
+- ADVANCE rate: picked 0.293 / greedy 0.299 — both FAR below the 0.5 gate.
+  ~70% of decoded drafts sit closer to the CURRENT step than the next.
+  Quantifies 3a-i's warning (own-span 0.458 >= next 0.412).
+- DIAGNOSIS (mechanism, not mystery): drafts are conditioned on the thought of
+  step n ALONE — a single thought is directionless (many valid continuations;
+  no chain momentum), and mean-NLL-under-prior can't tell "the right advance"
+  from "fluent riff". The verify saw the full chain; the DRAFTS never did.
+- NEXT (3b-ii prerequisite, before any bridge): CHAIN-CONDITIONED drafting —
+  inject the thoughts of steps 1..n (concatenated slots, canonical positions),
+  decode from the accumulated thought-memory. Matches the runtime vision
+  (thought memory accumulates) and gives drafts the forward momentum a single
+  thought lacks. Secondary lever if needed: an anti-restate term in verify.
