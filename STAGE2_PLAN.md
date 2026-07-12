@@ -316,3 +316,18 @@ Fable steers for the CoT run:
 
 Diffusion head (phase B); fresh teacher distillation (open datasets first);
 32B; Stage-3 runtime.
+
+## Stage-3 3a-i pre-registration (2026-07-12, WRITTEN WHILE THE NODE RUNS, before results)
+
+Node 44588589 (run_mimir_decode, GSM8K, step-16000 k=8 adapter). Predictions:
+- SOFT ceiling (teacher-forced PPL of true next step, injected thought vs
+  none): logit parity with the training forward is CPU-tested EXACT, and
+  reason_check already measured this adapter on this distribution
+  (gap_closed 0.884; sweep gist~11.4 vs none~15.4). So the drop is
+  PREDICTED: ~20-30% (ratio 0.72-0.80). This number VALIDATES THE HARNESS;
+  a wild deviation means a 3a-i bug, not new science.
+- HARD test (greedy F1 from the thought alone) is the genuinely NEW
+  information — no prior measurement constrains it. Reads: F1(next) >>
+  no-inject and > random-step => direct latent decode works; soft-drop-good
+  but F1 weak => thought rich, greedy extraction poor => draft-and-verify
+  (3b) carries the load; soft drop absent => harness bug (see above).
