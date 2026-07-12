@@ -357,3 +357,26 @@ Node 44588589 (run_mimir_decode, GSM8K, step-16000 k=8 adapter). Predictions:
   extraction" case => draft-and-verify (Stage 3b) is the path: sample
   candidates from the thought, verify against the target. Decode ceiling is
   established and viable; predicted-thought bridge is the next build.
+
+## Fable post-3a-i review (2026-07-12) — calibration RESOLVED, steers for 3b
+
+- The 72%-vs-predicted-20-30% deviation is NOT an anomaly and NOT (only) the
+  tail-scoring story: the correct prior was reason_check's own GSM8K PPLs
+  (gist 4.21 / none 12.04 = 65% drop), which were in our logs all along. 3a-i
+  reproduced that measurement through the injection path (72%, small extra
+  from tail-scoring). The harness is VALIDATED end-to-end; the
+  pre-registration quoted the wrong prior (FineWeb sweep numbers).
+- Honest greedy margin: F1 0.412 vs the RANDOM-STEP floor 0.254 (1.6x) — the
+  shared GSM8K step template gives ~0.25 overlap for free; quoting vs
+  no-inject (0.183) overstates.
+- ADVANCE-VS-RESTATE (the one warning sign): decode overlaps the current step
+  (0.458) slightly more than the next (0.412). Chaining requires drafts that
+  MOVE FORWARD. 3b must measure and gate on advance rate = fraction of drafts
+  closer to step n+1 than to step n.
+- Contamination: Qwen likely saw GSM8K in pretraining. The none-baseline
+  (12.4) shows the thought does real work, but run a fresh-problems eval
+  before any headline claim.
+- BRIDGE DESIGN (next build): do NOT regress per-layer KV tensors from the
+  predictor's final-layer output (under-determined). Train the bridge THROUGH
+  the injection loss that 3a-i just validated: convert -> inject -> minimize
+  the true next step's NLL. Optimize what we measure.
