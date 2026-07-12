@@ -322,6 +322,51 @@ def test_decode_from_gist_kv_greedy_matches_manual_rollout():
 
 
 @pytest.mark.slow
+def test_gist_start_offset_preserves_decode_geometry():
+    # shifting span+gist together must not change what the continuation decodes:
+    # gist at gist_start, cont from cont_start, gives the SAME logits as the
+    # default placement (relative geometry is all RoPE sees).
+    from marker.gist_model import gist_kv, nll_under_gist_kv
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    span, cont = [1, 2, 3], [5, 6, 7]
+    kv0, cs0, fl0 = gist_kv(pm, gist, span)  # default: gist at span_len
+    kvS, csS, flS = gist_kv(pm, gist, span, gist_start=40)  # shifted
+    assert cs0 == len(span) + 4 and csS == 40 + 4
+    assert torch.allclose(fl0, flS, atol=1e-4)  # first-token logits invariant to the shift
+    assert abs(nll_under_gist_kv(pm, kv0, cs0, fl0, cont) - nll_under_gist_kv(pm, kvS, csS, flS, cont)) < 1e-4
+
+
+@pytest.mark.slow
+def test_chain_gist_kv_single_step_matches_gist_kv():
+    from marker.gist_model import chain_gist_kv, gist_kv, nll_under_gist_kv
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    span, cont = [1, 2, 3], [5, 6, 7]
+    # a 1-step chain (base=64) == gist_kv with gist_start=64: same decode
+    kvc, csc, flc = chain_gist_kv(pm, gist, [span], base=64)
+    kvg, csg, flg = gist_kv(pm, gist, span, gist_start=64)
+    assert csc == csg == 64 + 4
+    assert torch.allclose(flc, flg, atol=1e-4)
+    assert abs(nll_under_gist_kv(pm, kvc, csc, flc, cont) - nll_under_gist_kv(pm, kvg, csg, flg, cont)) < 1e-4
+
+
+@pytest.mark.slow
+def test_chain_gist_kv_accumulates_positions():
+    # n steps -> n*k contiguous gist positions, continuation after them
+    from marker.gist_model import chain_gist_kv
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    spans = [[1, 2, 3], [4, 5], [6, 7, 8]]
+    kv, cont_start, _ = chain_gist_kv(pm, gist, spans, base=64)
+    assert kv.keys[0].shape[2] == 3 * 4  # 3 steps x k=4 positions stacked
+    assert cont_start == 64 + 3 * 4
+
+
+@pytest.mark.slow
 def test_decode_temperature_samples_distinct_drafts():
     # draft step of draft-and-verify: temperature>0 with different generator
     # seeds yields distinct candidates; temperature=0 stays greedy (matches the

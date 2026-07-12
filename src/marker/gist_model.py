@@ -216,6 +216,7 @@ def gist_kv(
     gist_param: torch.nn.Parameter,
     span: list[int],
     pad_id: int = 0,
+    gist_start: int | None = None,
 ):
     """The Stage-3 decode substrate: the FULL per-layer K/V at the k gist
     positions — what the continuation actually attends to during training.
@@ -235,7 +236,16 @@ def gist_kv(
       (next-token shift), so decode starts from argmax(first_logits): no
       out-of-distribution prime token needed.
     (Predicting a decodable thought still needs a final-layer -> per-layer-KV
-    bridge, or re-targeting the predictor onto this object — the Stage-3 fork.)"""
+    bridge, or re-targeting the predictor onto this object — the Stage-3 fork.)
+
+    gist_start (chain-conditioning, 3b-ii): shift ALL position_ids so the gist
+    lands at absolute positions [gist_start, gist_start+k) — span and gist move
+    TOGETHER, so their relative geometry (all attention depends on) is
+    unchanged and the gist stays encoder-faithful. Lets independently-encoded
+    thoughts stack at contiguous canonical slots into one accumulated memory
+    (chain_gist_kv) without re-rotating stored keys. Require gist_start >=
+    len(span) so span positions stay non-negative. Default (None) = span_len,
+    the single-thought behaviour."""
     from marker.run_axiom_mlp_demo import AxiomKV  # noqa: PLC0415
 
     device = next(peft_model.parameters()).device
@@ -246,7 +256,8 @@ def gist_kv(
     gist_e = gist_param.to(span_e.dtype).unsqueeze(0)
     inputs_embeds = torch.cat([span_e, gist_e], dim=1)  # [1, max_s+k, hidden]
     mask = build_batch_mask([max_s], [0], k, max_s, 0, dtype=inputs_embeds.dtype).to(device)
-    pos = torch.arange(inputs_embeds.shape[1], device=device).unsqueeze(0)
+    offset = 0 if gist_start is None else (gist_start - max_s)
+    pos = (torch.arange(inputs_embeds.shape[1], device=device) + offset).unsqueeze(0)
     out = peft_model(
         inputs_embeds=inputs_embeds, attention_mask=mask, position_ids=pos, use_cache=True
     )
@@ -256,7 +267,41 @@ def gist_kv(
     keys = [layer_kv[0][:, :, max_s : max_s + k, :].detach() for layer_kv in legacy]
     values = [layer_kv[1][:, :, max_s : max_s + k, :].detach() for layer_kv in legacy]
     kv = AxiomKV(n_layers=len(keys), keys=keys, values=values)
-    return kv, max_s + k, out.logits[0, -1].detach()
+    return kv, max_s + k + offset, out.logits[0, -1].detach()  # cont_start tracks the offset
+
+
+@torch.no_grad()
+def chain_gist_kv(
+    peft_model,  # noqa: ANN001
+    gist_param: torch.nn.Parameter,
+    spans: list[list[int]],
+    base: int = 64,
+):
+    """Accumulate the thoughts of steps 1..n into ONE injectable memory
+    (chain-conditioning, 3b-ii). Each step is encoded INDEPENDENTLY (encoder is
+    trained on single spans — conditioning a gist on prior gists would be
+    out-of-distribution) but placed at a canonical contiguous slot: thought i
+    at [base + (i-1)k, base + ik). base >= max span length keeps every step's
+    span at non-negative positions. Continuation decodes from base + n*k.
+
+    first_logits is the LAST step's standalone last-gist logit — it predicts
+    the first continuation token from step n's thought alone, not the whole
+    chain (a minor token-1 caveat; tokens 2.. decode over the full accumulated
+    memory). Returns (AxiomKV, cont_start, first_logits)."""
+    from marker.run_axiom_mlp_demo import AxiomKV  # noqa: PLC0415
+
+    k = gist_param.shape[0]
+    keys, values, first_logits = None, None, None
+    for i, span in enumerate(spans):
+        kv_i, _, fl_i = gist_kv(peft_model, gist_param, span, gist_start=base + i * k)
+        if keys is None:
+            keys = [kk.clone() for kk in kv_i.keys]
+            values = [vv.clone() for vv in kv_i.values]
+        else:
+            keys = [torch.cat([a, b], dim=2) for a, b in zip(keys, kv_i.keys, strict=True)]
+            values = [torch.cat([a, b], dim=2) for a, b in zip(values, kv_i.values, strict=True)]
+        first_logits = fl_i
+    return AxiomKV(n_layers=len(keys), keys=keys, values=values), base + len(spans) * k, first_logits
 
 
 @torch.no_grad()
