@@ -420,3 +420,33 @@ Node 44588589 (run_mimir_decode, GSM8K, step-16000 k=8 adapter). Predictions:
    verify still can't track the oracle, likelihood-verify is DEAD as the
    runtime guardrail; next candidate is lookahead-consistency verify (does the
    draft make the FOLLOWING step more predictable) — measurable offline.
+
+## Stage-3b CHAIN RESULT (2026-07-12, node 44601808): chain-conditioning did NOT rescue it
+
+143 pairs, k=8, chain-conditioned drafts + question in verify + calibrated advance.
+- F1(next): picked 0.375, greedy 0.376, ORACLE(best-of-8) 0.449. Advance:
+  picked 0.329, greedy 0.315; CEILING(true-next) 1.00, FLOOR(prev-step) 0.224.
+- vs 3b-i (single thought: picked 0.391 / advance ~0.29): NO improvement.
+  Chain-conditioning + question-context + calibration all in, headline flat.
+- DUAL failure, both levers limited:
+  (a) DRAFT CEILING is low — best-of-8 only 0.449 F1 (vs ~0.25 template floor):
+      drafts carry real signal but the accumulated thoughts don't pin the
+      specific next computation. Qualitative: fluent but wrong-direction steps
+      (true "80000*1.5=120000" -> draft "house sold for $150,000... profit
+      $10,000"), sometimes terminating the problem early.
+  (b) VERIFY doesn't capture even that ceiling — picked 0.375 ~= greedy 0.376
+      << oracle 0.449. Likelihood-verify (even WITH the question) fails to
+      select the better drafts. Fable's pre-registered branch fires:
+      likelihood-verify is DEAD as the runtime guardrail.
+- Advance: picks (0.329) sit just above the restate FLOOR (0.224), nowhere
+  near the true-next CEILING (1.0). Drafting the next step from thoughts does
+  not reliably move forward.
+- JUNCTURE (not a tweak-rerun): the "draft the next-step TEXT from injected
+  thoughts, verify by likelihood" loop has failed twice. The decode-to-text
+  step is the weak link (3a-i already: coherent-but-not-verbatim). Options to
+  weigh BEFORE more spend: (1) latent chaining — predict next THOUGHT vector,
+  inject as context for the next prediction, decode to text only at the end,
+  verify at the thought level; (2) lookahead-consistency verify (pre-
+  registered); (3) accept thoughts are lossy-for-generation and reposition the
+  win as memory/KV-compression (already proven: k-sweep) rather than latent
+  reasoning. Needs a strategy review, not another launcher.
