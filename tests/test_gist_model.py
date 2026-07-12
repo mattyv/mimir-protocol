@@ -238,6 +238,26 @@ def test_gist_kv_extracts_per_layer_kv_at_gist_positions():
 
 
 @pytest.mark.slow
+def test_decode_from_gist_kv_runs_from_injected_thought_only():
+    # Stage-3 ceiling mechanics: decode from ONLY the injected per-layer gist
+    # KV (no span tokens visible) + a minimal prime. Asserts it runs and
+    # respects max_new; reconstruction quality is the GPU eval, not this test.
+    from marker.gist_model import decode_from_gist_kv, gist_kv
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    kv = gist_kv(pm, gist, [1, 2, 3])
+    gen = decode_from_gist_kv(pm, kv, prime=[5], max_new=6)
+    assert 1 <= len(gen) <= 6
+    assert all(isinstance(t, int) for t in gen)
+    # the injected thought steers the decode: two different thoughts (from
+    # different spans) can produce different continuations from the same prime
+    kv2 = gist_kv(pm, gist, [9, 8, 7])
+    g2 = decode_from_gist_kv(pm, kv2, prime=[5], max_new=6)
+    assert isinstance(g2, list)  # both decode without raising (steer may or may not differ on a tiny random model)
+
+
+@pytest.mark.slow
 def test_generate_from_gist_runs_and_respects_max_new():
     base = _tiny_base()
     pm, gist = attach_gist(base, gist_k=4, r=4)

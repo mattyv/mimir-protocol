@@ -251,6 +251,43 @@ def gist_kv(
 
 
 @torch.no_grad()
+def decode_from_gist_kv(
+    peft_model,  # noqa: ANN001
+    gist_kv_obj,  # noqa: ANN001
+    prime: list[int],
+    *,
+    max_new: int = 40,
+    eos_id: int | None = None,
+):
+    """Stage-3 ceiling: greedily decode from ONLY an injected per-layer gist KV
+    — the span is gone; the thought alone must carry what-comes-next. The gist
+    occupies cache positions [0, k); `prime` (a minimal seed, e.g. a leading
+    space/BOS) and generated tokens follow at [k, ...). RoPE is relative, so
+    injecting the gist at position 0 preserves the gist->continuation geometry
+    from training. Returns generated token ids. (Feed a REAL gist here to
+    measure the decode ceiling; a PREDICTED thought needs the final-layer->KV
+    bridge first.)"""
+    from marker.run_axiom_mlp_demo import _build_dynamic_cache  # noqa: PLC0415
+
+    device = next(peft_model.parameters()).device
+    cache = _build_dynamic_cache(gist_kv_obj, device)
+    out = peft_model(torch.tensor([prime], device=device), past_key_values=cache, use_cache=True)
+    past = out.past_key_values
+    nxt = int(out.logits[0, -1].argmax().item())
+    gen = [nxt]
+    for _ in range(max_new - 1):
+        if nxt == eos_id:
+            break
+        out = peft_model(
+            torch.tensor([[nxt]], device=device), past_key_values=past, use_cache=True
+        )
+        past = out.past_key_values
+        nxt = int(out.logits[0, -1].argmax().item())
+        gen.append(nxt)
+    return gen
+
+
+@torch.no_grad()
 def generate_from_gist(
     peft_model,  # noqa: ANN001
     gist_param: torch.nn.Parameter,
