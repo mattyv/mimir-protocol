@@ -31,9 +31,21 @@ Default to terse plain-English. The user is a working engineer, not an ML resear
 - TLDRs and updates: a few lines, not a wall of text. Skip restating what we just did.
 - No status-recap preambles ("So we…", "As you saw…"). Get to the new info.
 - Defining jargon: when a term is unavoidable, give a short plain-English gloss in parentheses the first time it appears in a thread. Examples: "LoRA (a tiny set of extra learned weights bolted onto the model)", "residual stream (the running sum of vectors flowing layer-to-layer)", "logit (the model's pre-softmax score for a token)". After it's defined once, use the term freely.
+- **Watch the jargon — the user is not an ML researcher and has asked, repeatedly, to keep it plain.** Default to the plain phrase and put the term in parens, not the reverse. If a sentence has two+ unglossed ML terms, rewrite it. When in doubt, lead with the plain-English meaning and only name the term if it'll recur.
 - Prefer concrete words. "The model's stored prior reading" beats "the activation manifold".
 - Numbers and contrasts beat adjectives. "α=20 says 'order book, market data'; baseline says 'balance sheet'" beats "noticeable improvement".
 - If a request is ambiguous, ask one short question rather than guess.
+
+## Running glossary (plain gloss for recurring terms — use these, don't assume they're known)
+
+- **PPL / perplexity** — how *surprised* the model is by the correct text; roughly "how many options it was wavering between per word." Lower = predicted it better. PPL 1 = perfect; PPL 15 = as unsure as guessing among ~15 words.
+- **gap_closed** — how much of the way an injected thought gets us from "no help" to "seeing the full text." 1.0 = the thought is as good as seeing the real thing; 0 = no help; below 0 = actively misleading.
+- **gist / thought vector** — the compressed meaning of a sentence or reasoning step, stored as a handful of vectors instead of its words.
+- **recall@k** — out of many candidates, how often the right answer lands in the model's top k guesses. Higher = better.
+- **KV cache** — the model's per-layer memory of everything it has read so far; injecting a thought = writing into this memory directly.
+- **draft-and-verify** — guess the next step cheaply with the small model, then check it with the big model before trusting it.
+
+Add new recurring terms here as they come up.
 
 ## Vocabulary: "understand" vs "train"
 
