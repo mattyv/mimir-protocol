@@ -63,14 +63,21 @@ def bridge_injection_nll(
     bridge: GistBridge,
     thought: torch.Tensor,
     cont_ids: list[int],
-    cont_start: int,
 ) -> torch.Tensor:
     """The bridge's training loss: convert the thought, inject it, and return
     the teacher-forced mean NLL of the true next step's tail (same scoring as
     _tail_nll / the 3a-i ceiling — optimize what we measure). Differentiable
     into the bridge: the frozen model attends over the injected cache, so
     gradients flow back through attention into the bridge outputs. NO detach
-    anywhere on the bridge path (tested)."""
+    anywhere on the bridge path (tested).
+
+    CANONICAL POSITION FRAME (Fable 3b review): real gist keys carry rotations
+    that vary with each span's length; a bridge forced to imitate a varying
+    frame from a vector that doesn't know the length would learn mush across
+    examples. Learned keys instead live at canonical positions [0, k) and the
+    continuation ALWAYS decodes from position k — one fixed relative geometry
+    for every example. Decode from bridged KV must likewise use
+    cont_start = bridge.k, never a span-dependent value."""
     import torch.nn.functional as F  # noqa: N812, PLC0415
     from transformers import DynamicCache  # noqa: PLC0415
 
@@ -82,7 +89,7 @@ def bridge_injection_nll(
     for i in range(kv.n_layers):
         cache.update(kv.keys[i], kv.values[i], i)  # bridge outputs keep grad
     m = len(cont_ids) - 1
-    pos = torch.arange(cont_start, cont_start + m, device=device).unsqueeze(0)
+    pos = torch.arange(bridge.k, bridge.k + m, device=device).unsqueeze(0)
     out = peft_model(
         torch.tensor([cont_ids[:-1]], device=device),
         past_key_values=cache,

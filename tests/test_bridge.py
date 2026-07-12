@@ -69,7 +69,7 @@ def test_injection_nll_gradients_reach_the_bridge():
         head_dim=cfg.hidden_size // cfg.num_attention_heads,
     )
     thought = torch.randn(4, cfg.hidden_size)
-    loss = bridge_injection_nll(pm, b, thought, cont_ids=[5, 6, 7], cont_start=10)
+    loss = bridge_injection_nll(pm, b, thought, cont_ids=[5, 6, 7])
     assert torch.isfinite(loss)
     loss.backward()
     grads = [p.grad.abs().sum() for p in b.parameters() if p.grad is not None]
@@ -94,7 +94,7 @@ def test_bridge_overfits_one_batch():
     first = best = None
     for i in range(40):
         opt.zero_grad()
-        loss = bridge_injection_nll(pm, b, thought, cont_ids=[5, 6, 7, 8], cont_start=10)
+        loss = bridge_injection_nll(pm, b, thought, cont_ids=[5, 6, 7, 8])
         loss.backward()
         opt.step()
         if i == 0:

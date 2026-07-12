@@ -24,7 +24,7 @@ import argparse
 
 import torch
 
-from marker.draft_verify import advance_rate, pick_by_score
+from marker.draft_verify import advance_rate, guard_trivial, pick_by_score
 from marker.gist_model import decode_from_gist_kv, gist_kv
 
 
@@ -119,8 +119,15 @@ def main() -> None:
                         generator=g,
                     )
                 )
-            prior = [t for s in step_ids[: n + 1] for t in s]  # steps 1..n as context
-            scores = [_verify_nll(pm, prior, d) for d in drafts]
+            # steps 1..n as the verify context, newline-joined — without the
+            # separators the prior reads as run-on text, off-distribution for
+            # the verifier (Fable 3b review)
+            nl = tok("\n", add_special_tokens=False).input_ids
+            prior = []
+            for s in step_ids[: n + 1]:
+                prior.extend(s)
+                prior.extend(nl)
+            scores = guard_trivial(drafts, [_verify_nll(pm, prior, d) for d in drafts])
             picked, _ = pick_by_score(drafts, scores)
             f_pick.append(_f1(picked, cont_b))
             f_greedy.append(_f1(greedy, cont_b))

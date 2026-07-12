@@ -41,3 +41,17 @@ def pick_by_score(candidates: Sequence, scores: Sequence) -> tuple:
     real context — the verify signal). Ties take the first."""
     best_idx = min(range(len(scores)), key=lambda i: scores[i])
     return candidates[best_idx], best_idx
+
+
+def guard_trivial(drafts: Sequence, scores: Sequence, min_tokens: int = 3) -> list:
+    """Disqualify trivial drafts before verify (score -> inf). Mean-NLL verify
+    has a length loophole: a newline-only draft is maximally unsurprising per
+    token and would beat real steps for a fake reason (Fable 3b review). If
+    ALL drafts are trivial, return scores unchanged so selection stays
+    deterministic among the least-bad."""
+    guarded = [
+        float("inf") if len(d) < min_tokens else s for d, s in zip(drafts, scores, strict=True)
+    ]
+    if all(g == float("inf") for g in guarded):
+        return list(scores)
+    return guarded

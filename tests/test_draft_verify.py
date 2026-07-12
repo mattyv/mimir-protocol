@@ -53,3 +53,29 @@ def test_pick_by_score_returns_best_and_index():
 def test_pick_by_score_ties_take_first():
     best, idx = pick_by_score([["a"], ["b"]], [1.0, 1.0])
     assert idx == 0
+
+
+def test_disqualify_trivial_drafts():
+    # a newline-only draft is maximally unsurprising per token and would win
+    # NLL-verify for a fake reason — trivial drafts get score=inf instead.
+    from marker.draft_verify import guard_trivial
+
+    drafts = [[10, 11, 12, 13], [198], [7, 8]]
+    scores = [1.2, 0.1, 0.9]
+    guarded = guard_trivial(drafts, scores, min_tokens=3)
+    assert guarded[0] == 1.2
+    assert guarded[1] == float("inf")  # 1 token: disqualified
+    assert guarded[2] == float("inf")  # 2 tokens: disqualified
+    best, idx = pick_by_score(drafts, guarded)
+    assert idx == 0
+
+
+def test_guard_trivial_all_short_leaves_scores_untouched():
+    # if EVERY draft is trivial, disqualifying all would leave pick_by_score
+    # choosing among infs arbitrarily — keep original scores instead so the
+    # least-bad short draft still wins deterministically.
+    from marker.draft_verify import guard_trivial
+
+    drafts = [[198], [5]]
+    scores = [0.3, 0.2]
+    assert guard_trivial(drafts, scores, min_tokens=3) == scores

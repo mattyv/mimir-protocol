@@ -284,19 +284,23 @@ def decode_from_gist_kv(
 
     temperature=0 (default) is greedy (the 3a-i ceiling). temperature>0 samples
     (with `generator` for reproducible, distinct draft candidates) — the DRAFT
-    step of draft-and-verify."""
+    step of draft-and-verify. Sampling is truncated to the top_k most likely
+    tokens (Fable 3b review: unfiltered sampling over a ~150k vocab derails
+    drafts on rare-garbage tokens)."""
     from marker.run_axiom_mlp_demo import _build_dynamic_cache  # noqa: PLC0415
 
     device = next(peft_model.parameters()).device
     halt = set(stop_ids or ())
     if eos_id is not None:
         halt.add(eos_id)
+    top_k = 50
 
     def _pick(logits: torch.Tensor) -> int:
         if temperature <= 0:
             return int(logits.argmax().item())
-        probs = torch.softmax(logits / temperature, dim=-1)
-        return int(torch.multinomial(probs, 1, generator=generator).item())
+        vals, idx = logits.topk(min(top_k, logits.shape[-1]))
+        probs = torch.softmax(vals / temperature, dim=-1)
+        return int(idx[torch.multinomial(probs, 1, generator=generator)].item())
 
     past = _build_dynamic_cache(gist_kv_obj, device)
     nxt = _pick(first_logits.to(device))
