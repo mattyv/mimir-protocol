@@ -1,15 +1,15 @@
-"""Stage-3b-i: draft-and-verify with REAL thoughts (no predictor, no bridge).
+"""Stage-3b: CHAIN-conditioned draft-and-verify with real thoughts.
 
-Isolates the loop before adding predicted thoughts (3b-ii). Per reasoning step:
-  encode step n -> real thought (gist_kv) -> sample K candidate next-steps from
-  the injected thought -> VERIFY each by its NLL under the REAL reasoning-so-far
-  (question + steps 1..n) -> keep the best.
-
-Measures, vs a greedy (K=1, no verify) baseline:
-- did verify+sampling pick a step closer to the TRUE next step? (F1)
-- ADVANCE RATE (Fable gate): is the pick closer to step n+1 than to step n?
-  chaining needs forward motion, and 3a-i showed greedy restates ~ as much as
-  it advances. Draft-and-verify must lift this.
+3b-i (single-thought drafts) failed both gates: verify added nothing (picked
+F1 0.391 ~= greedy 0.390) and drafts didn't advance (~0.29). Diagnosis: one
+thought is directionless. This conditions drafts on the ACCUMULATED thoughts
+of steps 1..n (chain_gist_kv), against Fable's second-pass requirements:
+  - CHAIN-conditioned drafting (accumulated thought-memory, canonical positions)
+  - ORACLE logged (best-of-K vs truth): localizes the failure — verify
+    selection vs draft distribution
+  - QUESTION in the verify context (3b-i judged steps blind to the problem)
+  - advance metric CALIBRATED against a true-next ceiling + prev-step floor,
+    not an arbitrary 0.5
 
 Run (GPU):
     HF_TOKEN=... PYTHONPATH=src python -u -m marker.run_draft_verify \
@@ -25,7 +25,24 @@ import argparse
 import torch
 
 from marker.draft_verify import advance_rate, guard_trivial, pick_by_score
-from marker.gist_model import decode_from_gist_kv, gist_kv
+from marker.gist_model import chain_gist_kv, decode_from_gist_kv, gist_kv
+
+
+def _qa_docs(n, dataset):  # noqa: ANN001
+    """Stream n (question, answer) pairs — the question is the verify context
+    that 3b-i omitted (judging math steps blind to the problem)."""
+    from datasets import load_dataset  # noqa: PLC0415
+
+    is_gsm = dataset == "openai/gsm8k"
+    ds = load_dataset(
+        dataset, "main" if is_gsm else None, split="test" if is_gsm else "train", streaming=True
+    )
+    out = []
+    for i, row in enumerate(ds):
+        if i >= n:
+            break
+        out.append((row.get("question") or "", row.get("answer") or row.get("solution") or ""))
+    return out
 
 
 def _f1(pred, gold):  # noqa: ANN001
@@ -77,7 +94,6 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     from marker.run_stage2 import (  # noqa: PLC0415
-        _doc_texts,
         _load_stage1,
         _smoke_cot_texts,
         _split_units,
@@ -95,22 +111,24 @@ def main() -> None:
     _d = decode_from_gist_kv(pm, _kv, _cs, _fl, max_new=4, temperature=0.9, generator=_g)
     _verify_nll(pm, tok("a b c", add_special_tokens=False).input_ids, _d)
     print("PREFLIGHT_OK (sample + verify on device)", flush=True)
-    docs = (
-        _smoke_cot_texts(args.n_docs)
-        if args.smoke
-        else list(_doc_texts(args.n_docs, "cot", args.dataset, None, None))
-    )
+    if args.smoke:
+        qas = [("Q?", t) for t in _smoke_cot_texts(args.n_docs)]
+    else:
+        qas = _qa_docs(args.n_docs, args.dataset)
+    nl = tok("\n", add_special_tokens=False).input_ids
 
-    f_pick, f_greedy = [], []
-    picks, greedys, curs, nexts = [], [], [], []
+    f_pick, f_greedy, f_oracle = [], [], []
+    picks, greedys, curs, nexts, prevs = [], [], [], [], []
     shown = 0
-    for text in docs:
-        steps = _split_units(text, args.unit)
+    for question, answer in qas:
+        steps = _split_units(answer, args.unit)
         step_ids = [tok(s, add_special_tokens=False).input_ids[: args.max_span] for s in steps]
         step_ids = [s for s in step_ids if s]
+        q_ids = tok(question, add_special_tokens=False).input_ids if question else []
         for n in range(len(step_ids) - 1):
-            span_a, cont_b = step_ids[n], step_ids[n + 1]
-            kv, cont_start, first_logits = gist_kv(pm, gist, span_a)
+            cont_b = step_ids[n + 1]
+            # CHAIN-CONDITIONED: draft from the accumulated thoughts of steps 1..n
+            kv, cont_start, first_logits = chain_gist_kv(pm, gist, step_ids[: n + 1])
             greedy = decode_from_gist_kv(
                 pm, kv, cont_start, first_logits, max_new=args.max_new, stop_ids=stop_ids
             )
@@ -129,11 +147,9 @@ def main() -> None:
                         generator=g,
                     )
                 )
-            # steps 1..n as the verify context, newline-joined — without the
-            # separators the prior reads as run-on text, off-distribution for
-            # the verifier (Fable 3b review)
-            nl = tok("\n", add_special_tokens=False).input_ids
-            prior = []
+            # verify context = QUESTION + steps 1..n, newline-joined (3b-i judged
+            # steps blind to the problem; a real runtime has the question)
+            prior = list(q_ids) + list(nl)
             for s in step_ids[: n + 1]:
                 prior.extend(s)
                 prior.extend(nl)
@@ -141,10 +157,14 @@ def main() -> None:
             picked, _ = pick_by_score(drafts, scores)
             f_pick.append(_f1(picked, cont_b))
             f_greedy.append(_f1(greedy, cont_b))
+            f_oracle.append(
+                max(_f1(d, cont_b) for d in drafts)
+            )  # best-of-K: is verify or drafts the bottleneck?
             picks.append(picked)
             greedys.append(greedy)
-            curs.append(span_a)
+            curs.append(step_ids[n])
             nexts.append(cont_b)
+            prevs.append(step_ids[n - 1] if n > 0 else step_ids[n])
             if shown < args.show:
                 shown += 1
                 print(
@@ -156,16 +176,18 @@ def main() -> None:
 
     sim = lambda a, b: _f1(a, b)  # noqa: E731
     m = lambda xs: round(sum(xs) / max(1, len(xs)), 3)  # noqa: E731
+    ar = lambda ds: round(advance_rate(ds, curs, nexts, sim), 3)  # noqa: E731
     print(
-        f"\n[DRAFT-VERIFY] pairs={len(f_pick)}  k={args.k_drafts}  temp={args.temperature}\n"
-        f"  F1(next):     picked={m(f_pick)}  greedy={m(f_greedy)}\n"
-        f"  ADVANCE rate: picked={round(advance_rate(picks, curs, nexts, sim), 3)}  "
-        f"greedy={round(advance_rate(greedys, curs, nexts, sim), 3)}",
+        f"\n[DRAFT-VERIFY chain] pairs={len(f_pick)}  k={args.k_drafts}  temp={args.temperature}\n"
+        f"  F1(next):     picked={m(f_pick)}  greedy={m(f_greedy)}  ORACLE(best-of-K)={m(f_oracle)}\n"
+        f"  ADVANCE rate: picked={ar(picks)}  greedy={ar(greedys)}  "
+        f"|| CEILING(true-next)={ar(nexts)}  FLOOR(prev-step)={ar(prevs)}",
         flush=True,
     )
     print(
-        "GATE: picked F1 > greedy F1 (verify helps) AND picked advance-rate > 0.5 "
-        "and > greedy (drafts move to the NEXT step, don't restate)."
+        "READ: ORACLE >> greedy => verify is the bottleneck (good drafts exist, "
+        "selection misses them); ORACLE ~= greedy => drafts are. Judge picked "
+        "advance vs the CEILING/FLOOR bracket, not a fixed 0.5."
     )
 
 
