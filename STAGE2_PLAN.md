@@ -199,6 +199,29 @@ Money: all nodes destroyed+verified, $0 idle burn, ~$5 spent, $10.34 credit left
   dead nodes, recovered n2's log to completion, pushed branch vast-logs
   (merged here). No secrets in its commits (scanned).
 
+## k-sweep RESULT: the complete capacity curve (2026-07-12, all arms @ 8000 steps)
+
+| k | gap_closed | span content kept (above topic 0.632, vs k=8) |
+|---|---|---|
+| 1 | 0.794 | 65% |
+| 2 | 0.835 | 82% |
+| 4 | 0.863 | 93% |
+| 8 | 0.880 | 100% (=0.248) |
+| 16 | ~0.88 (plateau band 0.87-0.887; exact final clipped in log race) | ~100% |
+
+Verdict: **smooth log-shaped diminishing returns, no knee, saturated by k=8.**
+Each doubling buys less: +0.041 (1→2), +0.028 (2→4), +0.017 (4→8), ~0 (8→16).
+- Sentences are NOT underfunded at k=8; content is low-rank. k=4 is the
+  value pick for quality (93% at half the slots).
+- k=1 does not collapse (prediction falsified, recorded above) — 1 slot keeps
+  ~2/3 of span-specific content; k=2 keeps ~82% at 4x-shorter Stage-2
+  sequences than k=8. The compress-for-prediction asymmetry (k=2 encode →
+  predictor → k=8 decode) is now priced and viable.
+- k=3 NOT run, deliberately: the curve is regular enough that interpolation
+  (~0.85) is safe; no hidden knee to find.
+- Sweep arms pushed no checkpoints (by design) — any arm that informs a real
+  build decision gets one re-run with push + the xdoc control (~$0.75).
+
 ## QUEUED: Stage-1-real sweep (teed up 2026-07-12, runs after the Stage-2 result)
 
 One node, ~6-8h, ~$1.5-2. Order of runs after the current Stage-2 shakedown:
