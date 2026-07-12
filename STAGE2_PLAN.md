@@ -331,3 +331,29 @@ Node 44588589 (run_mimir_decode, GSM8K, step-16000 k=8 adapter). Predictions:
   no-inject and > random-step => direct latent decode works; soft-drop-good
   but F1 weak => thought rich, greedy extraction poor => draft-and-verify
   (3b) carries the load; soft drop absent => harness bug (see above).
+
+## Stage-3 3a-i RESULT (2026-07-12, node 44588589, GSM8K, step-16000 k=8 adapter)
+
+167 held-out step pairs. THE DECODE PATH WORKS — a real thought round-trips.
+- SOFT ceiling: PPL(next | injected thought) 3.44 vs no-injection 12.43 = 72%
+  drop. NOTE — this BEAT the pre-registered ~20-30% by a lot. Not a bug: the
+  injection path is parity-tested EXACT, and the deviation is a
+  mis-calibrated prediction — I predicted using gap_closed's FULL-continuation
+  PPL (gist 11.4 vs none 15.4) but the metric TAIL-scores (cont[1:], each
+  token teacher-forced on the step's own earlier tokens). Thought + within-step
+  context compound, so the injected condition benefits far more from tail-
+  scoring than 'none' does. Real, but the 72% is not the gap_closed number.
+  FLAG FOR FABLE: sanity-check this calibration next review.
+- HARD test (the genuinely new info): greedy F1(decoded, next) 0.412 >>
+  no-inject 0.183 AND > random-step 0.254 — BOTH pre-registered gates PASS.
+  own-span F1 0.458 (slightly > next) — the decode reflects step n's content
+  as much as it predicts n+1, as expected (the gist encodes step n).
+- Qualitative: decoded text is COHERENT, ON-TOPIC math reasoning that shares
+  the true step's numbers/entities but is not verbatim (e.g. true "48+24=72
+  clips" -> decoded "$1.50 x 48 = $72.00"). Not garbage; plausible reasoning
+  in the right ballpark.
+- VERDICT: the thought carries the meaning and the frozen model can express
+  it — approximately, via greedy. This is the "rich thought, imperfect greedy
+  extraction" case => draft-and-verify (Stage 3b) is the path: sample
+  candidates from the thought, verify against the target. Decode ceiling is
+  established and viable; predicted-thought bridge is the next build.
