@@ -210,6 +210,21 @@ Arms (all 8000 steps — the pilot plateaued by ~7500, no need for 16000):
   prediction (Fable, on record): k=1 COLLAPSES (single-slot attention has no
   query-dependent readout); k=4 vs 8 tells whether sentence content is
   low-rank; k=16 >> 8 would mean sentences are underfunded.
+
+  **PREDICTION FALSIFIED mid-run (2026-07-12, recorded before finals): k=1
+  does NOT collapse.** Clean learning curve (step 0 gap_closed −1.76 →
+  plateau ~0.77-0.78 by step 2500, flat thereafter) while k=8 blows past
+  (0.849 @ 2500, climbing). Why the prediction was wrong: it treated a slot
+  as ONE VECTOR — but one KV position is 28 layers × per-head K/V, so
+  different heads/layers read the same position differently; capacity of a
+  single position was under-counted by ~2 orders of magnitude. What
+  survives: the CAPACITY GAP — vs the topic-only baseline 0.632, k=1 keeps
+  ~half the span-specific content (0.78 vs 0.887 ⇒ 0.15/0.26). Implication:
+  k=1-encode → predictor → k=8-decode asymmetry is a legitimate design
+  option (8x shorter Stage-2 sequences), taxed ~half the specific content.
+  Caveat: sweep arms push NO checkpoints, so no post-hoc xdoc control on
+  k=1 — if this informs a real decision, re-run that arm once with push
+  (~$0.75). Judge the final curve at step 8000 only (same cosine schedule).
 - clause-snap arm (k=8): truncate at the last clause boundary inside the cap
   instead of mid-token (55% of over-cap cuts orphan clause material). Beats
   plain k=8 -> construct-aware boundaries matter; ~= k=8 -> truncation noise
