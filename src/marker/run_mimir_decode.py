@@ -69,10 +69,7 @@ def main() -> None:
     ap.add_argument("--unit", choices=["line", "sentence"], default="line")
     ap.add_argument("--n-docs", type=int, default=60)
     ap.add_argument("--max-span", type=int, default=64)
-    ap.add_argument("--max-new", type=int, default=48)
-    ap.add_argument(
-        "--prime", type=int, default=None, help="seed token id (default: a leading space)"
-    )
+    ap.add_argument("--max-new", type=int, default=32)
     ap.add_argument("--show", type=int, default=8, help="qualitative examples to print")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
@@ -84,11 +81,8 @@ def main() -> None:
     from marker.run_stage2 import _doc_texts, _load_stage1, _smoke_cot_texts  # noqa: PLC0415
 
     pm, gist, tok = _load_stage1(args.model_name, args.repo, device, device == "cuda")
-    prime = (
-        [args.prime] if args.prime is not None else tok(" ", add_special_tokens=False).input_ids[:1]
-    )
-    if not prime:
-        prime = [tok.eos_token_id or 0]
+    # stop at end-of-line for step-per-line corpora (don't run into later steps)
+    stop_ids = {tid for tid in (tok("\n", add_special_tokens=False).input_ids or []) if tid}
 
     docs = (
         _smoke_cot_texts(args.n_docs)
@@ -101,14 +95,25 @@ def main() -> None:
     import random  # noqa: PLC0415
 
     rng = random.Random(0)
+    # no-injection floor: greedy from a leading space, computed ONCE (it has
+    # no per-pair input, so it is identical for every pair)
+    prime = tok(" ", add_special_tokens=False).input_ids[:1] or [tok.eos_token_id or 0]
+    none = _decode_no_kv(pm, prime, args.max_new, tok.eos_token_id)
+
     f_next, f_span, f_rand, f_none = [], [], [], []
     shown = 0
     for i, (span_a, cont_b) in enumerate(pairs):
-        kv = gist_kv(pm, gist, span_a)
-        dec = decode_from_gist_kv(pm, kv, prime, max_new=args.max_new, eos_id=tok.eos_token_id)
+        kv, cont_start, first_logits = gist_kv(pm, gist, span_a)
+        dec = decode_from_gist_kv(
+            pm,
+            kv,
+            cont_start,
+            first_logits,
+            max_new=args.max_new,
+            eos_id=tok.eos_token_id,
+            stop_ids=stop_ids,
+        )
         rand_b = pairs[rng.randrange(len(pairs))][1]
-        # no-injection baseline: decode from the prime with an EMPTY cache
-        none = _decode_no_kv(pm, prime, args.max_new, tok.eos_token_id)
         f_next.append(_f1(dec, cont_b))
         f_span.append(_f1(dec, span_a))
         f_rand.append(_f1(dec, rand_b))

@@ -224,10 +224,18 @@ def gist_kv(
     that is what the Stage-2 predictor is trained on, but it is NOT enough to
     decode from — the continuation reads the gist at EVERY layer's K/V. This
     runs [span | gist] with use_cache and slices the k gist positions out of
-    each layer's cache, returning an AxiomKV injectable via
-    instruct.decode_with_kv. (So predicting a decodable thought means either a
-    final-layer -> per-layer-KV bridge, or re-targeting the predictor onto this
-    object — the open Stage-3 fork.)"""
+    each layer's cache. Returns (AxiomKV, cont_start, first_logits):
+    - cont_start = span_len + k. The gist keys carry RoPE rotations at their
+      TRAINING positions [span_len, span_len+k) — the continuation must decode
+      from explicit position cont_start onward, or the relative geometry is
+      off by span_len (cache-length position inference would put the query
+      BEFORE the keys — Fable 3a-i review, blocking bug).
+    - first_logits = the last gist position's next-token logits — in training
+      the FIRST continuation token is predicted from exactly this position
+      (next-token shift), so decode starts from argmax(first_logits): no
+      out-of-distribution prime token needed.
+    (Predicting a decodable thought still needs a final-layer -> per-layer-KV
+    bridge, or re-targeting the predictor onto this object — the Stage-3 fork.)"""
     from marker.run_axiom_mlp_demo import AxiomKV  # noqa: PLC0415
 
     device = next(peft_model.parameters()).device
@@ -247,39 +255,47 @@ def gist_kv(
     # slice the k gist positions [max_s : max_s+k] along the sequence dim (2)
     keys = [layer_kv[0][:, :, max_s : max_s + k, :].detach() for layer_kv in legacy]
     values = [layer_kv[1][:, :, max_s : max_s + k, :].detach() for layer_kv in legacy]
-    return AxiomKV(n_layers=len(keys), keys=keys, values=values)
+    kv = AxiomKV(n_layers=len(keys), keys=keys, values=values)
+    return kv, max_s + k, out.logits[0, -1].detach()
 
 
 @torch.no_grad()
 def decode_from_gist_kv(
     peft_model,  # noqa: ANN001
     gist_kv_obj,  # noqa: ANN001
-    prime: list[int],
+    cont_start: int,
+    first_logits: torch.Tensor,
     *,
-    max_new: int = 40,
+    max_new: int = 32,
     eos_id: int | None = None,
+    stop_ids: set[int] | None = None,
 ):
     """Stage-3 ceiling: greedily decode from ONLY an injected per-layer gist KV
-    — the span is gone; the thought alone must carry what-comes-next. The gist
-    occupies cache positions [0, k); `prime` (a minimal seed, e.g. a leading
-    space/BOS) and generated tokens follow at [k, ...). RoPE is relative, so
-    injecting the gist at position 0 preserves the gist->continuation geometry
-    from training. Returns generated token ids. (Feed a REAL gist here to
-    measure the decode ceiling; a PREDICTED thought needs the final-layer->KV
-    bridge first.)"""
+    — the span is gone; the thought alone must carry what-comes-next.
+
+    Faithful to training geometry (logit-parity tested): the gist keys are
+    RoPE'd at [span_len, span_len+k), so generated tokens take EXPLICIT
+    positions cont_start, cont_start+1, ... (never cache-length inference),
+    and the first token comes from argmax(first_logits) — the last gist
+    position's prediction, exactly as in training. stop_ids (e.g. newline for
+    step-per-line corpora) halt generation inclusively."""
     from marker.run_axiom_mlp_demo import _build_dynamic_cache  # noqa: PLC0415
 
     device = next(peft_model.parameters()).device
-    cache = _build_dynamic_cache(gist_kv_obj, device)
-    out = peft_model(torch.tensor([prime], device=device), past_key_values=cache, use_cache=True)
-    past = out.past_key_values
-    nxt = int(out.logits[0, -1].argmax().item())
+    halt = set(stop_ids or ())
+    if eos_id is not None:
+        halt.add(eos_id)
+    past = _build_dynamic_cache(gist_kv_obj, device)
+    nxt = int(first_logits.argmax().item())
     gen = [nxt]
-    for _ in range(max_new - 1):
-        if nxt == eos_id:
+    for j in range(max_new - 1):
+        if nxt in halt:
             break
         out = peft_model(
-            torch.tensor([[nxt]], device=device), past_key_values=past, use_cache=True
+            torch.tensor([[nxt]], device=device),
+            past_key_values=past,
+            position_ids=torch.tensor([[cont_start + j]], device=device),
+            use_cache=True,
         )
         past = out.past_key_values
         nxt = int(out.logits[0, -1].argmax().item())

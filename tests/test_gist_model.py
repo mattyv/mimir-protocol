@@ -211,14 +211,16 @@ def test_gist_kv_extracts_per_layer_kv_at_gist_positions():
     # Stage-3 decode path: the continuation attends to the gist positions'
     # per-layer K/V (encode_gist returns only the top-layer readout). gist_kv
     # slices the k gist positions from every layer's cache -> an injectable
-    # AxiomKV. Mechanical invariants only (shapes/positions/injectability),
-    # not reconstruction quality (that needs the real 7B on a GPU node).
+    # AxiomKV + the training-geometry continuation start + the last-gist-
+    # position logits (the train-faithful first-token predictor).
     from marker.gist_model import gist_kv
     from marker.run_axiom_mlp_demo import _build_dynamic_cache
 
     base = _tiny_base()
     pm, gist = attach_gist(base, gist_k=4, r=4)
-    kv = gist_kv(pm, gist, [1, 2, 3])
+    kv, cont_start, first_logits = gist_kv(pm, gist, [1, 2, 3])
+    assert cont_start == 3 + 4  # continuation resumes at span_len + k (training layout)
+    assert first_logits.shape == (base.config.vocab_size,)
     assert kv.n_layers == base.config.num_hidden_layers
     for kmat, vmat in zip(kv.keys, kv.values, strict=True):
         # [B=1, n_kv_heads, k=4 gist positions, head_dim]
@@ -229,7 +231,7 @@ def test_gist_kv_extracts_per_layer_kv_at_gist_positions():
     # (constant) gist embeddings — span-independent — and only becomes
     # span-specific at deeper layers once the gist positions have attended to
     # the span. So the last layer must differ across spans; layer 0 must not.
-    kv2 = gist_kv(pm, gist, [9, 8, 7])
+    kv2, _, _ = gist_kv(pm, gist, [9, 8, 7])
     assert torch.allclose(kv.keys[0], kv2.keys[0], atol=1e-4)  # layer 0: span-independent
     assert not torch.allclose(kv.keys[-1], kv2.keys[-1], atol=1e-4)  # last layer: span-specific
     # injectable through the existing runtime (builds a DynamicCache, no raise)
@@ -238,23 +240,99 @@ def test_gist_kv_extracts_per_layer_kv_at_gist_positions():
 
 
 @pytest.mark.slow
-def test_decode_from_gist_kv_runs_from_injected_thought_only():
-    # Stage-3 ceiling mechanics: decode from ONLY the injected per-layer gist
-    # KV (no span tokens visible) + a minimal prime. Asserts it runs and
-    # respects max_new; reconstruction quality is the GPU eval, not this test.
+def test_cache_decode_is_logit_parity_with_training_forward():
+    # THE Stage-3 injection gold test (Fable review): decoding from the
+    # injected gist KV must reproduce — to float tolerance — the logits of a
+    # full training-style [span|gist|cont] forward with the training mask
+    # (cont_sees={'gist'}). Parity proves the cache path is faithful to
+    # training; it catches positional-geometry bugs (gist keys are RoPE'd at
+    # [span_len, span_len+k), so continuation MUST decode from span_len+k,
+    # not from the cache length) that a run-and-no-crash test cannot.
+    from marker.gist import build_batch_mask
+    from marker.gist_model import gist_kv
+    from marker.run_axiom_mlp_demo import _build_dynamic_cache
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    span, cont = [1, 2, 3], [5, 6, 7]
+    k, max_s, max_c = 4, len(span), len(cont)
+
+    # full training-style forward: [span | gist | cont], cont sees gist only
+    embed = pm.get_input_embeddings()
+    span_e = embed(torch.tensor([span]))
+    cont_e = embed(torch.tensor([cont]))
+    gist_e = gist.to(span_e.dtype).unsqueeze(0)
+    inp = torch.cat([span_e, gist_e, cont_e], dim=1)
+    mask = build_batch_mask(
+        [max_s], [max_c], k, max_s, max_c, cont_sees=frozenset({"gist"}), dtype=inp.dtype
+    )
+    pos = torch.arange(inp.shape[1]).unsqueeze(0)
+    with torch.no_grad():
+        full = pm(inputs_embeds=inp, attention_mask=mask, position_ids=pos).logits[0]
+
+    # cache path: inject gist KV, decode cont with explicit training positions
+    kv, cont_start, first_logits = gist_kv(pm, gist, span)
+    assert torch.allclose(first_logits, full[max_s + k - 1], atol=1e-4), (
+        "first-token logits (last gist position) diverge from the training forward"
+    )
+    cache = _build_dynamic_cache(kv, torch.device("cpu"))
+    with torch.no_grad():
+        out = pm(
+            torch.tensor([cont]),
+            past_key_values=cache,
+            position_ids=torch.arange(cont_start, cont_start + max_c).unsqueeze(0),
+            use_cache=True,
+        )
+    # cache logits at cont position j must match the full forward at [max_s+k+j]
+    assert torch.allclose(out.logits[0], full[max_s + k :], atol=1e-4), (
+        f"cache-decode diverges from training forward: "
+        f"max|Δ|={float((out.logits[0] - full[max_s + k :]).abs().max()):.5f}"
+    )
+
+
+@pytest.mark.slow
+def test_decode_from_gist_kv_greedy_matches_manual_rollout():
+    # decode_from_gist_kv's greedy loop must equal a manual training-geometry
+    # rollout: first token = argmax(first_logits), then feed each token at
+    # explicit positions cont_start, cont_start+1, ... over the injected cache.
+    from marker.gist_model import decode_from_gist_kv, gist_kv
+    from marker.run_axiom_mlp_demo import _build_dynamic_cache
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    kv, cont_start, first_logits = gist_kv(pm, gist, [1, 2, 3])
+    gen = decode_from_gist_kv(pm, kv, cont_start, first_logits, max_new=4)
+    assert 1 <= len(gen) <= 4 and all(isinstance(t, int) for t in gen)
+
+    # manual rollout
+    want = [int(first_logits.argmax())]
+    cache = _build_dynamic_cache(kv, torch.device("cpu"))
+    past = cache
+    with torch.no_grad():
+        for j in range(3):
+            out = pm(
+                torch.tensor([[want[-1]]]),
+                past_key_values=past,
+                position_ids=torch.tensor([[cont_start + j]]),
+                use_cache=True,
+            )
+            past = out.past_key_values
+            want.append(int(out.logits[0, -1].argmax()))
+    assert gen == want[: len(gen)]
+
+
+@pytest.mark.slow
+def test_decode_from_gist_kv_respects_stop_ids():
     from marker.gist_model import decode_from_gist_kv, gist_kv
 
     base = _tiny_base()
     pm, gist = attach_gist(base, gist_k=4, r=4)
-    kv = gist_kv(pm, gist, [1, 2, 3])
-    gen = decode_from_gist_kv(pm, kv, prime=[5], max_new=6)
-    assert 1 <= len(gen) <= 6
-    assert all(isinstance(t, int) for t in gen)
-    # the injected thought steers the decode: two different thoughts (from
-    # different spans) can produce different continuations from the same prime
-    kv2 = gist_kv(pm, gist, [9, 8, 7])
-    g2 = decode_from_gist_kv(pm, kv2, prime=[5], max_new=6)
-    assert isinstance(g2, list)  # both decode without raising (steer may or may not differ on a tiny random model)
+    kv, cont_start, first_logits = gist_kv(pm, gist, [1, 2, 3])
+    full = decode_from_gist_kv(pm, kv, cont_start, first_logits, max_new=6)
+    stopped = decode_from_gist_kv(
+        pm, kv, cont_start, first_logits, max_new=6, stop_ids={full[0]}
+    )
+    assert stopped == [full[0]]  # halts on the stop token (inclusive)
 
 
 @pytest.mark.slow
