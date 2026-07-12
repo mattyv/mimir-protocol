@@ -207,6 +207,37 @@ def test_encode_gist_shape_and_span_dependence():
 
 
 @pytest.mark.slow
+def test_gist_kv_extracts_per_layer_kv_at_gist_positions():
+    # Stage-3 decode path: the continuation attends to the gist positions'
+    # per-layer K/V (encode_gist returns only the top-layer readout). gist_kv
+    # slices the k gist positions from every layer's cache -> an injectable
+    # AxiomKV. Mechanical invariants only (shapes/positions/injectability),
+    # not reconstruction quality (that needs the real 7B on a GPU node).
+    from marker.gist_model import gist_kv
+    from marker.run_axiom_mlp_demo import _build_dynamic_cache
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    kv = gist_kv(pm, gist, [1, 2, 3])
+    assert kv.n_layers == base.config.num_hidden_layers
+    for kmat, vmat in zip(kv.keys, kv.values, strict=True):
+        # [B=1, n_kv_heads, k=4 gist positions, head_dim]
+        assert kmat.shape[0] == 1 and kmat.shape[2] == 4
+        assert vmat.shape[2] == 4
+        assert kmat.shape[1] == base.config.num_key_value_heads
+    # span-specificity enters at DEPTH: layer-0 gist K/V is just the projected
+    # (constant) gist embeddings — span-independent — and only becomes
+    # span-specific at deeper layers once the gist positions have attended to
+    # the span. So the last layer must differ across spans; layer 0 must not.
+    kv2 = gist_kv(pm, gist, [9, 8, 7])
+    assert torch.allclose(kv.keys[0], kv2.keys[0], atol=1e-4)  # layer 0: span-independent
+    assert not torch.allclose(kv.keys[-1], kv2.keys[-1], atol=1e-4)  # last layer: span-specific
+    # injectable through the existing runtime (builds a DynamicCache, no raise)
+    cache = _build_dynamic_cache(kv, torch.device("cpu"))
+    assert cache is not None
+
+
+@pytest.mark.slow
 def test_generate_from_gist_runs_and_respects_max_new():
     base = _tiny_base()
     pm, gist = attach_gist(base, gist_k=4, r=4)

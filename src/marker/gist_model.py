@@ -211,6 +211,46 @@ def encode_gist(
 
 
 @torch.no_grad()
+def gist_kv(
+    peft_model,  # noqa: ANN001
+    gist_param: torch.nn.Parameter,
+    span: list[int],
+    pad_id: int = 0,
+):
+    """The Stage-3 decode substrate: the FULL per-layer K/V at the k gist
+    positions — what the continuation actually attends to during training.
+
+    encode_gist() returns only the final-layer readout (one vector per slot);
+    that is what the Stage-2 predictor is trained on, but it is NOT enough to
+    decode from — the continuation reads the gist at EVERY layer's K/V. This
+    runs [span | gist] with use_cache and slices the k gist positions out of
+    each layer's cache, returning an AxiomKV injectable via
+    instruct.decode_with_kv. (So predicting a decodable thought means either a
+    final-layer -> per-layer-KV bridge, or re-targeting the predictor onto this
+    object — the open Stage-3 fork.)"""
+    from marker.run_axiom_mlp_demo import AxiomKV  # noqa: PLC0415
+
+    device = next(peft_model.parameters()).device
+    k = gist_param.shape[0]
+    max_s = len(span)
+    embed = peft_model.get_input_embeddings()
+    span_e = embed(torch.tensor([span], device=device))
+    gist_e = gist_param.to(span_e.dtype).unsqueeze(0)
+    inputs_embeds = torch.cat([span_e, gist_e], dim=1)  # [1, max_s+k, hidden]
+    mask = build_batch_mask([max_s], [0], k, max_s, 0, dtype=inputs_embeds.dtype).to(device)
+    pos = torch.arange(inputs_embeds.shape[1], device=device).unsqueeze(0)
+    out = peft_model(
+        inputs_embeds=inputs_embeds, attention_mask=mask, position_ids=pos, use_cache=True
+    )
+    cache = out.past_key_values
+    legacy = cache.to_legacy_cache() if hasattr(cache, "to_legacy_cache") else cache
+    # slice the k gist positions [max_s : max_s+k] along the sequence dim (2)
+    keys = [layer_kv[0][:, :, max_s : max_s + k, :].detach() for layer_kv in legacy]
+    values = [layer_kv[1][:, :, max_s : max_s + k, :].detach() for layer_kv in legacy]
+    return AxiomKV(n_layers=len(keys), keys=keys, values=values)
+
+
+@torch.no_grad()
 def generate_from_gist(
     peft_model,  # noqa: ANN001
     gist_param: torch.nn.Parameter,
