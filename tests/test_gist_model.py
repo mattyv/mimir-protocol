@@ -322,6 +322,46 @@ def test_decode_from_gist_kv_greedy_matches_manual_rollout():
 
 
 @pytest.mark.slow
+def test_nll_under_gist_kv_matches_training_forward():
+    # the PPL-based ceiling metric: teacher-forced NLL of the continuation
+    # under the injected gist KV must equal the gist-only NLL from a full
+    # [span|gist|cont] training forward (same parity guarantee as the logit
+    # test, now on the loss the gist was trained with).
+    import torch.nn.functional as F  # noqa: N812
+
+    from marker.gist import build_batch_mask
+    from marker.gist_model import gist_kv, nll_under_gist_kv
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    span, cont = [1, 2, 3], [5, 6, 7]
+    k, max_s, max_c = 4, len(span), len(cont)
+
+    embed = pm.get_input_embeddings()
+    inp = torch.cat(
+        [
+            embed(torch.tensor([span])),
+            gist.to(embed.weight.dtype).unsqueeze(0),
+            embed(torch.tensor([cont])),
+        ],
+        dim=1,
+    )
+    mask = build_batch_mask(
+        [max_s], [max_c], k, max_s, max_c, cont_sees=frozenset({"gist"}), dtype=inp.dtype
+    )
+    pos = torch.arange(inp.shape[1]).unsqueeze(0)
+    with torch.no_grad():
+        logits = pm(inputs_embeds=inp, attention_mask=mask, position_ids=pos).logits[0]
+    # positions predicting cont: last gist position + each cont position but last
+    pred = logits[max_s + k - 1 : max_s + k - 1 + max_c]
+    want = F.cross_entropy(pred, torch.tensor(cont)).item()
+
+    kv, cont_start, first_logits = gist_kv(pm, gist, span)
+    got = nll_under_gist_kv(pm, kv, cont_start, first_logits, cont)
+    assert abs(got - want) < 1e-4, f"NLL parity broken: {got} vs {want}"
+
+
+@pytest.mark.slow
 def test_decode_from_gist_kv_respects_stop_ids():
     from marker.gist_model import decode_from_gist_kv, gist_kv
 

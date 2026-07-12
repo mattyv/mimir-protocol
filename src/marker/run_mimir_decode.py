@@ -101,9 +101,16 @@ def main() -> None:
     none = _decode_no_kv(pm, prime, args.max_new, tok.eos_token_id)
 
     f_next, f_span, f_rand, f_none = [], [], [], []
+    nll_gist, nll_none = [], []  # teacher-forced NLL of the true next step
     shown = 0
     for i, (span_a, cont_b) in enumerate(pairs):
         kv, cont_start, first_logits = gist_kv(pm, gist, span_a)
+        # SOFT ceiling: teacher-forced NLL of the true next step, injected gist
+        # vs no-injection, SAME tokens at SAME positions (scores cont_b[1:] so
+        # both conditions are apples-to-apples with no first-token asymmetry).
+        nll_gist.append(_tail_nll(pm, cont_b, cont_start, kv))
+        nll_none.append(_tail_nll(pm, cont_b, cont_start, None))
+        # HARD test: greedily generate from the thought alone.
         dec = decode_from_gist_kv(
             pm,
             kv,
@@ -128,16 +135,52 @@ def main() -> None:
         if (i + 1) % 50 == 0:
             print(f"  ...{i + 1}/{len(pairs)}", flush=True)
 
+    import math  # noqa: PLC0415
+
     m = lambda xs: round(sum(xs) / max(1, len(xs)), 3)  # noqa: E731
+    ppl_gist, ppl_none = math.exp(m(nll_gist)), math.exp(m(nll_none))
     print(
-        f"\n[MIMIR DECODE] F1(decoded, next)={m(f_next)}  "
+        f"\n[SOFT ceiling] PPL(next | injected thought)={ppl_gist:.2f}  "
+        f"vs PPL(next | no-injection)={ppl_none:.2f}  "
+        f"(drop {100 * (1 - ppl_gist / ppl_none):.0f}% => the thought carries the next step)",
+        flush=True,
+    )
+    print(
+        f"[HARD test] greedy F1(decoded, next)={m(f_next)}  "
         f"vs no-inject={m(f_none)}  vs random-step={m(f_rand)}  vs own-span={m(f_span)}",
         flush=True,
     )
     print(
-        "GATE: F1(decoded,next) > F1(no-inject,next) [thought carries content] "
-        "AND > F1(decoded,random) [it's the RIGHT content]. Else decode path is the bottleneck."
+        "READ: big PPL drop + weak greedy-F1 => the thought is RICH but greedy "
+        "can't extract it => draft-and-verify (Stage 3b). Big PPL drop + strong "
+        "F1 => direct decode works. No PPL drop => decode path is the bottleneck."
     )
+
+
+@torch.no_grad()
+def _tail_nll(peft_model, cont_ids, cont_start, kv):  # noqa: ANN001
+    """Teacher-forced mean NLL of cont_ids[1:] predicted from cont_ids[:-1] at
+    positions cont_start.., over an injected gist cache (kv) or an empty one
+    (kv=None). Scoring the tail (not the first token) keeps injected-vs-none
+    apples-to-apples: identical tokens, identical positions, the ONLY
+    difference is the injected thought."""
+    import torch.nn.functional as F  # noqa: N812, PLC0415
+
+    from marker.run_axiom_mlp_demo import _build_dynamic_cache  # noqa: PLC0415
+
+    if len(cont_ids) < 2:
+        return 0.0
+    device = next(peft_model.parameters()).device
+    cache = _build_dynamic_cache(kv, device) if kv is not None else None
+    m = len(cont_ids) - 1
+    pos = torch.arange(cont_start, cont_start + m, device=device).unsqueeze(0)
+    out = peft_model(
+        torch.tensor([cont_ids[:-1]], device=device),
+        past_key_values=cache,
+        position_ids=pos,
+        use_cache=True,
+    )
+    return float(F.cross_entropy(out.logits[0], torch.tensor(cont_ids[1:], device=device)))
 
 
 @torch.no_grad()

@@ -304,6 +304,46 @@ def decode_from_gist_kv(
 
 
 @torch.no_grad()
+def nll_under_gist_kv(
+    peft_model,  # noqa: ANN001
+    gist_kv_obj,  # noqa: ANN001
+    cont_start: int,
+    first_logits: torch.Tensor,
+    cont_ids: list[int],
+):
+    """Teacher-forced mean NLL of cont_ids under the injected gist KV — the
+    PPL-based decode ceiling. Far more sensitive than greedy-generate F1: it
+    separates 'the thought is empty' (NLL ~= no-injection) from 'the thought is
+    rich but greedy decoding can't extract it' (NLL drops sharply yet greedy
+    wanders) — the latter points at draft-and-verify, not a dead path. This is
+    the loss the gist was trained on, via the actual injection path.
+
+    cont_ids[0] is scored by first_logits (the last gist position's prediction);
+    cont_ids[1:] by feeding cont_ids[:-1] at explicit positions cont_start..
+    over the injected cache. Returns mean NLL (natural log)."""
+    import torch.nn.functional as F  # noqa: N812, PLC0415
+
+    from marker.run_axiom_mlp_demo import _build_dynamic_cache  # noqa: PLC0415
+
+    device = next(peft_model.parameters()).device
+    tgt = torch.tensor(cont_ids, device=device)
+    logits = [first_logits.to(device)]
+    if len(cont_ids) > 1:
+        cache = _build_dynamic_cache(gist_kv_obj, device)
+        m = len(cont_ids) - 1
+        pos = torch.arange(cont_start, cont_start + m, device=device).unsqueeze(0)
+        out = peft_model(
+            torch.tensor([cont_ids[:-1]], device=device),
+            past_key_values=cache,
+            position_ids=pos,
+            use_cache=True,
+        )
+        logits.append(out.logits[0])
+    stacked = torch.cat([x.unsqueeze(0) if x.dim() == 1 else x for x in logits], dim=0)
+    return float(F.cross_entropy(stacked, tgt))
+
+
+@torch.no_grad()
 def generate_from_gist(
     peft_model,  # noqa: ANN001
     gist_param: torch.nn.Parameter,
