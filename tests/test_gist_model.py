@@ -322,6 +322,29 @@ def test_decode_from_gist_kv_greedy_matches_manual_rollout():
 
 
 @pytest.mark.slow
+def test_decode_temperature_samples_distinct_drafts():
+    # draft step of draft-and-verify: temperature>0 with different generator
+    # seeds yields distinct candidates; temperature=0 stays greedy (matches the
+    # ceiling call).
+    from marker.gist_model import decode_from_gist_kv, gist_kv
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    kv, cont_start, first_logits = gist_kv(pm, gist, [1, 2, 3])
+    greedy = decode_from_gist_kv(pm, kv, cont_start, first_logits, max_new=8)
+    g1 = torch.Generator().manual_seed(1)
+    g2 = torch.Generator().manual_seed(2)
+    d1 = decode_from_gist_kv(
+        pm, kv, cont_start, first_logits, max_new=8, temperature=1.5, generator=g1
+    )
+    d2 = decode_from_gist_kv(
+        pm, kv, cont_start, first_logits, max_new=8, temperature=1.5, generator=g2
+    )
+    assert isinstance(greedy, list) and isinstance(d1, list)
+    assert d1 != d2, "different seeds should give different draft candidates"
+
+
+@pytest.mark.slow
 def test_nll_under_gist_kv_matches_training_forward():
     # the PPL-based ceiling metric: teacher-forced NLL of the continuation
     # under the injected gist KV must equal the gist-only NLL from a full

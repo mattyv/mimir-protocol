@@ -269,24 +269,37 @@ def decode_from_gist_kv(
     max_new: int = 32,
     eos_id: int | None = None,
     stop_ids: set[int] | None = None,
+    temperature: float = 0.0,
+    generator: torch.Generator | None = None,
 ):
-    """Stage-3 ceiling: greedily decode from ONLY an injected per-layer gist KV
-    — the span is gone; the thought alone must carry what-comes-next.
+    """Decode from ONLY an injected per-layer gist KV — the span is gone; the
+    thought alone must carry what-comes-next.
 
     Faithful to training geometry (logit-parity tested): the gist keys are
     RoPE'd at [span_len, span_len+k), so generated tokens take EXPLICIT
     positions cont_start, cont_start+1, ... (never cache-length inference),
-    and the first token comes from argmax(first_logits) — the last gist
-    position's prediction, exactly as in training. stop_ids (e.g. newline for
-    step-per-line corpora) halt generation inclusively."""
+    and the first token comes from first_logits — the last gist position's
+    prediction, exactly as in training. stop_ids (e.g. newline for
+    step-per-line corpora) halt generation inclusively.
+
+    temperature=0 (default) is greedy (the 3a-i ceiling). temperature>0 samples
+    (with `generator` for reproducible, distinct draft candidates) — the DRAFT
+    step of draft-and-verify."""
     from marker.run_axiom_mlp_demo import _build_dynamic_cache  # noqa: PLC0415
 
     device = next(peft_model.parameters()).device
     halt = set(stop_ids or ())
     if eos_id is not None:
         halt.add(eos_id)
+
+    def _pick(logits: torch.Tensor) -> int:
+        if temperature <= 0:
+            return int(logits.argmax().item())
+        probs = torch.softmax(logits / temperature, dim=-1)
+        return int(torch.multinomial(probs, 1, generator=generator).item())
+
     past = _build_dynamic_cache(gist_kv_obj, device)
-    nxt = int(first_logits.argmax().item())
+    nxt = _pick(first_logits.to(device))
     gen = [nxt]
     for j in range(max_new - 1):
         if nxt in halt:
@@ -298,7 +311,7 @@ def decode_from_gist_kv(
             use_cache=True,
         )
         past = out.past_key_values
-        nxt = int(out.logits[0, -1].argmax().item())
+        nxt = _pick(out.logits[0, -1])
         gen.append(nxt)
     return gen
 
