@@ -401,3 +401,22 @@ Node 44588589 (run_mimir_decode, GSM8K, step-16000 k=8 adapter). Predictions:
   decode from the accumulated thought-memory. Matches the runtime vision
   (thought memory accumulates) and gives drafts the forward momentum a single
   thought lacks. Secondary lever if needed: an anti-restate term in verify.
+
+## Fable second-pass on 3b-i (2026-07-12) — corrections to my own diagnosis
+
+1. FAILURE NOT LOCALIZED: no ORACLE logged (best-of-K by F1-vs-true). Without
+   it, "drafts are directionless" vs "verify can't select" are indistinguishable.
+   The chain-conditioned run MUST save all drafts and log oracle F1 alongside
+   picked/greedy. Oracle >> greedy => verify is the bottleneck; oracle ~= greedy
+   => draft distribution is. Pre-registered read BEFORE that run.
+2. ADVANCE METRIC UNCALIBRATED: correct math steps inherently reuse the current
+   step's numbers, so the 0.5 bar was arbitrary. Calibrate in-run: report
+   advance_rate of the TRUE next steps (ceiling) and of the PREVIOUS step
+   (known-restate floor); judge picks against that bracket.
+3. VERIFY CONTEXT MUST INCLUDE THE QUESTION (gsm8k 'question' field) — judging
+   steps without the problem statement handicaps likelihood-verify; any real
+   runtime has the question.
+4. PRE-REGISTERED BRANCH: if after chain-conditioning + question-context the
+   verify still can't track the oracle, likelihood-verify is DEAD as the
+   runtime guardrail; next candidate is lookahead-consistency verify (does the
+   draft make the FOLLOWING step more predictable) — measurable offline.
