@@ -85,6 +85,16 @@ def main() -> None:
 
     pm, gist, tok = _load_stage1(args.model_name, args.repo, device, device == "cuda")
     stop_ids = {t for t in (tok("\n", add_special_tokens=False).input_ids or []) if t}
+
+    # GPU pre-flight (GRAD_OK/eval-smoke philosophy): exercise the FULL draft
+    # path on-device — sample with a generator + verify — before the run, so
+    # device bugs (a CPU generator vs GPU probs crashed the first attempt) fail
+    # in seconds, not after setup+encode.
+    _kv, _cs, _fl = gist_kv(pm, gist, tok("preflight check", add_special_tokens=False).input_ids)
+    _g = torch.Generator(device="cpu").manual_seed(0)
+    _d = decode_from_gist_kv(pm, _kv, _cs, _fl, max_new=4, temperature=0.9, generator=_g)
+    _verify_nll(pm, tok("a b c", add_special_tokens=False).input_ids, _d)
+    print("PREFLIGHT_OK (sample + verify on device)", flush=True)
     docs = (
         _smoke_cot_texts(args.n_docs)
         if args.smoke

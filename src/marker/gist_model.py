@@ -300,7 +300,12 @@ def decode_from_gist_kv(
             return int(logits.argmax().item())
         vals, idx = logits.topk(min(top_k, logits.shape[-1]))
         probs = torch.softmax(vals / temperature, dim=-1)
-        return int(idx[torch.multinomial(probs, 1, generator=generator)].item())
+        # sample on the GENERATOR's device — a torch.Generator is device-bound
+        # and multinomial requires probs on the same device (GPU-only crash a
+        # CPU test can't catch). A CPU generator is reproducible across devices.
+        gdev = generator.device if generator is not None else probs.device
+        sel = torch.multinomial(probs.to(gdev), 1, generator=generator)
+        return int(idx[sel.to(idx.device)].item())
 
     past = _build_dynamic_cache(gist_kv_obj, device)
     nxt = _pick(first_logits.to(device))
