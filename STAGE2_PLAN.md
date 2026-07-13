@@ -515,3 +515,23 @@ Results (manifest on HF render_adapter/manifest.json):
 - RENDER LANE: validated. Next = ledger A/B (core built: extract_ledger +
   ledger_render_nll) — train render WITH the visible number ledger, target
   number-recall -> ~1.0 vs the 0.689/0.881 baseline.
+
+## Ledger A/B RESULT (2026-07-13, node 44669377): ledger closes the number gap — RENDER LANE COMPLETE
+
+| metric | no-ledger | +ledger |
+|---|---|---|
+| gsm8k number-recall | 0.689 | **0.963** |
+| gsm8k F1 (mean) | 0.872 | 0.922 |
+| fresh number-recall | 0.881 | **1.000** |
+| fresh F1 (mean / p50) | 0.932 / 1.0 | **0.988 / 1.0** |
+
+- The ledger closes the exact-number gap almost entirely (gsm8k 69%->96%,
+  fresh 88%->100%) AND lifts overall F1 (right numbers help surrounding tokens).
+  fresh mean F1 0.988 = near-perfect reconstruction. Adapter at
+  mattyvee/mimir-artifacts/render_adapter_ledger (manifest alongside).
+- gsm8k 0.963 not 1.0: a few real-step numbers escape the digit regex (word-
+  numbers "two", odd formats) — extraction coverage, not a decoder failure.
+- VERDICT: RENDER LANE COMPLETE. Thought -> faithful text with exact literals:
+  meaning from the thought, digits from the ledger, as designed. On-demand
+  "show me this thought" is a solved, validated capability.
+- NEXT: fast lane (FASTLANE_PLAN.md) — confidence-calibration probe first.
