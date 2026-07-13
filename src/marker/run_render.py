@@ -194,29 +194,43 @@ def main() -> None:
         f1s.sort()
         q = lambda p: round(f1s[min(len(f1s) - 1, int(p * len(f1s)))], 3) if f1s else 0.0  # noqa: E731
         mean = lambda xs: round(sum(xs) / max(1, len(xs)), 3)  # noqa: E731
-        print(
-            f"\n[RENDER {label}] eval={len(f1s)} (doc-disjoint; PRIMED with true first token)  "
-            f"reconstruct F1: mean={mean(f1s)} p10={q(0.1)} p50={q(0.5)} p90={q(0.9)}\n"
-            f"  number-recall (steps with numbers, n={len(numrec)}): mean={mean(numrec)}",
-            flush=True,
-        )
+        res = {
+            "eval_n": len(f1s),
+            "f1_mean": mean(f1s),
+            "f1_p10": q(0.1),
+            "f1_p50": q(0.5),
+            "f1_p90": q(0.9),
+            "num_recall": mean(numrec),
+            "num_recall_n": len(numrec),
+        }
+        print(f"\n[RENDER {label}] (doc-disjoint; PRIMED with true first token) {res}", flush=True)
+        return res
 
-    _eval_set(eval_pairs, "gsm8k")
+    manifest = {"gsm8k": _eval_set(eval_pairs, "gsm8k")}
     if fresh_pairs:
-        _eval_set(fresh_pairs, "FRESH-synth")
+        manifest["fresh_synth"] = _eval_set(fresh_pairs, "FRESH-synth")
     print(
         "READ: gsm8k numbers may be flattered by pretraining memorization; "
         "FRESH-synth (our templates, unmemorizable) is the honest fidelity. "
         "number-recall < 1 quantifies exactly what the literals ledger must fix."
     )
 
+    # persist results to a manifest — a flaky node's stderr spam once buried the
+    # eval output past the log tail, and the node was gone before it was read.
+    import json  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    d = Path("/tmp/render_out")  # noqa: S108
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"[RENDER MANIFEST] {json.dumps(manifest)}", flush=True)  # single-line, survives tail
+
     if args.out_repo:
         from huggingface_hub import upload_folder  # noqa: PLC0415
 
-        d = "/tmp/render_out"  # noqa: S108
-        pm.save_pretrained(d, selected_adapters=["render"])
-        upload_folder(repo_id=args.out_repo, folder_path=d, path_in_repo="render_adapter")
-        print(f"pushed render adapter to {args.out_repo}/render_adapter", flush=True)
+        pm.save_pretrained(str(d), selected_adapters=["render"])
+        upload_folder(repo_id=args.out_repo, folder_path=str(d), path_in_repo="render_adapter")
+        print(f"pushed render adapter + manifest to {args.out_repo}/render_adapter", flush=True)
 
 
 if __name__ == "__main__":
