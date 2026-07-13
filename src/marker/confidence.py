@@ -102,7 +102,54 @@ def dropout_agreement(samples: torch.Tensor) -> torch.Tensor:
     return off
 
 
+# ── injection-relevant (absolute) correctness ────────────────────────────────
+
+
+@torch.no_grad()
+def slot_cosine(pred_slots: torch.Tensor, tgt_slots: torch.Tensor) -> torch.Tensor:
+    """Per-example mean cosine between predicted and true thought SLOTS
+    [N, k, d] -> [N]. within_doc_correct is a RELATIVE-rank label (beat the
+    same-doc siblings); this is the ABSOLUTE label the bridge actually cares
+    about — how close the injected vector is to the true next thought. A
+    prediction can be within-doc top-1 yet have mediocre absolute cosine, so
+    'correct' here does not by itself certify 'safe to inject' (Fable review)."""
+    return F.cosine_similarity(pred_slots, tgt_slots, dim=-1).mean(dim=-1)
+
+
 # ── separation metrics ───────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def precision_at_coverage(confidence: torch.Tensor, correct: torch.Tensor, coverage: float) -> dict:
+    """The DEPLOYABLE readout (Fable review): if we accept only the top
+    `coverage` fraction by confidence — the steps we'd actually skip — what
+    fraction are correct? Returns {coverage, acc, n, base, lift}. base = overall
+    correct-rate; lift = acc - base (how much the gate buys over accepting
+    blindly). AUC>0.5 with base 0.30 can still mean a useless gate; this is the
+    number that says whether a high-confidence bin is reliably right."""
+    correct = correct.to(torch.double)
+    n = len(confidence)
+    k = max(1, int(round(coverage * n)))
+    top = confidence.argsort(descending=True)[:k]
+    acc = float(correct[top].mean())
+    base = float(correct.mean())
+    return {
+        "coverage": coverage,
+        "acc": round(acc, 3),
+        "n": int(k),
+        "base": round(base, 3),
+        "lift": round(acc - base, 3),
+    }
+
+
+@torch.no_grad()
+def coverage_curve(
+    confidence: torch.Tensor, correct: torch.Tensor, fractions=(0.1, 0.2, 0.3, 0.5)
+) -> list[dict]:
+    """precision_at_coverage across several coverage fractions — the accuracy
+    vs skip-rate trade curve. Speed win scales with coverage, safety with
+    accuracy; the curve is where you read the operating point."""
+    return [precision_at_coverage(confidence, correct, f) for f in fractions]
 
 
 @torch.no_grad()

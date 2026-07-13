@@ -12,11 +12,14 @@ from __future__ import annotations
 import torch
 
 from marker.confidence import (
+    coverage_curve,
     dropout_agreement,
     mc_dropout_pool,
+    precision_at_coverage,
     prediction_norm,
     rank_auc,
     retrieval_margin,
+    slot_cosine,
     tercile_report,
     within_doc_correct,
 )
@@ -145,3 +148,50 @@ def test_tercile_report_flat_when_confidence_useless():
     correct = (torch.rand(300) > 0.5).to(torch.bool)
     rep = tercile_report(conf, correct)
     assert abs(rep["auc"] - 0.5) < 0.15
+
+
+# ── precision @ coverage (the deployable gate) ───────────────────────────────
+
+
+def test_precision_at_coverage_picks_the_confident_slice():
+    # confidence == correctness rank: the top-20% are all correct, base is 0.5
+    conf = torch.linspace(0, 1, 100)
+    correct = (conf >= 0.5).to(torch.bool)
+    r = precision_at_coverage(conf, correct, coverage=0.2)
+    assert r["acc"] == 1.0  # top-20% confident are all right
+    assert r["n"] == 20
+    assert r["base"] == 0.5
+    assert r["lift"] == 0.5  # 1.0 - 0.5
+
+
+def test_precision_at_coverage_useless_signal_no_lift():
+    # confidence unrelated to correctness -> top slice ~ base, lift ~ 0
+    torch.manual_seed(0)
+    conf = torch.rand(400)
+    correct = (torch.rand(400) > 0.6).to(torch.bool)
+    r = precision_at_coverage(conf, correct, coverage=0.2)
+    assert abs(r["lift"]) < 0.15
+
+
+def test_coverage_curve_spans_fractions():
+    conf = torch.linspace(0, 1, 50)
+    correct = (conf >= 0.5).to(torch.bool)
+    curve = coverage_curve(conf, correct, fractions=(0.1, 0.5))
+    assert [p["coverage"] for p in curve] == [0.1, 0.5]
+    # tighter coverage is purer here (all top-10% correct; top-50% is the boundary)
+    assert curve[0]["acc"] >= curve[1]["acc"]
+
+
+# ── absolute slot cosine (injection-relevant label) ──────────────────────────
+
+
+def test_slot_cosine_identical_is_one():
+    x = torch.randn(4, 8, 16)
+    c = slot_cosine(x, x.clone())
+    assert c.shape == (4,)
+    assert torch.allclose(c, torch.ones(4), atol=1e-5)
+
+
+def test_slot_cosine_opposite_is_negative_one():
+    x = torch.randn(3, 8, 16)
+    assert torch.allclose(slot_cosine(x, -x), -torch.ones(3), atol=1e-5)
