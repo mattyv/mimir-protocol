@@ -99,6 +99,38 @@ for a skip decision that has no reliable signal to stand on. The render lane
 swing at reviving thought-*prediction* is a diffusion/sampling head that attacks
 regression-to-the-mean directly (below) — a bigger build, not a gate.
 
+## REVERSAL (2026-07-13, bridge ladder): predicted thoughts ARE usable injected
+
+The confidence GATE stayed dead, but the "dig" (user call: don't stop at the
+gate verdict) built the bridge anyway to ask the never-asked question: what does
+a predicted thought DO when injected? Four runs (dtype crash -> undertrained ->
+unstable optimizer -> overfit/hash-table probe) converged on a working recipe —
+2000 docs, jittered training inputs (noise 0.5, anti-hashing/denoising),
+val-gated checkpoint, width 512 — and the ladder came back (334 eval docs,
+held-out, doc-disjoint):
+
+| rung | eval gap_closed | read |
+|---|---|---|
+| gist_true | 0.804 | encoder ceiling (harness sanity — matches 0.88-era) |
+| **bridge_true** | **0.817** | conversion is LOSSLESS — the k=8 final-layer summary IS a faithful handle; bridge(summary) even edges out raw gist KV (denoising training) |
+| **bridge_pred** | **0.619** | a PREDICTED thought — no text ever existed — closes 62% of the gap when injected |
+| shuffled | 0.284 | generic-math-context floor; ALSO net-positive through this bridge |
+| none | 0.0 | |
+
+Three upgrades to the world-model:
+1. The final-layer summary is NOT lossy (kills the run-3 fear for good).
+2. Predicted thoughts carry real step-specific signal end-to-end:
+   0.62 sits far above the 0.28 generic-context floor.
+3. The noise-trained bridge SOFTENED the misleading-injection constraint: even a
+   wrong (cross-doc) thought is now net-positive (+0.28), where raw xdoc
+   injection used to be worse-than-nothing. Denoising made injection robust —
+   which weakens the case that skipping NEEDS a confidence gate at all.
+
+Open next: (a) latent chain rollout — predict->bridge->inject->predict again,
+measure drift over multiple latent steps (the real fast-lane test, now with a
+substrate that works); (b) render a predicted thought to text and READ it;
+(c) end-to-end task accuracy with always-inject (no gate).
+
 ## Non-goals / open
 
 Diffusion thought-sampler (only if regression head plateaus — it has: top-1 0.30
