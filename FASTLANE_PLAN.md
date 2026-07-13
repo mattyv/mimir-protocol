@@ -67,7 +67,40 @@ any bridge/rollout spend.
    repeat; render to text at the end. Measure skip-rate + final-answer
    accuracy vs the true chain, and wall-clock vs plain generation.
 
+## RESULT (2026-07-13): probe FAILED — confidence does not track correctness
+
+Ran the cheap-first probe on the trained `stage2_cot_openr1` predictor, held-out
+OpenR1 chains (skip first 2000 docs = its train+eval range), window=4, ~$0.30.
+Teacher-forced block: 2004 (thought→next-thought) pairs, base within-doc top-1
+= 0.275. Pre-registered gate (top-20% skip-bin accuracy ≥ 0.60, lift ≥ 0.15 over
+base, on a by-document confirm split) — **FAIL on every signal:**
+
+| signal | AUC | top-10% acc (lift) | top-20% acc (lift) |
+|---|---|---|---|
+| prediction_norm | 0.558 | 0.44 (+0.165) | 0.357 (+0.082) |
+| dropout_agreement | 0.500 | 0.345 (+0.07) | 0.327 (+0.052) |
+| retrieval_margin (diag) | 0.516 | 0.37 (+0.095) | 0.299 (+0.024) |
+
+One-step-drift block agreed (all signals ~0.5 AUC; its base 0.56 is inflated by
+small within-doc pools, so it's only a sanity echo, not the number).
+
+Read: `prediction_norm` has a faint pulse — the most-confident 10% of
+predictions are right 44% vs 27.5% base — but that's nowhere near a usable gate
+(you'd still be wrong on 56% of the steps you skipped, and wrong thoughts
+actively mislead). `dropout_agreement`, the signal we'd have bet on, is dead flat
+at AUC 0.500 — the predictor's uncertainty is **not calibrated**. Absolute
+prediction quality is moderate (mean slot-cosine to truth 0.665), but the model
+cannot tell its good predictions from its bad ones.
+
+**Verdict per the gate: the fast lane (adaptive skipping for speed) is DEAD as
+designed.** Do NOT build the bridge or the gated rollout — they were scaffolding
+for a skip decision that has no reliable signal to stand on. The render lane
+(thought→faithful text, validated) remains the deliverable. The one unexplored
+swing at reviving thought-*prediction* is a diffusion/sampling head that attacks
+regression-to-the-mean directly (below) — a bigger build, not a gate.
+
 ## Non-goals / open
 
-Diffusion thought-sampler (only if regression head plateaus); 32B; the
-still-owed gate-3 Mimir confirmations (separate track).
+Diffusion thought-sampler (only if regression head plateaus — it has: top-1 0.30
++ flat confidence); 32B; the still-owed gate-3 Mimir confirmations (separate
+track).
