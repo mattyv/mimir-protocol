@@ -270,8 +270,10 @@ def _analyze(fin: dict, label: str) -> dict:
         a = rank_auc(fin["signals"][name][sel], correct[sel])
         if a is not None:
             sel_aucs[name] = a
-    if not sel_aucs or conf.sum() < GATE_MIN_BIN:
-        out["gate"] = {"verdict": "INSUFFICIENT", "reason": "too few confirm-split examples"}
+    if not sel_aucs or GATE_COVERAGE * int(conf.sum()) < GATE_MIN_BIN:
+        # the skip-bin is COVERAGE x the confirm half; guard on the bin size, not
+        # the half, else a small-but-real block mislabels FAIL (Fable re-review)
+        out["gate"] = {"verdict": "INSUFFICIENT", "reason": "confirm-split skip-bin < GATE_MIN_BIN"}
         return out
     best = max(sel_aucs, key=sel_aucs.get)
     pac = coverage_curve(fin["signals"][best][conf], correct[conf], fractions=(GATE_COVERAGE,))[0]
