@@ -253,10 +253,25 @@ def main() -> None:
     # brutally noisy — the first real run barely moved off its poisonous init in
     # 1500 single-example steps. Accumulate `accum` examples per optimizer step.
     opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=0.01)
+    # warmup -> cosine schedule + gradient clip: the previous run's loss was flat
+    # and BOUNCING from step 50 (lr 5e-4, no schedule) — an unstable optimization
+    # that confounds "target unreachable" with "optimized badly". Stabilize it so
+    # the plateau (if any) is real.
+    import copy  # noqa: PLC0415
+
+    warmup = max(1, args.steps // 20)
+
+    def _lr_at(s):  # noqa: ANN001
+        if s < warmup:
+            return s / warmup
+        prog = (s - warmup) / max(1, args.steps - warmup)
+        return 0.5 * (1 + math.cos(math.pi * prog))
+
     torch.manual_seed(0)
     train_items = [(di, n) for di, (ids, _) in enumerate(train_docs) for n in pred_pairs(len(ids))]
     print(f"{len(train_items)} (doc, step) training pairs, accum={args.accum}", flush=True)
     curve, run, step = [], [], 0
+    best_loss, best_state = float("inf"), None  # eval on the BEST checkpoint, not the last
     checked = False
     opt.zero_grad()
     while step < args.steps and train_items:
@@ -272,17 +287,27 @@ def main() -> None:
                 print("GRAD_OK (bridge gradients flowing)", flush=True)
                 checked = True
             if len(run) % args.accum == 0:
+                for g in opt.param_groups:
+                    g["lr"] = args.lr * _lr_at(step)
+                torch.nn.utils.clip_grad_norm_(bridge.parameters(), 1.0)
                 opt.step()
                 opt.zero_grad()
                 step += 1
                 if step % (5 if args.smoke else 50) == 0:
-                    avg = sum(run[-args.accum :]) / args.accum
+                    avg = sum(run[-args.accum * (5 if args.smoke else 50) :]) / min(
+                        len(run), args.accum * (5 if args.smoke else 50)
+                    )
                     curve.append((step, round(avg, 4)))
-                    print(f"[step {step}] bridge nll {avg:.4f}", flush=True)
+                    if avg < best_loss:
+                        best_loss, best_state = avg, copy.deepcopy(bridge.state_dict())
+                    print(f"[step {step}] bridge nll {avg:.4f} (best {best_loss:.4f})", flush=True)
                 if step >= args.steps:
                     break
 
-    # ── eval ladder ──────────────────────────────────────────────────────────
+    # ── eval ladder (on the BEST-loss checkpoint) ────────────────────────────
+    if best_state is not None:
+        bridge.load_state_dict(best_state)
+        print(f"eval on best checkpoint (train nll {best_loss:.4f})", flush=True)
     bridge.eval()
     rungs = ["none", "full", "gist_true", "bridge_true", "bridge_pred", "shuffled"]
 
@@ -329,6 +354,7 @@ def main() -> None:
         "accum": args.accum,
         "train_loss_curve": curve,
         "final_train_loss": curve[-1][1] if curve else None,
+        "best_train_loss": round(best_loss, 4) if best_state is not None else None,
         "ladder": ladder,
         "train_ladder": train_ladder,
     }
