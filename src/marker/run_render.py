@@ -114,23 +114,33 @@ def main() -> None:
         if args.smoke
         else list(_doc_texts(args.n_docs, "cot", args.dataset, None, None))
     )
-    pairs = []
-    doc_starts = []  # first pair-index of each doc, for a DOC-boundary eval split
-    for text in docs:
-        doc_starts.append(len(pairs))
-        for s in _split_units(text, args.unit):
-            ids = tok(s, add_special_tokens=False).input_ids[: args.max_span]
-            if len(ids) < 2:
-                continue
-            kv, cont_start, _ = gist_kv(pm, gist, ids)
-            cpu_kv = type(kv)(kv.n_layers, [k.cpu() for k in kv.keys], [v.cpu() for v in kv.values])
-            pairs.append((cpu_kv, cont_start, ids, s))
+
+    def _encode_docs(texts):  # noqa: ANN001
+        out, starts = [], []
+        for text in texts:
+            starts.append(len(out))
+            for s in _split_units(text, args.unit):
+                ids = tok(s, add_special_tokens=False).input_ids[: args.max_span]
+                if len(ids) < 2:
+                    continue
+                kv, cont_start, _ = gist_kv(pm, gist, ids)
+                cpu_kv = type(kv)(
+                    kv.n_layers, [k.cpu() for k in kv.keys], [v.cpu() for v in kv.values]
+                )
+                out.append((cpu_kv, cont_start, ids, s))
+        return out, starts
+
+    pairs, doc_starts = _encode_docs(docs)
     print(f"encoded {len(pairs)} (thought, step) pairs", flush=True)
     # eval split at a DOCUMENT boundary (Fable render review: a step-index split
     # straddles one doc, letting sibling steps leak train->eval style)
     want = max(2, len(pairs) // 10)
     n_eval = next((ds for ds in doc_starts if ds >= want), want)
     eval_pairs, train_pairs = pairs[:n_eval], pairs[n_eval:]
+    # FRESH eval set (Fable memorization confound): our own synthetic step
+    # templates — never on the internet, cannot be memorized. Reported
+    # separately; the gsm8k eval may be flattered by pretraining recall.
+    fresh_pairs, _ = _encode_docs(_smoke_cot_texts(30)) if not args.smoke else ([], None)
 
     def _gpu(kv):  # noqa: ANN001
         return type(kv)(
@@ -139,13 +149,16 @@ def main() -> None:
 
     # ── train the render LoRA (render adapter active) ────────────────────────
     pm.set_adapter("render")
+    nl = tok("\n", add_special_tokens=False).input_ids
     opt = torch.optim.AdamW([p for _, p in render_params], lr=args.lr, weight_decay=0.01)
     torch.manual_seed(0)
     step = 0
     while step < args.steps:
         for idx in torch.randperm(len(train_pairs)):
             kv, cs, ids, _ = train_pairs[idx]
-            loss = render_nll(pm, _gpu(kv), cs, ids)
+            # target = step + newline: teach the decoder to STOP (the first
+            # run repeated the step 3-4x to max_new — no end-of-step marker)
+            loss = render_nll(pm, _gpu(kv), cs, list(ids) + list(nl))
             opt.zero_grad()
             loss.backward()
             if step == 0:
@@ -163,30 +176,38 @@ def main() -> None:
                 break
 
     # ── eval: reconstruction quality, beyond averages ────────────────────────
-    f1s, numrec = [], []
-    shown = 0
-    for kv, cs, ids, text in eval_pairs:
-        rec = _render_reconstruct(pm, _gpu(kv), cs, ids[0], args.max_span, stop_ids)
-        f1s.append(_f1_tok(rec, ids))
-        nr = _num_recall(tok.decode(rec), text)
-        if nr is not None:
-            numrec.append(nr)
-        if shown < 8:
-            shown += 1
-            print(f"\n[rec] STEP : {text!r}\n      RENDER: {tok.decode(rec)!r}", flush=True)
+    import random  # noqa: PLC0415
 
-    f1s.sort()
-    q = lambda p: round(f1s[min(len(f1s) - 1, int(p * len(f1s)))], 3) if f1s else 0.0  # noqa: E731
-    mean = lambda xs: round(sum(xs) / max(1, len(xs)), 3)  # noqa: E731
+    def _eval_set(ps, label):  # noqa: ANN001
+        f1s, numrec = [], []
+        # RANDOM display sample (the first gsm8k items are the most famous /
+        # most-memorized in the field — first-N display was selection-biased)
+        show = set(random.Random(0).sample(range(len(ps)), min(6, len(ps))))
+        for i, (kv, cs, ids, text) in enumerate(ps):
+            rec = _render_reconstruct(pm, _gpu(kv), cs, ids[0], args.max_span, stop_ids)
+            f1s.append(_f1_tok(rec, ids))
+            nr = _num_recall(tok.decode(rec), text)
+            if nr is not None:
+                numrec.append(nr)
+            if i in show:
+                print(f"\n[{label}] STEP : {text!r}\n      RENDER: {tok.decode(rec)!r}", flush=True)
+        f1s.sort()
+        q = lambda p: round(f1s[min(len(f1s) - 1, int(p * len(f1s)))], 3) if f1s else 0.0  # noqa: E731
+        mean = lambda xs: round(sum(xs) / max(1, len(xs)), 3)  # noqa: E731
+        print(
+            f"\n[RENDER {label}] eval={len(f1s)} (doc-disjoint; PRIMED with true first token)  "
+            f"reconstruct F1: mean={mean(f1s)} p10={q(0.1)} p50={q(0.5)} p90={q(0.9)}\n"
+            f"  number-recall (steps with numbers, n={len(numrec)}): mean={mean(numrec)}",
+            flush=True,
+        )
+
+    _eval_set(eval_pairs, "gsm8k")
+    if fresh_pairs:
+        _eval_set(fresh_pairs, "FRESH-synth")
     print(
-        f"\n[RENDER] eval={len(f1s)} (doc-disjoint; PRIMED with true first token)  "
-        f"reconstruct F1: mean={mean(f1s)} p10={q(0.1)} p50={q(0.5)} p90={q(0.9)}\n"
-        f"  number-recall (steps with numbers, n={len(numrec)}): mean={mean(numrec)}",
-        flush=True,
-    )
-    print(
-        "READ: F1 p50 is typical fidelity; p10 the worst steps; number-recall < 1 "
-        "quantifies exactly what the literals ledger must fix (exact digits)."
+        "READ: gsm8k numbers may be flattered by pretraining memorization; "
+        "FRESH-synth (our templates, unmemorizable) is the honest fidelity. "
+        "number-recall < 1 quantifies exactly what the literals ledger must fix."
     )
 
     if args.out_repo:
