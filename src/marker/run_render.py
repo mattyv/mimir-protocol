@@ -115,7 +115,9 @@ def main() -> None:
         else list(_doc_texts(args.n_docs, "cot", args.dataset, None, None))
     )
     pairs = []
+    doc_starts = []  # first pair-index of each doc, for a DOC-boundary eval split
     for text in docs:
+        doc_starts.append(len(pairs))
         for s in _split_units(text, args.unit):
             ids = tok(s, add_special_tokens=False).input_ids[: args.max_span]
             if len(ids) < 2:
@@ -124,7 +126,10 @@ def main() -> None:
             cpu_kv = type(kv)(kv.n_layers, [k.cpu() for k in kv.keys], [v.cpu() for v in kv.values])
             pairs.append((cpu_kv, cont_start, ids, s))
     print(f"encoded {len(pairs)} (thought, step) pairs", flush=True)
-    n_eval = max(2, len(pairs) // 10)
+    # eval split at a DOCUMENT boundary (Fable render review: a step-index split
+    # straddles one doc, letting sibling steps leak train->eval style)
+    want = max(2, len(pairs) // 10)
+    n_eval = next((ds for ds in doc_starts if ds >= want), want)
     eval_pairs, train_pairs = pairs[:n_eval], pairs[n_eval:]
 
     def _gpu(kv):  # noqa: ANN001
@@ -143,6 +148,13 @@ def main() -> None:
             loss = render_nll(pm, _gpu(kv), cs, ids)
             opt.zero_grad()
             loss.backward()
+            if step == 0:
+                # the quantized path is unexercised by CPU tests (pilot's GRAD
+                # FAIL guard): a silent no-grad here would "train" nothing and
+                # fake a render result — fail LOUDLY instead.
+                ok = any(p.grad is not None and p.grad.abs().sum() > 0 for _, p in render_params)
+                assert ok, "GRAD FAIL: no gradient reached the render LoRA (quantized path)"
+                print("GRAD_OK (render gradients flowing)", flush=True)
             opt.step()
             step += 1
             if step % (20 if args.smoke else 200) == 0:
@@ -167,8 +179,8 @@ def main() -> None:
     q = lambda p: round(f1s[min(len(f1s) - 1, int(p * len(f1s)))], 3) if f1s else 0.0  # noqa: E731
     mean = lambda xs: round(sum(xs) / max(1, len(xs)), 3)  # noqa: E731
     print(
-        f"\n[RENDER] eval={len(f1s)}  reconstruct F1: mean={mean(f1s)} "
-        f"p10={q(0.1)} p50={q(0.5)} p90={q(0.9)}\n"
+        f"\n[RENDER] eval={len(f1s)} (doc-disjoint; PRIMED with true first token)  "
+        f"reconstruct F1: mean={mean(f1s)} p10={q(0.1)} p50={q(0.5)} p90={q(0.9)}\n"
         f"  number-recall (steps with numbers, n={len(numrec)}): mean={mean(numrec)}",
         flush=True,
     )
