@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import math
 
-from marker.run_bridge import ladder_gap_closed, pred_pairs
+import torch
+
+from marker.predictor import NextThoughtPredictor
+from marker.run_bridge import ladder_gap_closed, pred_pairs, predict_step
 
 
 def test_pred_pairs_needs_history_and_a_next_step():
@@ -21,6 +24,47 @@ def test_pred_pairs_needs_history_and_a_next_step():
     assert pred_pairs(3) == [1]
     assert pred_pairs(2) == []  # no n with both history and a next step
     assert pred_pairs(1) == []
+
+
+def test_predict_step_windowed_positions_and_causality():
+    # the predictor's position table is only trained for window-local indices;
+    # predict_step must (a) clamp the input to the last <=window steps so
+    # positions stay in-distribution, and (b) be causally blind to step n's own
+    # summary even though it's included as the masked target position.
+    torch.manual_seed(0)
+    m = NextThoughtPredictor(d=8, k=4, d_model=16, layers=1, heads=2, max_sents=8).to("cpu")
+    m.eval()
+    summ = torch.randn(20, 4, 8)  # 20 steps >> window
+    with torch.no_grad():
+        # deep-in-doc step: would index position 18 unwindowed (max_sents=8 -> crash)
+        p = predict_step(m, summ, n=18, window=8)
+        assert p.shape == (4, 8)
+        # (b) changing step n's own summary must NOT change the prediction of n
+        summ2 = summ.clone()
+        summ2[18] = torch.randn(4, 8)
+        p2 = predict_step(m, summ2, n=18, window=8)
+        assert torch.allclose(p, p2, atol=1e-6)
+        # changing a step INSIDE the history window must change it
+        summ3 = summ.clone()
+        summ3[17] = torch.randn(4, 8)
+        p3 = predict_step(m, summ3, n=18, window=8)
+        assert not torch.allclose(p, p3, atol=1e-4)
+        # changing a step OUTSIDE the window must not change it
+        summ4 = summ.clone()
+        summ4[2] = torch.randn(4, 8)
+        p4 = predict_step(m, summ4, n=18, window=8)
+        assert torch.allclose(p, p4, atol=1e-6)
+
+
+def test_predict_step_earliest_valid_n():
+    # n=1: history is just step 0 -> input [step0, step1(masked)], one readout
+    torch.manual_seed(1)
+    m = NextThoughtPredictor(d=8, k=4, d_model=16, layers=1, heads=2, max_sents=8)
+    m.eval()
+    summ = torch.randn(3, 4, 8)
+    with torch.no_grad():
+        p = predict_step(m, summ, n=1, window=8)
+    assert p.shape == (4, 8)
 
 
 def test_ladder_gap_closed_anchors_none_zero_full_one():

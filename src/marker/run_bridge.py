@@ -47,6 +47,22 @@ def pred_pairs(n_steps: int) -> list[int]:
     return list(range(1, n_steps - 1))
 
 
+@torch.no_grad()
+def predict_step(predictor, summ: torch.Tensor, n: int, window: int) -> torch.Tensor:  # noqa: ANN001
+    """The predictor's guess of step n's summary from the (<= window-1) steps
+    before it. Input is the WINDOWED slice summ[max(0, n-window+1) : n+1] so the
+    sentence-position indices stay inside the range the predictor was trained on
+    (it saw windows re-indexed from 0; positions beyond that are untrained
+    embeddings — feeding a whole doc would run deep steps on garbage, Fable
+    bridge review bug A). Step n's own summary rides along only as the masked
+    target position: the block-causal mask keeps the readout at n-1 blind to it.
+    Returns [k, d] on summ's device."""
+    a = max(0, n - window + 1)
+    x = summ[a : n + 1].unsqueeze(0)  # [1, m<=window, k, d]
+    out = predictor(x)  # [1, m-1, k, d]; last index = readout at n-1 -> predicts n
+    return out[0, -1]
+
+
 def ladder_gap_closed(nlls: dict[str, list[float]]) -> dict[str, dict]:
     """Per-rung mean NLL -> PPL -> gap_closed, anchored by none (0.0) and full
     (1.0). gap_closed = (none_ppl - rung_ppl)/(none_ppl - full_ppl): fraction of
@@ -98,10 +114,12 @@ def _token_cache(pm, ids: list[int]):  # noqa: ANN001
     return out.past_key_values, len(ids)
 
 
-def _encode_doc(pm, gist, tok, text, unit, max_span):  # noqa: ANN001
+def _encode_doc(pm, gist, tok, text, unit, max_span, max_sents=16):  # noqa: ANN001
     """A doc -> (step token-id lists, summaries [L,k,hidden]). Summaries are the
     final-layer readout the predictor consumes; token ids feed the full/gist
-    rungs. Steps with <2 tokens dropped (need a scorable tail)."""
+    rungs. Steps with <2 tokens dropped (need a scorable tail); docs capped at
+    max_sents=16 steps — the stage-2 cot cap the predictor's data respected
+    (and OpenR1 traces can run to hundreds of lines)."""
     from marker.gist_model import encode_gist  # noqa: PLC0415
     from marker.run_stage2 import _split_units  # noqa: PLC0415
 
@@ -110,6 +128,8 @@ def _encode_doc(pm, gist, tok, text, unit, max_span):  # noqa: ANN001
         t = tok(s, add_special_tokens=False).input_ids[:max_span]
         if len(t) >= 2:
             ids.append(t)
+        if len(ids) >= max_sents:
+            break
     if len(ids) < 3:
         return None
     summ = encode_gist(pm, gist, ids).float()  # [L, k, hidden]
@@ -131,6 +151,13 @@ def main() -> None:
     ap.add_argument("--n-docs", type=int, default=400)
     ap.add_argument(
         "--skip-docs", type=int, default=2000, help="stream past the predictor's train range"
+    )
+    ap.add_argument(
+        "--window",
+        type=int,
+        default=8,
+        help="predictor input window: MUST match the predictor's training window "
+        "(stage2 default 8) so sentence-position embeddings stay in-distribution",
     )
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -231,10 +258,9 @@ def main() -> None:
     nlls: dict[str, list[float]] = {r: [] for r in rungs}
     rng = torch.Generator().manual_seed(0)
     with torch.no_grad():
-        for ids, summ in eval_docs:
-            L = len(ids)
-            preds = predictor(summ.unsqueeze(0).to(device))[0]  # [L-1, k, d]: preds[i] -> step i+1
-            for n in pred_pairs(L):
+        for di, (ids, summ) in enumerate(eval_docs):
+            summ_dev = summ.to(device)
+            for n in pred_pairs(len(ids)):
                 cont = ids[n + 1]
                 nlls["none"].append(tail_nll(pm, None, 0, cont))
                 cache, cs = _token_cache(pm, ids[n])
@@ -242,19 +268,28 @@ def main() -> None:
                 kv, cs, _ = gist_kv(pm, gist, ids[n])
                 nlls["gist_true"].append(tail_nll(pm, _build_dynamic_cache(kv, device), cs, cont))
                 nlls["bridge_true"].append(
-                    tail_nll(
-                        pm, _build_dynamic_cache(bridge(summ[n].to(device)), device), bridge.k, cont
-                    )
+                    tail_nll(pm, _build_dynamic_cache(bridge(summ_dev[n]), device), bridge.k, cont)
                 )
+                # windowed prediction: positions stay inside the predictor's
+                # trained range (Fable bridge review bug A)
+                ghat = predict_step(predictor, summ_dev, n, args.window)
                 nlls["bridge_pred"].append(
-                    tail_nll(pm, _build_dynamic_cache(bridge(preds[n - 1]), device), bridge.k, cont)
+                    tail_nll(pm, _build_dynamic_cache(bridge(ghat), device), bridge.k, cont)
                 )
-                j = n
-                while j == n and L > 1:  # a DIFFERENT step's true summary (mislead control)
-                    j = int(torch.randint(0, L, (1,), generator=rng))
+                # mislead control: a random step from a DIFFERENT doc — same-doc
+                # draws could pull step n+1 itself, injecting the answer's own
+                # thought as the "mislead" (Fable bridge review bug B)
+                dj = di
+                while dj == di and len(eval_docs) > 1:
+                    dj = int(torch.randint(0, len(eval_docs), (1,), generator=rng))
+                o_ids, o_summ = eval_docs[dj]
+                j = int(torch.randint(0, len(o_ids), (1,), generator=rng))
                 nlls["shuffled"].append(
                     tail_nll(
-                        pm, _build_dynamic_cache(bridge(summ[j].to(device)), device), bridge.k, cont
+                        pm,
+                        _build_dynamic_cache(bridge(o_summ[j].to(device)), device),
+                        bridge.k,
+                        cont,
                     )
                 )
 
