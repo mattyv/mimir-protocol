@@ -22,7 +22,7 @@ import re
 import torch
 
 from marker.gist_model import gist_kv
-from marker.render import attach_render, render_nll
+from marker.render import attach_render, extract_ledger, ledger_render_nll, render_nll
 
 _NUM = re.compile(r"\d+")
 
@@ -51,21 +51,33 @@ def _num_recall(pred_text: str, gold_text: str) -> float | None:
 
 
 @torch.no_grad()
-def _render_reconstruct(pm, thought_kv, cont_start, first_tok, max_new, stop_ids):  # noqa: ANN001
+def _render_reconstruct(pm, thought_kv, cont_start, first_tok, max_new, stop_ids, prefix_ids=None):  # noqa: ANN001
     """Greedy reconstruct a span from its thought under the active (render)
     adapter, primed with the true first token (the thought + a seed -> the
-    step; a ledger/prefix would supply the seed at runtime)."""
+    step; a ledger/prefix would supply the seed at runtime). prefix_ids (the
+    visible literals ledger) are fed before the first token and NOT counted as
+    output."""
     from marker.run_axiom_mlp_demo import _build_dynamic_cache  # noqa: PLC0415
 
     device = next(pm.parameters()).device
     cache = _build_dynamic_cache(thought_kv, device)
+    pos0 = cont_start
+    if prefix_ids:
+        out = pm(
+            torch.tensor([prefix_ids], device=device),
+            past_key_values=cache,
+            position_ids=torch.arange(pos0, pos0 + len(prefix_ids), device=device).unsqueeze(0),
+            use_cache=True,
+        )
+        cache = out.past_key_values
+        pos0 += len(prefix_ids)
     gen = [first_tok]
     nxt = first_tok
     for j in range(max_new - 1):
         out = pm(
             torch.tensor([[nxt]], device=device),
             past_key_values=cache,
-            position_ids=torch.tensor([[cont_start + j]], device=device),
+            position_ids=torch.tensor([[pos0 + j]], device=device),
             use_cache=True,
         )
         cache = out.past_key_values
@@ -88,6 +100,12 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--r", type=int, default=16)
     ap.add_argument("--max-span", type=int, default=64)
+    ap.add_argument(
+        "--ledger",
+        action="store_true",
+        help="literals ledger: feed the step's exact numbers as a visible prefix "
+        "(train + eval) — targets number-recall ~1.0 vs the no-ledger baseline",
+    )
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
     if args.smoke:
@@ -153,12 +171,23 @@ def main() -> None:
     opt = torch.optim.AdamW([p for _, p in render_params], lr=args.lr, weight_decay=0.01)
     torch.manual_seed(0)
     step = 0
+
+    def _ledger_ids(text):  # noqa: ANN001
+        """The step's literals as visible tokens, newline-terminated (the \\n
+        marks end-of-ledger; generation stops at its OWN later newline)."""
+        nums = extract_ledger(text)
+        return tok(" ".join(nums) + "\n", add_special_tokens=False).input_ids if nums else []
+
     while step < args.steps:
         for idx in torch.randperm(len(train_pairs)):
-            kv, cs, ids, _ = train_pairs[idx]
+            kv, cs, ids, text = train_pairs[idx]
             # target = step + newline: teach the decoder to STOP (the first
             # run repeated the step 3-4x to max_new — no end-of-step marker)
-            loss = render_nll(pm, _gpu(kv), cs, list(ids) + list(nl))
+            tgt = list(ids) + list(nl)
+            if args.ledger:
+                loss = ledger_render_nll(pm, _gpu(kv), cs, _ledger_ids(text), tgt)
+            else:
+                loss = render_nll(pm, _gpu(kv), cs, tgt)
             opt.zero_grad()
             loss.backward()
             if step == 0:
@@ -184,7 +213,15 @@ def main() -> None:
         # most-memorized in the field — first-N display was selection-biased)
         show = set(random.Random(0).sample(range(len(ps)), min(6, len(ps))))
         for i, (kv, cs, ids, text) in enumerate(ps):
-            rec = _render_reconstruct(pm, _gpu(kv), cs, ids[0], args.max_span, stop_ids)
+            rec = _render_reconstruct(
+                pm,
+                _gpu(kv),
+                cs,
+                ids[0],
+                args.max_span,
+                stop_ids,
+                prefix_ids=_ledger_ids(text) if args.ledger else None,
+            )
             f1s.append(_f1_tok(rec, ids))
             nr = _num_recall(tok.decode(rec), text)
             if nr is not None:
@@ -206,7 +243,7 @@ def main() -> None:
         print(f"\n[RENDER {label}] (doc-disjoint; PRIMED with true first token) {res}", flush=True)
         return res
 
-    manifest = {"gsm8k": _eval_set(eval_pairs, "gsm8k")}
+    manifest = {"ledger": bool(args.ledger), "gsm8k": _eval_set(eval_pairs, "gsm8k")}
     if fresh_pairs:
         manifest["fresh_synth"] = _eval_set(fresh_pairs, "FRESH-synth")
     print(
@@ -228,9 +265,10 @@ def main() -> None:
     if args.out_repo:
         from huggingface_hub import upload_folder  # noqa: PLC0415
 
+        sub = "render_adapter_ledger" if args.ledger else "render_adapter"
         pm.save_pretrained(str(d), selected_adapters=["render"])
-        upload_folder(repo_id=args.out_repo, folder_path=str(d), path_in_repo="render_adapter")
-        print(f"pushed render adapter + manifest to {args.out_repo}/render_adapter", flush=True)
+        upload_folder(repo_id=args.out_repo, folder_path=str(d), path_in_repo=sub)
+        print(f"pushed render adapter + manifest to {args.out_repo}/{sub}", flush=True)
 
 
 if __name__ == "__main__":

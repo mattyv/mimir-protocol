@@ -21,14 +21,16 @@ import torch
 
 from marker.gist_model import QWEN_TARGETS
 
-_LEDGER_NUM = re.compile(r"\d+")
+_LEDGER_NUM = re.compile(r"\d+(?:,\d{3})*(?:\.\d+)?")
 
 
 def extract_ledger(text: str, dedup: bool = False) -> list[str]:
     """The literals ledger: the step's exact numbers, in order — the values
     lossy meaning-compression drops. Stored beside the thought and given to the
-    render decoder as a VISIBLE prefix to copy from. (Numbers first; names/units
-    are a later extension.) dedup keeps first occurrence only."""
+    render decoder as a VISIBLE prefix to copy from. Decimals and
+    thousand-commas kept WHOLE ("0.2", "1,000") so the decoder copies literals,
+    not fragments. (Numbers first; names/units a later extension.) dedup keeps
+    first occurrence only."""
     nums = _LEDGER_NUM.findall(text)
     if not dedup:
         return nums
