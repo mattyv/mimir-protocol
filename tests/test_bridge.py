@@ -77,6 +77,30 @@ def test_injection_nll_gradients_reach_the_bridge():
     assert sum(g > 0 for g in grads) > 0, "no gradient reached the bridge (silent detach?)"
 
 
+def test_injection_nll_kv_dtype_cast_survives_half_model():
+    # the first Vast bridge run died at step 0: bridge outputs fp32 K/V, the
+    # quantized model attends in half, SDPA crashes on the mix — a GPU-only
+    # failure fp32 CPU tests can't see. A bf16 tiny model reproduces the class
+    # on CPU: without kv_dtype this raises, with it the loss is finite and
+    # gradients still reach the fp32 bridge through the cast.
+    base, pm, gist = _tiny()
+    cfg = base.config
+    pm.to(torch.bfloat16)
+    b = GistBridge(
+        d=cfg.hidden_size,
+        k=4,
+        n_layers=cfg.num_hidden_layers,
+        n_kv_heads=cfg.num_key_value_heads,
+        head_dim=cfg.hidden_size // cfg.num_attention_heads,
+    )  # bridge stays fp32 (its training precision)
+    thought = torch.randn(4, cfg.hidden_size)
+    loss = bridge_injection_nll(pm, b, thought, cont_ids=[5, 6, 7], kv_dtype=torch.bfloat16)
+    assert torch.isfinite(loss)
+    loss.backward()
+    grads = [p.grad.abs().sum() for p in b.parameters() if p.grad is not None]
+    assert grads and sum(g > 0 for g in grads) > 0, "cast broke gradient flow to the bridge"
+
+
 @pytest.mark.slow
 def test_bridge_overfits_one_batch():
     torch.manual_seed(0)

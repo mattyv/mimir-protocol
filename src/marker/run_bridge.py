@@ -222,11 +222,27 @@ def main() -> None:
         head_dim=head_dim,
         width=args.width,
     ).to(device)
+    # the model's ATTENTION dtype, from a real cache tensor (bridge outputs are
+    # fp32; a quantized model attends in half — SDPA crashes on the mix, a
+    # GPU-only failure the first Vast run hit at step 0)
+    kv_dtype = probe_kv.keys[0].dtype
     print(
         f"bridge: d={gist.shape[-1]} k={gist.shape[0]} n_layers={probe_kv.n_layers} "
-        f"n_kv_heads={n_kv_heads} head_dim={head_dim}",
+        f"n_kv_heads={n_kv_heads} head_dim={head_dim} kv_dtype={kv_dtype}",
         flush=True,
     )
+
+    def _bridge_cache(vec):  # noqa: ANN001
+        """bridge(vec) -> DynamicCache in the model's attention dtype."""
+        kv = bridge(vec)
+        return _build_dynamic_cache(
+            type(kv)(
+                kv.n_layers,
+                [k.to(kv_dtype) for k in kv.keys],
+                [v.to(kv_dtype) for v in kv.values],
+            ),
+            device,
+        )
 
     # ── train the bridge on TRUE summaries (convert->inject->NLL of next step) ─
     opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=0.01)
@@ -238,7 +254,7 @@ def main() -> None:
         for j in torch.randperm(len(train_items)):
             di, n = train_items[int(j)]
             ids, summ = train_docs[di]
-            loss = bridge_injection_nll(pm, bridge, summ[n].to(device), ids[n + 1])
+            loss = bridge_injection_nll(pm, bridge, summ[n].to(device), ids[n + 1], kv_dtype)
             opt.zero_grad()
             loss.backward()
             if step == 0:
@@ -267,15 +283,11 @@ def main() -> None:
                 nlls["full"].append(tail_nll(pm, cache, cs, cont))
                 kv, cs, _ = gist_kv(pm, gist, ids[n])
                 nlls["gist_true"].append(tail_nll(pm, _build_dynamic_cache(kv, device), cs, cont))
-                nlls["bridge_true"].append(
-                    tail_nll(pm, _build_dynamic_cache(bridge(summ_dev[n]), device), bridge.k, cont)
-                )
+                nlls["bridge_true"].append(tail_nll(pm, _bridge_cache(summ_dev[n]), bridge.k, cont))
                 # windowed prediction: positions stay inside the predictor's
                 # trained range (Fable bridge review bug A)
                 ghat = predict_step(predictor, summ_dev, n, args.window)
-                nlls["bridge_pred"].append(
-                    tail_nll(pm, _build_dynamic_cache(bridge(ghat), device), bridge.k, cont)
-                )
+                nlls["bridge_pred"].append(tail_nll(pm, _bridge_cache(ghat), bridge.k, cont))
                 # mislead control: a random step from a DIFFERENT doc — same-doc
                 # draws could pull step n+1 itself, injecting the answer's own
                 # thought as the "mislead" (Fable bridge review bug B)
@@ -285,12 +297,7 @@ def main() -> None:
                 o_ids, o_summ = eval_docs[dj]
                 j = int(torch.randint(0, len(o_ids), (1,), generator=rng))
                 nlls["shuffled"].append(
-                    tail_nll(
-                        pm,
-                        _build_dynamic_cache(bridge(o_summ[j].to(device)), device),
-                        bridge.k,
-                        cont,
-                    )
+                    tail_nll(pm, _bridge_cache(o_summ[j].to(device)), bridge.k, cont)
                 )
 
     ladder = ladder_gap_closed(nlls)

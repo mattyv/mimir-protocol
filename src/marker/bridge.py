@@ -63,6 +63,7 @@ def bridge_injection_nll(
     bridge: GistBridge,
     thought: torch.Tensor,
     cont_ids: list[int],
+    kv_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """The bridge's training loss: convert the thought, inject it, and return
     the teacher-forced mean NLL of the true next step's tail (same scoring as
@@ -77,7 +78,13 @@ def bridge_injection_nll(
     examples. Learned keys instead live at canonical positions [0, k) and the
     continuation ALWAYS decodes from position k — one fixed relative geometry
     for every example. Decode from bridged KV must likewise use
-    cont_start = bridge.k, never a span-dependent value."""
+    cont_start = bridge.k, never a span-dependent value.
+
+    kv_dtype: cast the injected K/V to the model's ATTENTION dtype (pass the
+    dtype of a real cache tensor, e.g. a gist_kv key). The bridge computes in
+    fp32; a quantized GPU model attends in half — mixing them crashes SDPA with
+    a dtype mismatch (GPU-only failure: fp32 CPU tests can't see it). The cast
+    is differentiable, so gradients still reach the bridge."""
     import torch.nn.functional as F  # noqa: N812, PLC0415
     from transformers import DynamicCache  # noqa: PLC0415
 
@@ -87,7 +94,10 @@ def bridge_injection_nll(
     kv = bridge(thought.to(device))
     cache = DynamicCache()
     for i in range(kv.n_layers):
-        cache.update(kv.keys[i], kv.values[i], i)  # bridge outputs keep grad
+        km, vm = kv.keys[i], kv.values[i]
+        if kv_dtype is not None:
+            km, vm = km.to(kv_dtype), vm.to(kv_dtype)
+        cache.update(km, vm, i)  # bridge outputs keep grad (cast is differentiable)
     m = len(cont_ids) - 1
     pos = torch.arange(bridge.k, bridge.k + m, device=device).unsqueeze(0)
     out = peft_model(
