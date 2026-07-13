@@ -473,3 +473,25 @@ number-dense slice, not just means.
   names) beside the thought — a few tokens, deterministic; render splices them
   in. Meaning from the thought, exact digits from the ledger. Lossy-at-any-k
   stops applying to the details that matter.
+
+## Render RESULT (2026-07-12, node 44650760): render decoder WORKS — reconstruction is near-verbatim
+
+800 docs, 2000 steps, 289 doc-disjoint eval. Node destroyed clean, adapter
+pushed to mattyvee/mimir-artifacts/render_adapter. $12.53.
+- reconstruct F1: mean 0.47, p10 0.35, p50 0.458, p90 0.606. number-recall
+  (steps with numbers, n=286): 0.731.
+- BUT F1 UNDERSTATES quality — a decoding artifact: no EOS at end-of-step (the
+  splitter strips the newline), so greedy reconstructs the step then REPEATS
+  it 3-4x to max_new, tanking precision. Examples are near-verbatim:
+    "Natalia sold 48/2 = 24 clips in May." -> EXACT (then repeats)
+    "In the beginning, Betty has only 100/2 = $50." -> "...Betty has 100/2 = $50."
+    "Weng earns 12/60 = $0.2 per min" -> "Weng earns 60/60 = $0.2 per min" (wrong
+    first number, structure+answer right)
+  True fidelity is materially higher than 0.47; the render path is validated.
+- number-recall 0.731 QUANTIFIES the ledger: ~73% of exact digits survive from
+  the thought alone; the literals ledger closes the remaining ~27% (12->60,
+  48+24 order flips). Meaning from the thought, exact numbers from the ledger —
+  as designed.
+- CHEAP FIX owed: eval stop-at-end-of-step (emit newline / cap at first step)
+  for a clean F1; the repetition is an eval artifact, not a model failure.
+  Optional ~$0.4 re-measure; qualitative + number-recall already tell the story.
