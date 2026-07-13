@@ -27,8 +27,10 @@ WINDOW="${WINDOW:-6}"                           # = the predictor's TRAINING win
 STEPS="${STEPS:-3000}"
 ACCUM="${ACCUM:-8}"
 WIDTH="${WIDTH:-512}"
-LR="${LR:-5e-4}"
-TIMEOUT="${TIMEOUT:-150m}"
+LR="${LR:-3e-4}"
+NOISE="${NOISE:-0.5}"                           # anti-hashing input jitter
+WD="${WD:-0.05}"
+TIMEOUT="${TIMEOUT:-170m}"
 
 echo "→ Searching RTX 3090 (rel>=0.98 inet>=500 cuda>=12.4)..."
 OFFER_ID=""
@@ -77,7 +79,8 @@ timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_bridge \
   --artifacts-repo ${REPO} --subdir ${SUBDIR} --out-repo ${REPO} \
   --dataset ${DATASET} --unit ${UNIT} \
   --n-docs ${NDOCS} --skip-docs ${SKIPDOCS} --window ${WINDOW} \
-  --steps ${STEPS} --accum ${ACCUM} --width ${WIDTH} --lr ${LR} 2>&1 | tee /root/bridge.log
+  --steps ${STEPS} --accum ${ACCUM} --width ${WIDTH} --lr ${LR} \
+  --noise ${NOISE} --wd ${WD} 2>&1 | tee /root/bridge.log
 echo "BRIDGE_RC=\${PIPESTATUS[0]}" | tee -a /root/bridge.log
 kill \$HB 2>/dev/null
 echo "ALLDONE" | tee -a /root/bridge.log

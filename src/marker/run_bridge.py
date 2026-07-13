@@ -63,6 +63,22 @@ def predict_step(predictor, summ: torch.Tensor, n: int, window: int) -> torch.Te
     return out[0, -1]
 
 
+def noised(summ: torch.Tensor, ratio: float, gen: torch.Generator) -> torch.Tensor:
+    """Anti-hashing jitter for bridge training: add per-slot Gaussian noise with
+    norm = ratio * ||slot||. A fingerprint-memorizing bridge (the width-1024
+    overfit probe hit train NLL 0.003 — a hash table keyed on the exact summary)
+    cannot tolerate jittered keys, so noise forces it to use the summary's
+    MEANING. ratio 1.0 puts the noised copy at cosine ~0.71 to the clean one —
+    roughly the predictor's own error distance — so the bridge trains on exactly
+    the input quality bridge_pred feeds it. [..., k, d] -> same shape; ratio 0 =
+    identity. Noise drawn on CPU with `gen` (torch.Generator is CPU-only)."""
+    if ratio <= 0:
+        return summ
+    u = torch.randn(summ.shape, generator=gen)
+    u = u / u.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    return summ + (ratio * summ.norm(dim=-1, keepdim=True)) * u.to(summ.device)
+
+
 def ladder_gap_closed(nlls: dict[str, list[float]]) -> dict[str, dict]:
     """Per-rung mean NLL -> PPL -> gap_closed, anchored by none (0.0) and full
     (1.0). gap_closed = (none_ppl - rung_ppl)/(none_ppl - full_ppl): fraction of
@@ -163,7 +179,16 @@ def main() -> None:
         "--steps", type=int, default=3000, help="OPTIMIZER steps (each = accum examples)"
     )
     ap.add_argument("--accum", type=int, default=8, help="examples per optimizer step (grad accum)")
-    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument(
+        "--noise",
+        type=float,
+        default=0.5,
+        help="anti-hashing input jitter: noise norm as a fraction of each slot's "
+        "norm (0.5 -> cos ~0.89 to clean, 1.0 -> ~0.71 = the predictor's error "
+        "distance). 0 disables",
+    )
+    ap.add_argument("--wd", type=float, default=0.05)
     ap.add_argument("--width", type=int, default=512)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--max-span", type=int, default=96)
@@ -208,8 +233,17 @@ def main() -> None:
     # ── encode docs -> (token ids, summaries) ────────────────────────────────
     encoded = [e for e in (_encode_doc(pm, gist, tok, t, unit, args.max_span) for t in docs) if e]
     print(f"encoded {len(encoded)} docs with >=3 scorable steps", flush=True)
+    # three DOC-disjoint splits: eval (the ladder), val (checkpoint gate — best
+    # TRAIN loss picks the most-memorized weights, exactly wrong), train
     n_eval = max(1, len(encoded) // 5)
-    eval_docs, train_docs = encoded[:n_eval], encoded[n_eval:]
+    n_val = max(1, len(encoded) // 10)
+    eval_docs = encoded[:n_eval]
+    val_docs = encoded[n_eval : n_eval + n_val]
+    train_docs = encoded[n_eval + n_val :]
+    print(
+        f"split: {len(train_docs)} train / {len(val_docs)} val / {len(eval_docs)} eval docs",
+        flush=True,
+    )
 
     # ── build the bridge from a REAL gist_kv's shapes ────────────────────────
     from marker.gist_model import gist_kv  # noqa: PLC0415
@@ -252,7 +286,7 @@ def main() -> None:
     # time (variable-length conts don't pad cleanly), so batch=1 forwards were
     # brutally noisy — the first real run barely moved off its poisonous init in
     # 1500 single-example steps. Accumulate `accum` examples per optimizer step.
-    opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=0.01)
+    opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=args.wd)
     # warmup -> cosine schedule + gradient clip: the previous run's loss was flat
     # and BOUNCING from step 50 (lr 5e-4, no schedule) — an unstable optimization
     # that confounds "target unreachable" with "optimized badly". Stabilize it so
@@ -269,16 +303,36 @@ def main() -> None:
 
     torch.manual_seed(0)
     train_items = [(di, n) for di, (ids, _) in enumerate(train_docs) for n in pred_pairs(len(ids))]
-    print(f"{len(train_items)} (doc, step) training pairs, accum={args.accum}", flush=True)
-    curve, run, step = [], [], 0
-    best_loss, best_state = float("inf"), None  # eval on the BEST checkpoint, not the last
+    val_items = [(di, n) for di, (ids, _) in enumerate(val_docs) for n in pred_pairs(len(ids))][:64]
+    print(
+        f"{len(train_items)} train / {len(val_items)} val pairs, "
+        f"accum={args.accum} noise={args.noise}",
+        flush=True,
+    )
+    noise_gen = torch.Generator().manual_seed(7)
+
+    @torch.no_grad()
+    def _val_loss():
+        bridge.eval()
+        tot = 0.0
+        for di, n in val_items:
+            ids, summ = val_docs[di]
+            tot += float(bridge_injection_nll(pm, bridge, summ[n].to(device), ids[n + 1], kv_dtype))
+        bridge.train()
+        return tot / max(1, len(val_items))
+
+    curve, val_curve, run, step = [], [], [], 0
+    best_val, best_state = float("inf"), None  # checkpoint gated on VAL, never train
+    val_every = 5 if args.smoke else 200
     checked = False
     opt.zero_grad()
     while step < args.steps and train_items:
         for j in torch.randperm(len(train_items)):
             di, n = train_items[int(j)]
             ids, summ = train_docs[di]
-            loss = bridge_injection_nll(pm, bridge, summ[n].to(device), ids[n + 1], kv_dtype)
+            # anti-hashing: train on a JITTERED copy of the true summary (see noised)
+            g_in = noised(summ[n], args.noise, noise_gen).to(device)
+            loss = bridge_injection_nll(pm, bridge, g_in, ids[n + 1], kv_dtype)
             (loss / args.accum).backward()
             run.append(loss.item())
             if not checked:
@@ -294,20 +348,25 @@ def main() -> None:
                 opt.zero_grad()
                 step += 1
                 if step % (5 if args.smoke else 50) == 0:
-                    avg = sum(run[-args.accum * (5 if args.smoke else 50) :]) / min(
-                        len(run), args.accum * (5 if args.smoke else 50)
-                    )
+                    avg = sum(run[-args.accum * 50 :]) / min(len(run), args.accum * 50)
                     curve.append((step, round(avg, 4)))
-                    if avg < best_loss:
-                        best_loss, best_state = avg, copy.deepcopy(bridge.state_dict())
-                    print(f"[step {step}] bridge nll {avg:.4f} (best {best_loss:.4f})", flush=True)
+                if step % val_every == 0:
+                    vl = _val_loss()
+                    val_curve.append((step, round(vl, 4)))
+                    if vl < best_val:
+                        best_val, best_state = vl, copy.deepcopy(bridge.state_dict())
+                    print(
+                        f"[step {step}] train nll {curve[-1][1]:.4f} | val nll {vl:.4f} "
+                        f"(best {best_val:.4f})",
+                        flush=True,
+                    )
                 if step >= args.steps:
                     break
 
-    # ── eval ladder (on the BEST-loss checkpoint) ────────────────────────────
+    # ── eval ladder (on the BEST-VAL checkpoint) ─────────────────────────────
     if best_state is not None:
         bridge.load_state_dict(best_state)
-        print(f"eval on best checkpoint (train nll {best_loss:.4f})", flush=True)
+        print(f"eval on best-VAL checkpoint (val nll {best_val:.4f})", flush=True)
     bridge.eval()
     rungs = ["none", "full", "gist_true", "bridge_true", "bridge_pred", "shuffled"]
 
@@ -353,12 +412,20 @@ def main() -> None:
         "steps": args.steps,
         "accum": args.accum,
         "train_loss_curve": curve,
+        "val_loss_curve": val_curve,
         "final_train_loss": curve[-1][1] if curve else None,
-        "best_train_loss": round(best_loss, 4) if best_state is not None else None,
+        "best_val_loss": round(best_val, 4) if best_state is not None else None,
+        "noise": args.noise,
+        "wd": args.wd,
+        "width": args.width,
         "ladder": ladder,
         "train_ladder": train_ladder,
     }
-    print(f"\n[BRIDGE] final_train_loss={manifest['final_train_loss']}", flush=True)
+    print(
+        f"\n[BRIDGE] final_train_loss={manifest['final_train_loss']} "
+        f"best_val_loss={manifest['best_val_loss']}",
+        flush=True,
+    )
     print("[BRIDGE LADDER]  (eval | train-sample)", flush=True)
     for r in rungs:
         e, t = ladder[r], train_ladder[r]

@@ -14,7 +14,7 @@ import math
 import torch
 
 from marker.predictor import NextThoughtPredictor
-from marker.run_bridge import ladder_gap_closed, pred_pairs, predict_step
+from marker.run_bridge import ladder_gap_closed, noised, pred_pairs, predict_step
 
 
 def test_pred_pairs_needs_history_and_a_next_step():
@@ -54,6 +54,27 @@ def test_predict_step_windowed_positions_and_causality():
         summ4[2] = torch.randn(4, 8)
         p4 = predict_step(m, summ4, n=18, window=8)
         assert torch.allclose(p, p4, atol=1e-6)
+
+
+def test_noised_hits_target_cosine_band():
+    # anti-hashing jitter: noised(g, ratio) adds per-slot noise with norm =
+    # ratio * ||slot||. ratio 1.0 -> expected cosine ~1/sqrt(2) ~ 0.71 to the
+    # clean summary (the predictor's error distance); ratio 0 -> identity.
+    torch.manual_seed(0)
+    g = torch.randn(8, 512)
+    z = noised(g, 1.0, torch.Generator().manual_seed(1))
+    cos = torch.nn.functional.cosine_similarity(g, z, dim=-1)
+    assert 0.6 < cos.mean() < 0.8, f"ratio 1.0 should land near cos 0.71, got {cos.mean():.3f}"
+    z0 = noised(g, 0.0, torch.Generator().manual_seed(1))
+    assert torch.equal(z0, g)
+
+
+def test_noised_preserves_shape_and_grad_free_input():
+    g = torch.randn(3, 4, 16)
+    z = noised(g, 0.5, torch.Generator().manual_seed(0))
+    assert z.shape == g.shape
+    cos = torch.nn.functional.cosine_similarity(g, z, dim=-1)
+    assert (cos > 0.8).all()  # ratio 0.5 -> cos ~ 0.89, comfortably above 0.8
 
 
 def test_predict_step_earliest_valid_n():
