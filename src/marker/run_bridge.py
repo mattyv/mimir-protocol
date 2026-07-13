@@ -159,8 +159,11 @@ def main() -> None:
         help="predictor input window: MUST match the predictor's training window "
         "(stage2 default 8) so sentence-position embeddings stay in-distribution",
     )
-    ap.add_argument("--steps", type=int, default=1500)
-    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument(
+        "--steps", type=int, default=3000, help="OPTIMIZER steps (each = accum examples)"
+    )
+    ap.add_argument("--accum", type=int, default=8, help="examples per optimizer step (grad accum)")
+    ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--width", type=int, default=512)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--max-span", type=int, default=96)
@@ -169,8 +172,8 @@ def main() -> None:
 
     unit = args.unit or ("line" if args.corpus == "cot" else "sentence")
     if args.smoke:
-        args.model_name, args.repo, args.n_docs, args.steps = "Qwen/Qwen2.5-0.5B", None, 40, 40
-        args.max_span, args.skip_docs = 24, 0
+        args.model_name, args.repo, args.n_docs, args.steps = "Qwen/Qwen2.5-0.5B", None, 40, 15
+        args.max_span, args.skip_docs, args.accum = 24, 0, 4
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     from marker.run_stage2 import _doc_texts, _load_stage1, _smoke_cot_texts
@@ -245,36 +248,49 @@ def main() -> None:
         )
 
     # ── train the bridge on TRUE summaries (convert->inject->NLL of next step) ─
+    # gradient accumulation: bridge_injection_nll scores ONE (thought, cont) at a
+    # time (variable-length conts don't pad cleanly), so batch=1 forwards were
+    # brutally noisy — the first real run barely moved off its poisonous init in
+    # 1500 single-example steps. Accumulate `accum` examples per optimizer step.
     opt = torch.optim.AdamW(bridge.parameters(), lr=args.lr, weight_decay=0.01)
     torch.manual_seed(0)
     train_items = [(di, n) for di, (ids, _) in enumerate(train_docs) for n in pred_pairs(len(ids))]
-    print(f"{len(train_items)} (doc, step) training pairs", flush=True)
-    step = 0
+    print(f"{len(train_items)} (doc, step) training pairs, accum={args.accum}", flush=True)
+    curve, run, step = [], [], 0
+    checked = False
+    opt.zero_grad()
     while step < args.steps and train_items:
         for j in torch.randperm(len(train_items)):
             di, n = train_items[int(j)]
             ids, summ = train_docs[di]
             loss = bridge_injection_nll(pm, bridge, summ[n].to(device), ids[n + 1], kv_dtype)
-            opt.zero_grad()
-            loss.backward()
-            if step == 0:
+            (loss / args.accum).backward()
+            run.append(loss.item())
+            if not checked:
                 ok = any(p.grad is not None and p.grad.abs().sum() > 0 for p in bridge.parameters())
                 assert ok, "GRAD FAIL: no gradient reached the bridge (quantized/detach path)"
                 print("GRAD_OK (bridge gradients flowing)", flush=True)
-            opt.step()
-            step += 1
-            if step % (10 if args.smoke else 200) == 0:
-                print(f"[step {step}] bridge nll {loss.item():.4f}", flush=True)
-            if step >= args.steps:
-                break
+                checked = True
+            if len(run) % args.accum == 0:
+                opt.step()
+                opt.zero_grad()
+                step += 1
+                if step % (5 if args.smoke else 50) == 0:
+                    avg = sum(run[-args.accum :]) / args.accum
+                    curve.append((step, round(avg, 4)))
+                    print(f"[step {step}] bridge nll {avg:.4f}", flush=True)
+                if step >= args.steps:
+                    break
 
-    # ── eval ladder on held-out docs ─────────────────────────────────────────
+    # ── eval ladder ──────────────────────────────────────────────────────────
     bridge.eval()
     rungs = ["none", "full", "gist_true", "bridge_true", "bridge_pred", "shuffled"]
-    nlls: dict[str, list[float]] = {r: [] for r in rungs}
-    rng = torch.Generator().manual_seed(0)
-    with torch.no_grad():
-        for di, (ids, summ) in enumerate(eval_docs):
+
+    @torch.no_grad()
+    def run_ladder(docs, seed):  # noqa: ANN001
+        nlls: dict[str, list[float]] = {r: [] for r in rungs}
+        rng = torch.Generator().manual_seed(seed)
+        for di, (ids, summ) in enumerate(docs):
             summ_dev = summ.to(device)
             for n in pred_pairs(len(ids)):
                 cont = ids[n + 1]
@@ -284,35 +300,44 @@ def main() -> None:
                 kv, cs, _ = gist_kv(pm, gist, ids[n])
                 nlls["gist_true"].append(tail_nll(pm, _build_dynamic_cache(kv, device), cs, cont))
                 nlls["bridge_true"].append(tail_nll(pm, _bridge_cache(summ_dev[n]), bridge.k, cont))
-                # windowed prediction: positions stay inside the predictor's
-                # trained range (Fable bridge review bug A)
-                ghat = predict_step(predictor, summ_dev, n, args.window)
+                ghat = predict_step(predictor, summ_dev, n, args.window)  # windowed (bug A)
                 nlls["bridge_pred"].append(tail_nll(pm, _bridge_cache(ghat), bridge.k, cont))
-                # mislead control: a random step from a DIFFERENT doc — same-doc
-                # draws could pull step n+1 itself, injecting the answer's own
-                # thought as the "mislead" (Fable bridge review bug B)
+                # mislead control: a step from a DIFFERENT doc (bug B)
                 dj = di
-                while dj == di and len(eval_docs) > 1:
-                    dj = int(torch.randint(0, len(eval_docs), (1,), generator=rng))
-                o_ids, o_summ = eval_docs[dj]
+                while dj == di and len(docs) > 1:
+                    dj = int(torch.randint(0, len(docs), (1,), generator=rng))
+                o_ids, o_summ = docs[dj]
                 j = int(torch.randint(0, len(o_ids), (1,), generator=rng))
                 nlls["shuffled"].append(
                     tail_nll(pm, _bridge_cache(o_summ[j].to(device)), bridge.k, cont)
                 )
+        return ladder_gap_closed(nlls)
 
-    ladder = ladder_gap_closed(nlls)
+    ladder = run_ladder(eval_docs, 0)
+    # TRAIN-set ladder on a sample: the decisive diagnostic. If bridge_true is
+    # good on TRAIN but bad on eval -> overfit (more data/reg). If bad on BOTH ->
+    # the bridge can't even fit the summary->KV target (undertrained, or the
+    # final-layer summary is too lossy to reconstruct injectable KV).
+    train_ladder = run_ladder(train_docs[: min(15, len(train_docs))], 1)
+
     manifest = {
         "probe_dataset": args.dataset,
         "subdir": args.subdir,
         "skip_docs": args.skip_docs,
         "n_eval_docs": len(eval_docs),
         "steps": args.steps,
+        "accum": args.accum,
+        "train_loss_curve": curve,
+        "final_train_loss": curve[-1][1] if curve else None,
         "ladder": ladder,
+        "train_ladder": train_ladder,
     }
-    print("\n[BRIDGE LADDER]", flush=True)
+    print(f"\n[BRIDGE] final_train_loss={manifest['final_train_loss']}", flush=True)
+    print("[BRIDGE LADDER]  (eval | train-sample)", flush=True)
     for r in rungs:
+        e, t = ladder[r], train_ladder[r]
         print(
-            f"  {r:12s} ppl={ladder[r]['ppl']} gap_closed={ladder[r]['gap_closed']} n={ladder[r]['n']}",
+            f"  {r:12s} eval gc={e['gap_closed']} ppl={e['ppl']}  |  train gc={t['gap_closed']} ppl={t['ppl']}",
             flush=True,
         )
 
