@@ -15,9 +15,29 @@ separate build; render.py is meaning-reconstruction.)
 
 from __future__ import annotations
 
+import re
+
 import torch
 
 from marker.gist_model import QWEN_TARGETS
+
+_LEDGER_NUM = re.compile(r"\d+")
+
+
+def extract_ledger(text: str, dedup: bool = False) -> list[str]:
+    """The literals ledger: the step's exact numbers, in order — the values
+    lossy meaning-compression drops. Stored beside the thought and given to the
+    render decoder as a VISIBLE prefix to copy from. (Numbers first; names/units
+    are a later extension.) dedup keeps first occurrence only."""
+    nums = _LEDGER_NUM.findall(text)
+    if not dedup:
+        return nums
+    seen, out = set(), []
+    for x in nums:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 def attach_render(peft_model, r: int = 16, alpha: int = 32, targets=None):  # noqa: ANN001
@@ -71,3 +91,43 @@ def render_nll(
         use_cache=True,
     )
     return F.cross_entropy(out.logits[0], torch.tensor(span_ids[1:], device=device))
+
+
+def ledger_render_nll(
+    peft_model,  # noqa: ANN001
+    thought_kv,  # noqa: ANN001
+    cont_start: int,
+    ledger_ids: list[int],
+    span_ids: list[int],
+) -> torch.Tensor:
+    """Ledger-conditioned render loss: the exact-literal tokens (ledger_ids) are
+    fed as a VISIBLE prefix right after the thought, then the step is decoded —
+    CE scores the STEP tokens only, not the ledger. The decoder learns to copy
+    the correct digits from the visible ledger (meaning from the thought, exact
+    numbers from the ledger). Layout at positions cont_start..:
+    [ledger tokens | span tokens]; only span positions contribute to the loss."""
+    import torch.nn.functional as F  # noqa: N812, PLC0415
+    from transformers import DynamicCache  # noqa: PLC0415
+
+    if len(span_ids) < 2:
+        raise ValueError("need >= 2 span tokens to score a reconstruction tail")
+    device = next(peft_model.parameters()).device
+    cache = DynamicCache()
+    for i in range(thought_kv.n_layers):
+        cache.update(thought_kv.keys[i].to(device), thought_kv.values[i].to(device), i)
+    seq = list(ledger_ids) + list(span_ids)
+    inp = seq[:-1]  # predict seq[1:] from seq[:-1]
+    pos = torch.arange(cont_start, cont_start + len(inp), device=device).unsqueeze(0)
+    out = peft_model(
+        torch.tensor([inp], device=device),
+        past_key_values=cache,
+        position_ids=pos,
+        use_cache=True,
+    )
+    # score only the SPAN targets: seq[1:] positions that land in span_ids.
+    # span targets are seq[len(ledger):], predicted by logits at input index
+    # len(ledger)-1 .. onward.
+    start = len(ledger_ids) - 1 if ledger_ids else 0
+    logits = out.logits[0][start : start + (len(span_ids) - (0 if ledger_ids else 1))]
+    tgt = span_ids if ledger_ids else span_ids[1:]
+    return F.cross_entropy(logits, torch.tensor(tgt, device=device))
