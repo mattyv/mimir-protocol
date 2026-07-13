@@ -495,3 +495,23 @@ pushed to mattyvee/mimir-artifacts/render_adapter. $12.53.
 - CHEAP FIX owed: eval stop-at-end-of-step (emit newline / cap at first step)
   for a clean F1; the repetition is an eval artifact, not a model failure.
   Optional ~$0.4 re-measure; qualitative + number-recall already tell the story.
+
+## Render RESULT v2 (2026-07-13, node 44659420): render path VALIDATED — high fidelity, confound cleared
+
+EOS-in-target fix + fresh-text eval + manifest persistence. Node destroyed, $11.87.
+Results (manifest on HF render_adapter/manifest.json):
+- gsm8k (289): F1 mean 0.872 / p10 0.725 / p50 0.878 / p90 1.0; number-recall 0.689.
+- FRESH-synth (150, unmemorizable): F1 mean 0.932 / p10 0.783 / p50 1.0 / p90 1.0;
+  number-recall 0.881.
+- MEMORIZATION CONFOUND CLEARED: fresh > gsm8k (0.93 vs 0.87), the OPPOSITE of
+  what memorization-flattering would predict. Fresh is higher because synthetic
+  steps are structurally simpler, not because gsm8k was memorized. Render
+  fidelity is real.
+- EOS fix confirmed: F1 0.47 (artifact-depressed) -> 0.87/0.93. p50 fresh = 1.0
+  (half of fresh steps reconstructed EXACTLY). The repetition WAS the whole gap.
+- NUMBERS are the lossy part, as thesis predicts: number-recall (0.69/0.88) sits
+  BELOW overall F1 (0.87/0.93) — meaning/structure reconstructs great, exact
+  digits drift. The ledger's job is now precisely quantified.
+- RENDER LANE: validated. Next = ledger A/B (core built: extract_ledger +
+  ledger_render_nll) — train render WITH the visible number ledger, target
+  number-recall -> ~1.0 vs the 0.689/0.881 baseline.
