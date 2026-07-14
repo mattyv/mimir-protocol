@@ -204,6 +204,22 @@ def main() -> None:
             if step >= args.steps:
                 break
 
+    # ── push the WEIGHTS immediately after training, BEFORE the (long) eval ──
+    # A 4h run once died at the timeout during eval and the trained adapter died
+    # with the node (nothing pushes until the end). Weights first, durably;
+    # manifest follows after eval.
+    if args.out_repo:
+        from pathlib import Path  # noqa: PLC0415
+
+        from huggingface_hub import upload_folder  # noqa: PLC0415
+
+        d0 = Path("/tmp/render_out")  # noqa: S108
+        d0.mkdir(parents=True, exist_ok=True)
+        pm.save_pretrained(str(d0), selected_adapters=["render"])
+        sub0 = "render_adapter_ledger" if args.ledger else "render_adapter"
+        upload_folder(repo_id=args.out_repo, folder_path=str(d0), path_in_repo=sub0)
+        print(f"[WEIGHTS PUSHED EARLY] {args.out_repo}/{sub0}", flush=True)
+
     # ── eval: reconstruction quality, beyond averages ────────────────────────
     import random  # noqa: PLC0415
 
