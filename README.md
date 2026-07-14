@@ -33,6 +33,8 @@ next thought and **render** any thought back to faithful text. The bet is memory
 
 → **[docs/latent-thought-prediction.md](docs/latent-thought-prediction.md)** —
 pipeline diagrams, results, plan docs.
+&nbsp;·&nbsp; **[Predictor anatomy →](docs/predictor-anatomy.md)** — a diagram of
+the next-thought predictor's forward pass.
 
 ## Two words we use precisely
 
