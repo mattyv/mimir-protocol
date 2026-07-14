@@ -15,6 +15,7 @@ Last verified: 2026-07-14 (loaded, shapes checked, all tensors finite).
 | **Reasoning predictor** | `stage2_cot_openr1/predictor.pt` | 84 MB | the next-thought predictor everything downstream uses (d_model 384, d 3584, k 8, 4 layers). Trained on OpenR1 CoT. |
 | Prose predictor | `stage2_predictor/predictor.pt` | 84 MB | the earlier web/prose next-thought predictor |
 | **Bridge** | `bridge/bridge.pt` | 67 MB | predicted-thought → injectable KV (width 512, noise-trained, val-gated — the validated `bridge_pred 0.62` run) |
+| Bridge (frozen copy) | `bridge_validated/bridge.pt` | 67 MB | immutable copy of the validated 0.62 bridge — future bridge training can't clobber it |
 | **Gist encoder (LoRA)** | `checkpoints/step-000200 … 016000/` | 0.16 MB/step ×21 | the Stage-1 gist adapter (`adapter_model.safetensors` + `gist.safetensors`). Step **16000** is the one loaded by `_load_stage1`. |
 | Render decoder (LoRA) | `render_adapter/render/adapter_model.safetensors` | 162 MB | thought → text reconstruction adapter |
 | Render + ledger (LoRA) | `render_adapter_ledger/render/adapter_model.safetensors` | 162 MB | render adapter trained with the literals ledger (the validated F1 0.99 / numbers 100% run) |

@@ -166,6 +166,13 @@ chaining — now measured precisely: usable depth ≈ 2, harmful by ≈ 6. The
 confidence gate was meant to catch exactly this and is dead, so open-loop
 chaining is not viable.
 
+(Fable review caveat — two causes conflated: the bridge was trained to tolerate
+inputs at cos ~0.89 from clean (noise 0.5); by d3 the chained thought sits at
+cos ~0.6, far outside that ball, so part of the cliff may be BRIDGE brittleness
+on out-of-ball inputs rather than prediction drift alone. A heavier-noise bridge
+might chain somewhat deeper; doesn't rescue open-loop, but don't cite
+"prediction drift" as the sole cause.)
+
 NOT purely negative — the reframe the numbers point to:
 - Teacher-forced staying at 0.65 means a real step RESETS the drift. So latent
   reasoning works in SHORT BURSTS between real anchors: take 1-2 cheap latent
@@ -178,6 +185,19 @@ NOT purely negative — the reframe the numbers point to:
   accuracy. Otherwise the render lane stays the headline deliverable and the
   latent-prediction thread closes with: substrate works single-step (0.62),
   chaining drifts (~2 steps), speed upside is bounded to short bursts.
+
+Pre-registered design for the burst test (Fable review — without these arms it
+proves nothing). Two untested assumptions it must cover: MIXED real/latent
+history (rollout only measured all-real vs all-predicted) and free GENERATION
+from injected predicted thoughts (everything so far is teacher-forced NLL):
+1. plain full generation (baseline to beat on wall-clock at equal accuracy)
+2. burst with TRUE thoughts injected (ceiling — does the schedule work at all)
+3. burst with PREDICTED thoughts (the test)
+4. burst with NO injection, steps just skipped (killer control: if ~= arm 3,
+   the predictor contributes nothing and the win is model robustness)
+Metric: final-answer accuracy + wall-clock. NOT NLL. One run, then close the
+thread either way. (Validated 0.62 bridge frozen at HF bridge_validated/ so
+burst work can't clobber it.)
 
 ## Non-goals / open
 
