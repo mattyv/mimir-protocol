@@ -131,6 +131,54 @@ measure drift over multiple latent steps (the real fast-lane test, now with a
 substrate that works); (b) render a predicted thought to text and READ it;
 (c) end-to-end task accuracy with always-inject (no gate).
 
+## ROLLOUT RESULT (2026-07-14): open-loop latent chaining drifts after ~2 steps
+
+The real fast-lane test. Free-run the predictor on its OWN outputs from a 2-step
+real prefix; at each rollout depth inject the predicted thought and score
+gap_closed on the true next step, vs a teacher-forced control (predict from TRUE
+history). 508 held-out docs, n=441 (depth 1) tapering to 85 (depth 12).
+
+| depth | free (chained) | teacher-forced | shuffled floor | free_cos |
+|---|---|---|---|---|
+| 1 | 0.56 | 0.56 | 0.19 | 0.67 |
+| 2 | 0.48 | 0.62 | 0.37 | 0.65 |
+| 3 | 0.19 | 0.60 | 0.19 | 0.62 |
+| 4 | 0.13 | 0.63 | 0.21 | 0.58 |
+| 6 | −0.06 | 0.64 | 0.27 | 0.56 |
+| 9 | −0.43 | 0.74 | 0.50 | 0.50 |
+| 12 | −3.37 | 0.68 | 0.47 | 0.47 |
+
+Read:
+- **Teacher-forced holds flat at ~0.6-0.7 across ALL depths.** The
+  predictor+bridge substrate is solid at every step — repeated single-step
+  prediction never degrades. So the failure below is the CHAINING, not the
+  pieces.
+- **Free-running collapses fast.** d1 = 0.56 (== tf by construction, all-real
+  history), still 0.48 at d2, but by **d3 it's 0.19 — down at the shuffled
+  floor** (0.19), i.e. a chained thought is already no better than a random one.
+  By **d6 it goes NEGATIVE** (−0.06): injecting the drifted thought is worse than
+  injecting nothing. free_cos decays smoothly (0.67→0.47) — the drift is gradual
+  in geometry but injection amplifies "slightly wrong" into "harmful".
+
+**Verdict: open-loop latent reasoning survives ~2 steps, then drifts off the
+manifold.** This is the "errors compound" failure this plan predicted for naive
+chaining — now measured precisely: usable depth ≈ 2, harmful by ≈ 6. The
+confidence gate was meant to catch exactly this and is dead, so open-loop
+chaining is not viable.
+
+NOT purely negative — the reframe the numbers point to:
+- Teacher-forced staying at 0.65 means a real step RESETS the drift. So latent
+  reasoning works in SHORT BURSTS between real anchors: take 1-2 cheap latent
+  steps, then decode+re-encode one real step to re-anchor, repeat. The speed
+  story shrinks from "reason entirely in latent space" to "skip 1-2 big-model
+  steps at a time" — still a real (if modest) win, and it needs no confidence
+  gate.
+- Next test if pursued: the anchored-burst schedule (k latent, 1 real, k latent,
+  …) end-to-end vs plain generation — measure wall-clock and final-answer
+  accuracy. Otherwise the render lane stays the headline deliverable and the
+  latent-prediction thread closes with: substrate works single-step (0.62),
+  chaining drifts (~2 steps), speed upside is bounded to short bursts.
+
 ## Non-goals / open
 
 Diffusion thought-sampler (only if regression head plateaus — it has: top-1 0.30
