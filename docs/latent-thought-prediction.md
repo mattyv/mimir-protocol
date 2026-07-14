@@ -25,6 +25,7 @@ flowchart LR
 
 - **Encoder** — squeezes a sentence/step into ~8 key–value slots (a "thought").
 - **Predictor** — a small model that guesses the *next* thought from prior ones.
+  Full breakdown: [predictor-anatomy.md](predictor-anatomy.md).
 - **Render decoder** — turns a thought back into its exact text, on demand.
 - **Literals ledger** — the exact numbers/names kept verbatim beside the thought
   (compression is lossy on precise digits; the ledger keeps them deterministic).
