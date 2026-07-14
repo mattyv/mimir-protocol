@@ -34,7 +34,14 @@ import time
 
 import torch
 
-from marker.burst import answers_match, extract_answer, make_schedule, rope_shift_keys, rope_theta
+from marker.burst import (
+    GSM8K_FEWSHOT,
+    answers_match,
+    extract_answer,
+    make_schedule,
+    rope_shift_keys,
+    rope_theta,
+)
 from marker.predictor import NextThoughtPredictor
 from marker.rollout import rollout
 
@@ -93,7 +100,7 @@ def main() -> None:  # noqa: PLR0915
     ap.add_argument("--window", type=int, default=8)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--max-step-toks", type=int, default=40)
-    ap.add_argument("--max-answer-toks", type=int, default=48)
+    ap.add_argument("--max-answer-toks", type=int, default=12)  # '#### ' primed: number + newline
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -193,7 +200,9 @@ def main() -> None:  # noqa: PLR0915
 
     @torch.no_grad()
     def _run(question, ref_steps, arm):  # noqa: ANN001, PLR0912
-        prompt = f"Question: {question}\nAnswer:\n"
+        # 2-shot demonstrations pin the line-per-step + '#### x' format a BASE
+        # model won't produce zero-shot (first run: plain acc 0.044, void)
+        prompt = f"{GSM8K_FEWSHOT}Question: {question}\nAnswer:\n"
         ids = tok(prompt, add_special_tokens=False).input_ids
         cache, pos, logits = _prefill(pm, ids)
         sched = make_schedule(len(ref_steps), args.anchor_every)
@@ -238,6 +247,18 @@ def main() -> None:  # noqa: PLR0915
                     use_cache=True,
                 )
                 cache, pos, logits, fwd = out.past_key_values, pos + 1, out.logits[0, -1], fwd + 1
+        # force-prime '#### ' so the final answer decode is format-independent
+        # and identical across arms (extraction never depends on the model
+        # choosing to emit the marker)
+        hash_ids = tok("#### ", add_special_tokens=False).input_ids
+        out = pm(
+            torch.tensor([hash_ids], device=device),
+            past_key_values=cache,
+            position_ids=torch.arange(pos, pos + len(hash_ids), device=device).unsqueeze(0),
+            use_cache=True,
+        )
+        cache, pos, logits = out.past_key_values, pos + len(hash_ids), out.logits[0, -1]
+        fwd += 1
         ans_toks, _, _, _ = _decode_step(pm, cache, pos, logits, nl_id, args.max_answer_toks)
         fwd += len(ans_toks)
         return tok.decode(ans_toks), decoded, fwd, cap

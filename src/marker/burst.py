@@ -17,6 +17,25 @@ import torch
 
 _ANS = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
+# 2-shot prompt (GSM8K TRAIN examples — test problems never appear here). A BASE
+# model has no instruction-following: without demonstrations it rambles past the
+# per-line step format the burst schedule depends on (first burst run: plain acc
+# 0.044, cap_rate 4.07 — every step-decode hit the token cap; the whole run was
+# void). The examples pin the format: one step per line, then '#### <answer>'.
+GSM8K_FEWSHOT = (
+    "Question: Natalia sold clips to 48 of her friends in April, and then she "
+    "sold half as many clips in May. How many clips did Natalia sell altogether "
+    "in April and May?\nAnswer:\n"
+    "Natalia sold 48 / 2 = 24 clips in May.\n"
+    "Natalia sold 48 + 24 = 72 clips altogether in April and May.\n"
+    "#### 72\n\n"
+    "Question: Weng earns $12 an hour for babysitting. Yesterday, she just did "
+    "50 minutes of babysitting. How much did she earn?\nAnswer:\n"
+    "Weng earns 12 / 60 = $0.2 per minute.\n"
+    "Working 50 minutes, she earned 0.2 x 50 = $10.\n"
+    "#### 10\n\n"
+)
+
 
 def rope_theta(config) -> float:  # noqa: ANN001
     """The model's RoPE base frequency, wherever it lives. Qwen2.5-7B has it
