@@ -17,7 +17,8 @@ SUBDIR="${SUBDIR:-stage2_cot_openr1}"            # predictor
 BRIDGESUB="${BRIDGESUB:-bridge_validated}"      # the frozen 0.62 bridge
 DATASET="${DATASET:-openai/gsm8k}"              # checkable numeric answers
 NPROB="${NPROB:-120}"
-
+MINSTEPS="${MINSTEPS:-0}"                        # >0 = filter to the hardest problems
+MCAP="${MCAP:-4}"
 WINDOW="${WINDOW:-8}"
 TIMEOUT="${TIMEOUT:-150m}"
 
@@ -62,12 +63,12 @@ python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get
 echo "=== download ${MODEL} (authenticated, 20min cap) ==="
 timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2 \
   || { kill \$HB; echo "SETUPFAIL (download too slow)"; echo "ALLDONE"; exit 1; }
-echo "=== FRONTLOAD (subdir=${SUBDIR} bridge=${BRIDGESUB} dataset=${DATASET} nprob=${NPROB} window=${WINDOW}) ==="
+echo "=== FRONTLOAD (dataset=${DATASET} nprob=${NPROB} min_steps=${MINSTEPS} m_cap=${MCAP} window=${WINDOW}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_frontload \
   --model-name ${MODEL} --repo ${REPO} \
   --artifacts-repo ${REPO} --subdir ${SUBDIR} --bridge-subdir ${BRIDGESUB} --out-repo ${REPO} \
   --dataset ${DATASET} --window ${WINDOW} \
-  --n-problems ${NPROB} 2>&1 | tee /root/frontload.log
+  --n-problems ${NPROB} --min-ref-steps ${MINSTEPS} --m-cap ${MCAP} 2>&1 | tee /root/frontload.log
 echo "FRONTLOAD_RC=\${PIPESTATUS[0]}" | tee -a /root/frontload.log
 kill \$HB 2>/dev/null
 echo "ALLDONE" | tee -a /root/frontload.log
