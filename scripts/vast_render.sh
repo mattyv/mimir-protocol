@@ -57,10 +57,10 @@ python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get
 echo "=== download ${MODEL} (authenticated, 20min cap) ==="
 timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2 \
   || { kill \$HB; echo "SETUPFAIL (download too slow)"; echo "ALLDONE"; exit 1; }
-echo "=== run: render training (ndocs=${NDOCS} steps=${STEPS}) ==="
+echo "=== run: render training (ndocs=${NDOCS} steps=${STEPS} ledger=${LEDGER:-}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_render \
   --model-name ${MODEL} --repo ${REPO} --out-repo ${REPO} --dataset ${DATASET} --unit ${UNIT} \
-  --n-docs ${NDOCS} --steps ${STEPS} 2>&1 | tee /root/render.log
+  --n-docs ${NDOCS} --steps ${STEPS} ${LEDGER:+--ledger} 2>&1 | tee /root/render.log
 kill \$HB 2>/dev/null
 echo "RENDER_RC=\${PIPESTATUS[0]}" | tee -a /root/render.log
 echo "ALLDONE" | tee -a /root/render.log
