@@ -28,6 +28,7 @@ from marker.gist_model import attach_gist, encode_gist, to_leaf_param
 from marker.predictor import (
     NextThoughtPredictor,
     info_nce_loss,
+    info_nce_within,
     prediction_diversity,
     recall_at_k,
     regression_loss,
@@ -166,10 +167,21 @@ def _doc_sentence_spans(tok, text, max_span, max_sents, unit="sentence"):  # noq
 
 @torch.no_grad()
 def encode_corpus(
-    pm, gist, tok, docs_text, max_span, max_sents, min_sents, device, unit="sentence"
+    pm,
+    gist,
+    tok,
+    docs_text,
+    max_span,
+    max_sents,
+    min_sents,
+    device,
+    unit="sentence",
+    questions=None,
 ):  # noqa: ANN001
     """Each document -> a gist sequence [n_sents, k, hidden] (encode every
-    unit). Returns a list of per-document sequences (>= min_sents long)."""
+    unit). Returns a list of per-document sequences (>= min_sents long).
+    With `questions` (v2): each kept doc's QUESTION is encoded as one extra
+    thought and prepended as row 0 (the _windows_q convention)."""
     seqs = []
     for i, text in enumerate(docs_text):
         spans = _doc_sentence_spans(tok, text, max_span, max_sents, unit)
@@ -177,7 +189,12 @@ def encode_corpus(
             continue
         # encode sentence-by-sentence (variable span lengths -> one at a time)
         slots = [encode_gist(pm, gist, [sp]).float()[0] for sp in spans]  # each [k, hidden]
-        seqs.append(torch.stack(slots).cpu())  # [n_sents, k, hidden]
+        if questions is not None:
+            q_ids = tok(questions[i], add_special_tokens=False).input_ids[: max_span * 2]
+            if len(q_ids) < 2:
+                continue
+            slots.insert(0, encode_gist(pm, gist, [q_ids]).float()[0])
+        seqs.append(torch.stack(slots).cpu())  # [(1+)n_sents, k, hidden]
         if (i + 1) % 50 == 0:
             print(f"    ...encoded {i + 1} docs, {len(seqs)} kept", flush=True)
     return seqs
@@ -197,12 +214,37 @@ def _windows(seq, length, stride=None):  # noqa: ANN001
     return [seq[i : i + length] for i in range(0, len(seq) - length + 1, stride)]
 
 
-def _batches(seqs, length, batch, whitener, seed=0):  # noqa: ANN001
+def _windows_q(seq, length, stride=None):  # noqa: ANN001
+    """Question-conditioned windows: row 0 of `seq` is the QUESTION's thought
+    (v2 convention), rows 1.. are the steps. Every window carries the question
+    as its own row 0: [q, s_i..s_{i+L-1}], step rows non-overlapping (same
+    duplicate-target reasoning as _windows). The v1 predictor never saw the
+    problem it was predicting steps for — this is the fix."""
+    import torch as _t  # noqa: PLC0415
+
+    if stride is None:
+        stride = length
+    return [
+        _t.cat([seq[0:1], seq[i : i + length]]) for i in range(1, len(seq) - length + 1, stride)
+    ]
+
+
+def qwin_slices(out, wz):  # noqa: ANN001
+    """Align predictions/targets for a question-carrying window. Window rows
+    [q, s_i.., s_j]; model output index m = readout at row m predicting row m+1.
+    Index 0 (question -> first step of the window) is ill-posed for mid-doc
+    windows (it asks for step i from the question alone), so keep outputs 1..
+    predicting rows 2.. Returns (pred_use, tgt_use), both [B, L-1, k, d]."""
+    return out[:, 1:], wz[:, 2:]
+
+
+def _batches(seqs, length, batch, whitener, seed=0, with_q=False):  # noqa: ANN001
     """Shuffled whitened training batches. `seed` should vary per epoch so the
     batch composition (= the InfoNCE negative sets) varies across epochs; a
     local Generator keeps the global RNG stream untouched (a fixed
     manual_seed(0) here froze both the order AND the dropout masks)."""
-    wins = [w for s in seqs for w in _windows(s, length)]
+    winf = _windows_q if with_q else _windows
+    wins = [w for s in seqs for w in winf(s, length)]
     g = torch.Generator()
     g.manual_seed(seed)
     order = torch.randperm(len(wins), generator=g)
@@ -306,17 +348,20 @@ def _eval_smoke(device):  # noqa: ANN001
 
 
 @torch.no_grad()
-def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
+def evaluate(model, seqs, length, whitener, device, with_q=False):  # noqa: ANN001
     """Retrieval eval, three pools: recall@5 over ALL eval targets (hardest,
     context), recall@5_128 over true+127 seeded decoys (THE gate-comparable
     number), recall@5_doc over same-doc targets only (the topic-shortcut
     control — succession signal, not document identification). tgt_sim = mean
     pairwise target similarity, the platitude-gate reference for diversity.
     Runs in eval mode (no_grad does NOT disable dropout), restores the caller's
-    mode; duplicate targets (cross-doc boilerplate) deduped before recall."""
+    mode; duplicate targets (cross-doc boilerplate) deduped before recall.
+    with_q (v2): windows carry the question as row 0; the ill-posed q->step
+    output is dropped (qwin_slices), so pairs-per-window stays length-1."""
+    winf = _windows_q if with_q else _windows
     wins, win_doc = [], []
     for di, s in enumerate(seqs):
-        for w in _windows(s, length):
+        for w in winf(s, length):
             wins.append(w)
             win_doc.append(di)
     if not wins:
@@ -329,11 +374,13 @@ def evaluate(model, seqs, length, whitener, device):  # noqa: ANN001
         b, ln, k, d = stack.shape
         wz = whitener.transform(stack.reshape(b * ln, k, d)).reshape(b, ln, k, d).to(device)
         pred = model(wz)
-        preds.append(model.pool(pred).reshape(-1, model.pool_proj.out_features))
-        tgts.append(model.pool(wz[:, 1:]).reshape(-1, model.pool_proj.out_features))
+        pu, tu = qwin_slices(pred, wz) if with_q else (pred, wz[:, 1:])
+        preds.append(model.pool(pu).reshape(-1, model.pool_proj.out_features))
+        tgts.append(model.pool(tu).reshape(-1, model.pool_proj.out_features))
     model.train(was_training)
     p, t = torch.cat(preds), torch.cat(tgts)
     # each window contributes length-1 (pred, target) pairs, all from its doc
+    # (with_q: length+1 rows -> length outputs -> length-1 kept after the drop)
     doc = torch.tensor(win_doc, device=t.device).repeat_interleave(length - 1)
     keep = _dedup_keep_idx(t)
     dropped = t.shape[0] - keep.shape[0]
@@ -394,6 +441,19 @@ def main() -> None:
     ap.add_argument("--d-model", type=int, default=640)
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument(
+        "--with-question",
+        action="store_true",
+        help="v2: prepend the problem's own thought as row 0 of every window — "
+        "v1 predicted steps without ever seeing the question",
+    )
+    ap.add_argument(
+        "--hard-neg",
+        type=float,
+        default=0.0,
+        help="v2: weight of the within-window hard-negative InfoNCE (same-doc "
+        "sibling steps — the candidates recall@1_doc actually asks it to beat)",
+    )
+    ap.add_argument(
         "--whiten",
         choices=["off", "shrunk", "zca"],
         default="off",
@@ -429,7 +489,21 @@ def main() -> None:
     pm, gist, tok = _load_stage1(args.model_name, args.repo, device, quantize)
 
     # ── encode corpus into gist sequences ────────────────────────────────────
-    if args.smoke:
+    questions = None
+    if args.with_question:
+        if args.corpus != "cot":
+            raise SystemExit("--with-question needs a cot dataset (question/solution pairs)")
+        if args.smoke:
+            sols = _smoke_cot_texts(args.n_docs)
+            qa = [
+                (f"Apply the operations to the starting items ({i}).", s)
+                for i, s in enumerate(sols)
+            ]
+        else:
+            qa = list(_doc_texts_qa(args.n_docs, args.dataset, args.dataset_config))
+        questions = [q for q, _ in qa]
+        docs_text = [s for _, s in qa]
+    elif args.smoke:
         docs_text = (
             _smoke_cot_texts(args.n_docs) if args.corpus == "cot" else _smoke_texts(args.n_docs)
         )
@@ -438,7 +512,16 @@ def main() -> None:
             _doc_texts(args.n_docs, args.corpus, args.dataset, args.dataset_config, args.text_field)
         )
     seqs = encode_corpus(
-        pm, gist, tok, docs_text[: args.n_docs], max_span, max_sents, min_sents, device, unit
+        pm,
+        gist,
+        tok,
+        docs_text[: args.n_docs],
+        max_span,
+        max_sents,
+        min_sents,
+        device,
+        unit,
+        questions=questions,
     )
     print(f"encoded {len(seqs)} gist sequences", flush=True)
     # document-disjoint split
@@ -471,19 +554,33 @@ def main() -> None:
     step, epoch = 0, 0
     best, best_state = {}, None
     while step < args.steps:
-        for wz in _batches(train_seqs, args.window, 8 if args.smoke else 64, whitener, seed=epoch):
+        for wz in _batches(
+            train_seqs,
+            args.window,
+            8 if args.smoke else 64,
+            whitener,
+            seed=epoch,
+            with_q=args.with_question,
+        ):
             wz = wz.to(device)
-            pred = model(wz)
-            tgt = wz[:, 1:]
+            out = model(wz)
+            pred, tgt = qwin_slices(out, wz) if args.with_question else (out, wz[:, 1:])
             pp = model.pool(pred).reshape(-1, model.pool_proj.out_features)
             tp = model.pool(tgt).reshape(-1, model.pool_proj.out_features)
             loss = 0.1 * regression_loss(pred, tgt) + info_nce_loss(pp, tp)
+            if args.hard_neg > 0:
+                # same-window sibling steps as isolated hard negatives
+                ppw = model.pool(pred)  # [B, L-1, d_model]
+                tpw = model.pool(tgt)
+                loss = loss + args.hard_neg * info_nce_within(ppw, tpw)
             opt.zero_grad()
             loss.backward()
             opt.step()
             step += 1
             if step % (20 if args.smoke else args.eval_every) == 0:
-                ev = evaluate(model, eval_seqs, args.window, whitener, device)
+                ev = evaluate(
+                    model, eval_seqs, args.window, whitener, device, with_q=args.with_question
+                )
                 print(f"[step {step}] loss {loss.item():.4f}  eval {ev}", flush=True)
                 # gate reads the BEST eval checkpoint (pre-registered before
                 # launch). Keyed on recall@1_doc — the within-doc succession
@@ -501,7 +598,7 @@ def main() -> None:
                 break
         epoch += 1
 
-    ev = evaluate(model, eval_seqs, args.window, whitener, device)
+    ev = evaluate(model, eval_seqs, args.window, whitener, device, with_q=args.with_question)
     fkey = (ev.get("recall@1_doc", -1.0), ev.get("recall@5_128", -1.0))
     if fkey > (best.get("recall@1_doc", -1.0), best.get("recall@5_128", -1.0)):
         best = {**ev, "step": step}
@@ -523,9 +620,40 @@ def main() -> None:
             model,
             whitener,
             args.out_repo,
-            {"best": best, "final": ev, "whiten": args.whiten, "corpus": args.corpus, "unit": unit},
+            {
+                "best": best,
+                "final": ev,
+                "whiten": args.whiten,
+                "corpus": args.corpus,
+                "unit": unit,
+                # provenance (Fable held-out review: overlap must be checkable)
+                "dataset": args.dataset,
+                "n_docs": args.n_docs,
+                "window": args.window,
+                "with_question": args.with_question,
+                "hard_neg": args.hard_neg,
+                "d_model": args.d_model,
+                "layers": args.layers,
+            },
             args.out_subdir,
         )
+
+
+def _doc_texts_qa(n, dataset=None, config=None, qfield=None, afield=None):  # noqa: ANN001
+    """Stream n (question, solution) PAIRS from a cot dataset — the v2
+    question-conditioning path. Defaults: gsm8k question/answer; other datasets
+    problem/solution (OpenR1 layout)."""
+    from datasets import load_dataset  # noqa: PLC0415
+
+    name = dataset or "openai/gsm8k"
+    cfg = config if config is not None else ("main" if name == "openai/gsm8k" else None)
+    ds = load_dataset(name, cfg, split="train", streaming=True)
+    qf = qfield or ("question" if name == "openai/gsm8k" else "problem")
+    af = afield or ("answer" if name == "openai/gsm8k" else "solution")
+    for seen, row in enumerate(ds):
+        yield (row.get(qf) or "", row.get(af) or "")
+        if seen + 1 >= n:
+            break
 
 
 def _doc_texts(n, corpus="web", dataset=None, config=None, field=None):  # noqa: ANN001

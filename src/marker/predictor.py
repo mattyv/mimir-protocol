@@ -111,6 +111,20 @@ def info_nce_loss(
     return F.cross_entropy(logits, labels)
 
 
+def info_nce_within(pred_pool: torch.Tensor, tgt_pool: torch.Tensor, temp: float = 0.07):
+    """Hard-negative InfoNCE: each prediction must rank its own target above the
+    OTHER TARGETS OF ITS OWN WINDOW (same document, adjacent steps — the
+    candidates the within-doc top-1 metric actually asks it to beat). The
+    standard in-batch InfoNCE drowns these few hard negatives in hundreds of
+    easy cross-doc ones; this term isolates them. [B, L, d] pooled projections;
+    per-window softmax over the L candidates."""
+    p = F.normalize(pred_pool, dim=-1)
+    t = F.normalize(tgt_pool, dim=-1)
+    logits = torch.einsum("bld,bmd->blm", p, t) / temp  # [B, L, L]
+    labels = torch.arange(p.shape[1], device=p.device).expand(p.shape[0], -1)
+    return F.cross_entropy(logits.reshape(-1, p.shape[1]), labels.reshape(-1))
+
+
 # ── metrics (model-free) ────────────────────────────────────────────────────────
 
 
