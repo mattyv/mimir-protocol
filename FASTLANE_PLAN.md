@@ -315,6 +315,39 @@ it). This separates gist-capacity from reader-capacity before any retrain spend;
 the retrain is NOT a clean discriminator in either direction. Also patch
 run_frontload to log per-problem {pid, arm, correct} for paired stats.
 
+### GISTPROBE RESULT (2026-07-14): READER-limited. The gist holds the structure.
+
+397 context steps (256 hard / 141 easy), true-gist vs wrong-gist:
+
+| | hard true | hard wrong | easy true | easy wrong |
+|---|---|---|---|---|
+| token F1 | 0.894 | 0.536 | 0.891 | 0.535 |
+| number recall | 0.958 | 0.801 | 0.950 | 0.795 |
+| relations exact | 0.636 | 0.159 | 0.697 | 0.066 |
+| op-sequence match | 0.807 | 0.250 | 0.816 | 0.158 |
+| struct-NLL (non-digit tokens) | **0.394** | **4.482** | 0.319 | 4.811 |
+
+Verdict per the pre-registered grid:
+1. **The relational structure IS in the 8-slot gist** — the 11x struct-NLL
+   contrast (0.39 vs 4.48) is the direct, generation-free measurement. The
+   WEB-trained encoder packs math relations into 8 slots recoverably. The
+   "not enough data in the gist" hypothesis is REFUTED (as is my earlier
+   "gist fidelity is the binding constraint").
+2. **The READER is the wall** — it *recognizes* the correct structure (NLL
+   0.39) but greedily *writes* only ~64-70% of relations exactly. Per Fable's
+   compounding math, rel~0.64 over m~4 context steps predicts almost exactly
+   the observed reconstitute tie (0.49 vs 0.73 text).
+3. **No hard-easy cliff** (0.64 vs 0.70; NLL 0.39 vs 0.32) — the failure is
+   difficulty-independent reader imprecision, not hard-step anything.
+4. Wrong-gist F1 0.54 confirms Fable's metric critique: the ledger+first-token
+   crutch alone buys half the F1 — token-F1 was never a structure metric.
+
+Fix indicated: READER retrain (scale: 800->4000 docs, 2000->6000 steps — the
+reader saw only ~2000 training examples). Pre-registered targets: relations
+exact 0.64 -> >=0.85 on this probe, then rerun reconstitute expecting
+gist_render 0.49 -> ~0.65+. The k=16 / CoT-encoder retrains are NOT justified
+by this evidence.
+
 **Standing conclusion for the thread: compressed thoughts are validated for
 LIKELIHOOD (memory/compression: the ladder) and for RECONSTRUCTION (render
 lane), but not as generation-time context in this configuration. Predictor
