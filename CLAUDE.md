@@ -9,6 +9,24 @@ Write the test first. Watch it fail. Make it pass. Refactor.
 - Don't write production code without a test pinning the behaviour you want, unless it's pure plumbing (imports, config dicts, hook registration that has no logic to assert on). When in doubt, write the test.
 - For mech-interp work specifically: tests assert mechanical invariants (zero-vec inject is a no-op, target tokens are single BPE tokens, hook fires at the configured layer), not numerical outcomes of the experiment itself. The experiment results live in plots/artifacts, not assertions.
 
+## Hardware sizing (Vast launches)
+
+Before launching a GPU run, size BOTH the GPU and the host RAM against the run's
+actual footprint — the offer search must filter for what the job needs, or it
+silently rents an underspec box that OOMs mid-run (a wasted node + wasted spend).
+
+- **CPU RAM is a first-class requirement, not an afterthought.** The gist store
+  (docs × sents × k × d × dtype) plus window materialization (`_windows`/
+  `_windows_q`) lives in host RAM, not VRAM. Estimate peak before launch:
+  fp32 gist store ≈ n_docs × sents × k × 3584 × 4 bytes; add the window list
+  (a `cat`-copy in `_windows_q`) on top. Put a `cpu_ram>=<GB*1024>` clause in the
+  `vastai search offers` query sized to that peak (2000 docs ≈ 4GB, 8000 ≈ ~27GB).
+- **VRAM:** the frozen 7B in 4-bit ≈ 6GB + activations; `gpu_ram>=23` (a 3090)
+  is the standing floor. Bump for bigger models or long-context generation.
+- **Disk:** `disk_space>=100` for the model download + HF cache.
+- If a run OOMs or the box is underspec, that's a sizing bug in the launcher —
+  fix the query, don't just relaunch and hope for a bigger random box.
+
 ## Ruff
 
 `ruff check` and `ruff format` are the lint/format authority.

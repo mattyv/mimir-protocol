@@ -78,6 +78,13 @@ def main() -> None:  # noqa: PLR0915
     ap.add_argument("--dataset", default="openai/gsm8k")
     ap.add_argument("--n-problems", type=int, default=120)
     ap.add_argument("--m-cap", type=int, default=4)
+    ap.add_argument(
+        "--min-ref-steps",
+        type=int,
+        default=0,
+        help="keep only problems with >= this many reference steps (harder; "
+        "0 = no filter). Streams more of the test split to fill n-problems.",
+    )
     ap.add_argument("--window", type=int, default=8)
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--max-span", type=int, default=64)
@@ -152,11 +159,18 @@ def main() -> None:  # noqa: PLR0915
     else:
         from datasets import load_dataset  # noqa: PLC0415
 
+        from marker.reason_check import split_solution_steps as _sss  # noqa: PLC0415
+
         ds = load_dataset(args.dataset, "main", split="test", streaming=True)
         probs = []
         for row in ds:
             if len(probs) >= args.n_problems:
                 break
+            # --min-ref-steps filters to the HARDEST problems (more reasoning
+            # steps = lower solve-alone accuracy = more headroom for injected
+            # context — the one config where thoughts-as-context could still help)
+            if args.min_ref_steps and len(_sss(row["answer"])) < args.min_ref_steps:
+                continue
             probs.append((row["question"], extract_answer(row["answer"]), row["answer"]))
 
     def _shift(akv, delta):  # noqa: ANN001
@@ -214,11 +228,14 @@ def main() -> None:  # noqa: PLR0915
 
     agg = {a: {"correct": 0, "toks": 0, "n": 0, "secs": 0.0} for a in ARMS}
     samples = []
+    step_counts, m_counts = [], []
     for pi, (q, gold, ref) in enumerate(probs):
         steps = split_solution_steps(ref)
         if len(steps) < 3:
             continue
         m = context_split(len(steps), args.m_cap)
+        step_counts.append(len(steps))
+        m_counts.append(m)
         for a in ARMS:
             t0 = time.time()
             text, ntok = _run(q, steps, m, a)
@@ -242,7 +259,16 @@ def main() -> None:  # noqa: PLR0915
         if (pi + 1) % 20 == 0:
             print(f"  ...{pi + 1} problems", flush=True)
 
-    manifest = {"m_cap": args.m_cap, "n_problems": args.n_problems, "samples": samples, "arms": {}}
+    mean = lambda xs: round(sum(xs) / len(xs), 2) if xs else None  # noqa: E731
+    manifest = {
+        "m_cap": args.m_cap,
+        "min_ref_steps": args.min_ref_steps,
+        "n_problems": args.n_problems,
+        "mean_ref_steps": mean(step_counts),
+        "mean_context_m": mean(m_counts),
+        "samples": samples,
+        "arms": {},
+    }
     print("\n[FRONTLOAD] arm          acc    gen_toks   mean_s", flush=True)
     for a in ARMS:
         g = agg[a]
