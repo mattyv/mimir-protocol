@@ -276,25 +276,44 @@ transcription with the adapter off. Prediction: recovers to ~= the text arm.
 1. **The reader interface CURES the harm completely**: 0.11 -> 0.49 (+38 pts).
    Making the content legible eliminates the premature-wrap-up poisoning. Raw
    injection was indeed the wrong interface — that part of the prediction held.
-2. **But it recovers zero net value over solving alone** (0.492 == none 0.492,
-   vs the 0.73 text ceiling). The transcripts show why: reconstructions of
-   HARD steps keep the digits (ledger) and the topic frame but degrade the
-   RELATIONS — sample p1 turned "1.5h walking at 4mph + running twice as far"
-   into "run 4*6=24" (right numbers, wrong structure), flipping the answer.
-   Where transcription was faithful (p0) the model scored like the text arm;
-   where it wasn't, it got misled — netting exactly zero.
-3. **The BS-call lands where it counts**: render's F1 0.93-0.99 was measured on
-   EASY (gsm8k-train-style, ~800-doc training) steps. On 7+-step problems'
-   longer steps, 8-slot-gist+ledger fidelity drops enough that relation errors
-   compound through the reasoning chain. At the hard end, gist fidelity IS the
-   binding constraint.
+2. **No DETECTABLE value at n=63** (0.492 == none 0.492 by coincidence of
+   31/63; the honest CI on gist_render−none is ~±12-17pts, so anywhere from
+   mild help to mild harm). "Zero net value" was an overclaim on a point
+   estimate — corrected (Fable reconstitute review).
 
-Next decision (cheap -> expensive): (a) retrain the RENDER READER on hard/long
-steps (~$2-3, existing harness, different data) and rerun gist_render — if a
-better reader climbs toward 0.73, the gist holds the data and the reader was
-undertrained; if it stays at ~none, the 8-slot gist itself can't hold hard
-steps and (b) a k=16 encoder retrain (the expensive capacity test) is the
-justified next spend — full vindication of the BS-call.
+CORRECTION (Fable review of the interpretation, 2026-07-14): claims 3-4 below
+were NOT supported and are retracted.
+- The "hard steps are LONGER, so the gist can't hold them" premise is FALSE:
+  the 252 hard-run context steps are the SAME token length as render's training
+  steps (mean 22.1 vs 23.2; p90 36 vs 34; 2/252 hit the 64-cap). No length gap.
+- The "right numbers, wrong structure" mechanism rests on <=3 dumped problems
+  (n~1 anecdote) — the harness scores the free generation, never the
+  reconstructions themselves.
+- token-F1 (the 0.93-0.99 receipt) + the ledger (digits given as a visible
+  prefix) + true-first-token priming certify LITERALS, not RELATIONS. "right
+  numbers, wrong operator" scores HIGH F1. So the reader's fidelity on relations
+  was never measured, on easy OR hard steps.
+- Compounding math: F1~0.9 => ~10-14% per-step structure error; (1-q)^4 over 4
+  reconstructed steps/problem nets ~0.49 with NO hard-step-specific fidelity
+  drop needed. The result may be exactly what render's KNOWN fidelity predicts
+  on ANY steps once stacked 4-deep and the ledger stops flattering the metric.
+
+Honest status: gist_render CURES the raw-injection poisoning (0.11->0.49, real).
+Whether it fails to ADD value because (a) the 8-slot gist lacks relational
+structure, (b) the render reader is a ledger-crutched decoder that never learned
+structure, or (c) plain per-step-error compounding with no hard-specific drop —
+is UNMEASURED. The three point to different fixes (k=16 encoder / relation-aware
+reader / nothing).
+
+Next: the CHEAP discriminator (~$1-2, pure eval, no generation) — reconstruct
+the hard AND easy context steps and measure (i) a relation score (extracted
+arithmetic ops vs gold), (ii) a WRONG-gist control (true ledger+first-token but
+another step's gist — does the reader even read the gist?), (iii) an NLL
+contrast on STRUCTURE tokens only, true-gist vs wrong-gist (is the relational
+info IN the 8-slot gist at all — answered WITHOUT the decoder having to generate
+it). This separates gist-capacity from reader-capacity before any retrain spend;
+the retrain is NOT a clean discriminator in either direction. Also patch
+run_frontload to log per-problem {pid, arm, correct} for paired stats.
 
 **Standing conclusion for the thread: compressed thoughts are validated for
 LIKELIHOOD (memory/compression: the ladder) and for RECONSTRUCTION (render
