@@ -186,6 +186,46 @@ NOT purely negative — the reframe the numbers point to:
   latent-prediction thread closes with: substrate works single-step (0.62),
   chaining drifts (~2 steps), speed upside is bounded to short bursts.
 
+## FRONTLOAD RESULT (2026-07-14): thoughts do NOT transfer to free generation
+
+The clean instrument (after the burst harness proved unusable — its forced
+line-per-step decode broke the baseline itself, plain 13%): give the model the
+first half of a solution as context, then let it GENERATE FREELY. GSM8K test,
+86 problems x 5 arms, healthy baseline this time:
+
+| context given | accuracy | mean gen tokens |
+|---|---|---|
+| nothing (solve alone) | 0.698 | 89 |
+| first half as TEXT | 0.826 | 56 |
+| first half as TRUE thoughts | **0.326** | 46 |
+| thoughts minus the last | 0.465 | 69 |
+| thoughts + last PREDICTED | 0.488 | 86 |
+
+Reads:
+1. Instrument is sane: text context helps (+13 pts over none). And per the
+   pre-registered rule, gist_pred vs gist_minus = +0.02 — a TIE: the predicted
+   thought adds nothing measurable. Do NOT launch predictor-v2 on this basis.
+2. The headline: TRUE thoughts as context HALVE accuracy vs no context at all
+   (0.33 vs 0.70), and more injected thoughts = worse (minus-one arm 0.47 >
+   full 0.33). Teacher-forced NLL gains (gap_closed 0.62-0.82) do NOT
+   transfer to free generation.
+3. Mechanism (from the generation dumps): injected arms are NOT derailed —
+   text is fluent, on-topic, structurally identical to the no-context arm.
+   But gist_true generations are HALF the length (46 vs 89 tokens): the
+   injected KV convinces the model that solution content already exists (so it
+   wraps up early) without the model being able to fully READ that content —
+   premature conclusions from partially-legible context. Text context also
+   shortens generation (56 toks) but is fully legible -> 0.83.
+4. Caveat: none=0.70 means GSM8K gives context little headroom; a harder task
+   (none low) is the one configuration where generation-time injection could
+   still show value. The premature-wrap-up mechanism would likely persist.
+
+**Standing conclusion for the thread: compressed thoughts are validated for
+LIKELIHOOD (memory/compression: the ladder) and for RECONSTRUCTION (render
+lane), but not as generation-time context in this configuration. Predictor
+improvements (v2: question-conditioning + hard negatives, built + tested,
+launch held) currently have no generation-side customer.**
+
 Pre-registered design for the burst test (Fable review — without these arms it
 proves nothing). Two untested assumptions it must cover: MIXED real/latent
 history (rollout only measured all-real vs all-predicted) and free GENERATION
