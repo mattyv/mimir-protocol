@@ -101,6 +101,9 @@ def main() -> None:  # noqa: PLR0915
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--max-step-toks", type=int, default=40)
     ap.add_argument("--max-answer-toks", type=int, default=12)  # '#### ' primed: number + newline
+    ap.add_argument(
+        "--dump-samples", type=int, default=3, help="dump full traces for first N problems"
+    )
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -207,6 +210,7 @@ def main() -> None:  # noqa: PLR0915
         cache, pos, logits = _prefill(pm, ids)
         sched = make_schedule(len(ref_steps), args.anchor_every)
         thoughts, decoded, fwd, cap = [], 0, 1, 0  # fwd counts prefill
+        trace = []  # what actually happened, for the qualitative dump
         for i, step in enumerate(ref_steps):
             step_ids = tok(step, add_special_tokens=False).input_ids[: args.max_step_toks]
             if not step_ids:
@@ -218,8 +222,9 @@ def main() -> None:  # noqa: PLR0915
                 )
                 decoded += len(toks)
                 fwd += len(toks)
-                if len(toks) >= args.max_step_toks and toks[-1] != nl_id:
-                    cap += 1
+                capped = len(toks) >= args.max_step_toks and toks[-1] != nl_id
+                cap += int(capped)
+                trace.append(f"[dec{'|CAP' if capped else ''}] {tok.decode(toks).strip()}")
                 if arm == "burst_pred":  # only this arm needs predictor history
                     body = toks[:-1] if toks and toks[-1] == nl_id else toks
                     if body:
@@ -227,17 +232,21 @@ def main() -> None:  # noqa: PLR0915
                         fwd += 1
             else:  # latent step
                 if arm == "burst_none":
+                    trace.append("[skip]")
                     continue  # skip entirely — no thought, no injection
                 if arm == "burst_true":
                     akv = _thought_kv_true(step_ids, pos)
                     fwd += 1
+                    trace.append(f"[inject-true] ({step.strip()})")
                 else:  # burst_pred — predict next thought from history, free-running
                     if not thoughts:  # nothing to predict from yet
+                        trace.append("[skip:no-history]")
                         continue
                     seq = torch.stack(thoughts)  # all on `device` (no cpu mix)
                     ghat = rollout(predictor, seq, 1, args.window)[0]  # tested path, no off-by-one
                     akv = _thought_kv_from_summary(ghat, pos)
                     thoughts.append(ghat.detach())
+                    trace.append("[inject-pred]")
                 cache, pos = _inject(pm, cache, pos, akv)
                 # re-read a newline to prime the next step's first token
                 out = pm(
@@ -261,27 +270,51 @@ def main() -> None:  # noqa: PLR0915
         fwd += 1
         ans_toks, _, _, _ = _decode_step(pm, cache, pos, logits, nl_id, args.max_answer_toks)
         fwd += len(ans_toks)
-        return tok.decode(ans_toks), decoded, fwd, cap
+        trace.append(f"[answer] #### {tok.decode(ans_toks).strip()}")
+        return tok.decode(ans_toks), decoded, fwd, cap, trace
 
     arms = ["plain", "burst_true", "burst_pred", "burst_none"]
     agg = {a: {"correct": 0, "toks": 0, "fwd": 0, "cap": 0, "n": 0, "secs": 0.0} for a in arms}
+    samples: list[dict] = []
     for pi, (q, gold, ref) in enumerate(probs):
         steps = split_solution_steps(ref)
         if len(steps) < 3:
             continue
         for a in arms:
             t0 = time.time()
-            ans, dec, fwd, cap = _run(q, steps, a)
+            ans, dec, fwd, cap, trace = _run(q, steps, a)
             agg[a]["secs"] += time.time() - t0
-            agg[a]["correct"] += int(answers_match(extract_answer(ans), gold))
+            ok = answers_match(extract_answer(ans), gold)
+            agg[a]["correct"] += int(ok)
             agg[a]["toks"] += dec
             agg[a]["fwd"] += fwd
             agg[a]["cap"] += cap
             agg[a]["n"] += 1
+            # qualitative dump: full traces for the first problems — the last two
+            # runs were misread because nobody ever READ a generation
+            if pi < args.dump_samples:
+                samples.append(
+                    {
+                        "prob": pi,
+                        "arm": a,
+                        "gold": gold,
+                        "correct": bool(ok),
+                        "q": q[:200],
+                        "trace": trace,
+                    }
+                )
+                print(f"\n--- p{pi} {a} gold={gold} ok={ok} ---", flush=True)
+                for line in trace:
+                    print(f"    {line}", flush=True)
         if (pi + 1) % 20 == 0:
             print(f"  ...{pi + 1} problems", flush=True)
 
-    manifest = {"anchor_every": args.anchor_every, "n_problems": args.n_problems, "arms": {}}
+    manifest = {
+        "anchor_every": args.anchor_every,
+        "n_problems": args.n_problems,
+        "samples": samples,
+        "arms": {},
+    }
     # decoded_toks / model_forwards are the fair cost proxies; mean_secs is rough
     # (kernel/overhead noise). cap_rate = fraction of anchor decodes that hit the
     # token cap without a newline — spikes if injection derails the next decode.
