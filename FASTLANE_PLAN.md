@@ -262,10 +262,39 @@ the raw model lacks is a READER — and the render adapter (a LoRA on this same
 frozen model) IS a trained gist-reader that no generation test ever used. The
 missing experiment: RECONSTITUTE-THEN-SOLVE — inject thoughts, transcribe them
 to text with the render adapter (its trained job), then solve from the
-transcription with the adapter off. Prediction: recovers to ~= the text arm. If
-so, the conclusion becomes "thoughts work in generation THROUGH their reader;
-raw injection was the wrong interface" — and the memory story (store ~8 slots
-vs ~25 tokens of KV per step, reconstitute on demand) is validated end-to-end.
+transcription with the adapter off. Prediction: recovers to ~= the text arm.
+
+### RECONSTITUTE RESULT (2026-07-14, hard problems): split verdict
+
+| context | acc |
+|---|---|
+| none | 0.492 |
+| text | 0.730 |
+| gist_true (raw injection) | 0.111 |
+| **gist_render (reader transcribes, then solve)** | **0.492** |
+
+1. **The reader interface CURES the harm completely**: 0.11 -> 0.49 (+38 pts).
+   Making the content legible eliminates the premature-wrap-up poisoning. Raw
+   injection was indeed the wrong interface — that part of the prediction held.
+2. **But it recovers zero net value over solving alone** (0.492 == none 0.492,
+   vs the 0.73 text ceiling). The transcripts show why: reconstructions of
+   HARD steps keep the digits (ledger) and the topic frame but degrade the
+   RELATIONS — sample p1 turned "1.5h walking at 4mph + running twice as far"
+   into "run 4*6=24" (right numbers, wrong structure), flipping the answer.
+   Where transcription was faithful (p0) the model scored like the text arm;
+   where it wasn't, it got misled — netting exactly zero.
+3. **The BS-call lands where it counts**: render's F1 0.93-0.99 was measured on
+   EASY (gsm8k-train-style, ~800-doc training) steps. On 7+-step problems'
+   longer steps, 8-slot-gist+ledger fidelity drops enough that relation errors
+   compound through the reasoning chain. At the hard end, gist fidelity IS the
+   binding constraint.
+
+Next decision (cheap -> expensive): (a) retrain the RENDER READER on hard/long
+steps (~$2-3, existing harness, different data) and rerun gist_render — if a
+better reader climbs toward 0.73, the gist holds the data and the reader was
+undertrained; if it stays at ~none, the 8-slot gist itself can't hold hard
+steps and (b) a k=16 encoder retrain (the expensive capacity test) is the
+justified next spend — full vindication of the BS-call.
 
 **Standing conclusion for the thread: compressed thoughts are validated for
 LIKELIHOOD (memory/compression: the ladder) and for RECONSTRUCTION (render
