@@ -248,11 +248,24 @@ An instruct model injects KV identically and would hit the same wall; an
 instruct swap is therefore unlikely to rescue generation-time injection. (Worth
 one confirmation someday, not a priority.)
 
-**FINAL for the generation-time thesis: compressed thoughts do NOT work as
-generation-time context, at any difficulty. Validated capabilities stand
+**For the generation-time thesis: RAW-injected compressed thoughts do NOT work
+as generation-time context, at any difficulty. Validated capabilities stand
 (encoder, render+ledger, the likelihood ladder). The fast lane — in every form
 tried (draft-verify, confidence gate, open-loop chain, anchored burst,
-front-loaded injection) — is closed.**
+front-loaded raw injection) — is closed.**
+
+CAVEAT (user BS-call, upheld in part): the "capacity is fine" evidence (k-sweep
+saturating at 8) was measured in likelihood-space, which does not transfer to
+generation — so "the model doesn't get enough OUT of the gist while generating"
+remained live. The render receipt says the data is IN the gist (F1 0.99); what
+the raw model lacks is a READER — and the render adapter (a LoRA on this same
+frozen model) IS a trained gist-reader that no generation test ever used. The
+missing experiment: RECONSTITUTE-THEN-SOLVE — inject thoughts, transcribe them
+to text with the render adapter (its trained job), then solve from the
+transcription with the adapter off. Prediction: recovers to ~= the text arm. If
+so, the conclusion becomes "thoughts work in generation THROUGH their reader;
+raw injection was the wrong interface" — and the memory story (store ~8 slots
+vs ~25 tokens of KV per step, reconstitute on demand) is validated end-to-end.
 
 **Standing conclusion for the thread: compressed thoughts are validated for
 LIKELIHOOD (memory/compression: the ladder) and for RECONSTRUCTION (render

@@ -46,7 +46,15 @@ from marker.predictor import NextThoughtPredictor
 from marker.run_bridge import predict_step
 from marker.run_burst import _decode_step, _inject, _prefill
 
-ARMS = ("none", "text", "gist_true", "gist_minus", "gist_pred")
+ARMS = ("none", "text", "gist_true", "gist_minus", "gist_pred", "gist_render")
+# gist_render = RECONSTITUTE-THEN-SOLVE (the BS-call experiment): the raw model
+# can't READ injected thoughts while generating, but the render adapter — a
+# trained gist-reader on this same frozen model — can. Transcribe the m thoughts
+# back to text with the render adapter (its validated job, F1 0.99 w/ ledger),
+# then solve from the transcription with the adapter off. Storage sidecar per
+# step = the ledger numbers + the first token (the validated render config).
+# Prediction: recovers to ~= the text arm => thoughts work in generation
+# THROUGH their reader, and the ~3x KV-memory story is validated end-to-end.
 
 
 def context_split(n_steps: int, cap: int = 4) -> int:
@@ -74,6 +82,7 @@ def main() -> None:  # noqa: PLR0915
     ap.add_argument("--artifacts-repo", default=None)
     ap.add_argument("--subdir", default="stage2_cot_openr1")
     ap.add_argument("--bridge-subdir", default="bridge_validated")
+    ap.add_argument("--render-subdir", default="render_adapter_ledger")
     ap.add_argument("--out-repo", default=None)
     ap.add_argument("--dataset", default="openai/gsm8k")
     ap.add_argument("--n-problems", type=int, default=120)
@@ -152,6 +161,23 @@ def main() -> None:  # noqa: PLR0915
         )
     predictor = predictor.to(device).eval()
 
+    # the trained gist-READER (render adapter) for the gist_render arm; smoke
+    # attaches a random one to exercise the path mechanically
+    if args.smoke:
+        from marker.render import attach_render  # noqa: PLC0415
+
+        attach_render(pm)
+        pm.set_adapter("default")
+    else:
+        from huggingface_hub import snapshot_download  # noqa: PLC0415
+
+        loc = snapshot_download(
+            args.artifacts_repo, allow_patterns=[f"{args.render_subdir}/render/*"]
+        )
+        pm.load_adapter(f"{loc}/{args.render_subdir}/render", adapter_name="render")
+        pm.set_adapter("default")
+        print(f"render adapter loaded from {args.render_subdir}", flush=True)
+
     if args.smoke:
         from marker.run_stage2 import _smoke_cot_texts  # noqa: PLC0415
 
@@ -194,16 +220,48 @@ def main() -> None:  # noqa: PLR0915
                 break
         return text, len(toks)
 
+    from marker.render import extract_ledger  # noqa: PLC0415
+    from marker.run_render import _render_reconstruct  # noqa: PLC0415
+
+    @torch.no_grad()
+    def _reconstitute(step_ids_i, step_text):  # noqa: ANN001
+        """Transcribe one thought back to text with the trained render adapter
+        (the validated config: ledger numbers + first token as the stored
+        sidecar). Returns (text, n_reader_tokens)."""
+        kv, cs, _ = gist_kv(pm, gist, step_ids_i)  # default adapter encodes
+        nums = extract_ledger(step_text)
+        led = tok(" ".join(nums) + "\n", add_special_tokens=False).input_ids if nums else []
+        pm.set_adapter("render")
+        rec = _render_reconstruct(pm, kv, cs, step_ids_i[0], args.max_span, {nl_id}, prefix_ids=led)
+        pm.set_adapter("default")
+        return tok.decode(rec).strip(), len(rec)
+
     @torch.no_grad()
     def _run(question, steps, m, arm):  # noqa: ANN001
         step_ids = [tok(s, add_special_tokens=False).input_ids[: args.max_span] for s in steps]
         prompt = f"{GSM8K_FEWSHOT}Question: {question}\nAnswer:\n"
+        recon_toks = 0
         if arm == "text":
             prompt += "".join(s.strip() + "\n" for s in steps[:m])
+        elif arm == "gist_render":
+            # reconstitute-then-solve: thoughts -> reader -> text -> solve
+            lines = []
+            for i in range(m):
+                line, n = _reconstitute(step_ids[i], steps[i])
+                lines.append(line)
+                recon_toks += n
+            prompt += "".join(ln + "\n" for ln in lines if ln)
         ids = tok(prompt, add_special_tokens=False).input_ids
         cache, pos, logits = _prefill(pm, ids)
 
-        n_inject = {"none": 0, "text": 0, "gist_true": m, "gist_minus": m - 1, "gist_pred": m}[arm]
+        n_inject = {
+            "none": 0,
+            "text": 0,
+            "gist_render": 0,
+            "gist_true": m,
+            "gist_minus": m - 1,
+            "gist_pred": m,
+        }[arm]
         if n_inject:
             summ = encode_gist(pm, gist, step_ids[:m]).float()  # [m, k, hidden] true summaries
             for i in range(n_inject):
@@ -224,9 +282,10 @@ def main() -> None:  # noqa: PLR0915
                 use_cache=True,
             )
             cache, pos, logits = out.past_key_values, pos + 1, out.logits[0, -1]
-        return _free_generate(cache, pos, logits)
+        text, ntok = _free_generate(cache, pos, logits)
+        return text, ntok, recon_toks
 
-    agg = {a: {"correct": 0, "toks": 0, "n": 0, "secs": 0.0} for a in ARMS}
+    agg = {a: {"correct": 0, "toks": 0, "recon": 0, "n": 0, "secs": 0.0} for a in ARMS}
     samples = []
     step_counts, m_counts = [], []
     for pi, (q, gold, ref) in enumerate(probs):
@@ -238,11 +297,12 @@ def main() -> None:  # noqa: PLR0915
         m_counts.append(m)
         for a in ARMS:
             t0 = time.time()
-            text, ntok = _run(q, steps, m, a)
+            text, ntok, recon = _run(q, steps, m, a)
             ok = answers_match(extract_answer(text), gold)
             agg[a]["secs"] += time.time() - t0
             agg[a]["correct"] += int(ok)
             agg[a]["toks"] += ntok
+            agg[a]["recon"] += recon
             agg[a]["n"] += 1
             if pi < args.dump_samples:
                 samples.append(
@@ -269,19 +329,21 @@ def main() -> None:  # noqa: PLR0915
         "samples": samples,
         "arms": {},
     }
-    print("\n[FRONTLOAD] arm          acc    gen_toks   mean_s", flush=True)
+    print("\n[FRONTLOAD] arm          acc    gen_toks  recon_toks   mean_s", flush=True)
     for a in ARMS:
         g = agg[a]
         n = max(1, g["n"])
         row = {
             "acc": round(g["correct"] / n, 3),
             "mean_gen_toks": round(g["toks"] / n, 1),
+            "mean_recon_toks": round(g["recon"] / n, 1),
             "mean_secs": round(g["secs"] / n, 2),
             "n": g["n"],
         }
         manifest["arms"][a] = row
         print(
-            f"  {a:12s} {row['acc']:>5}  {row['mean_gen_toks']:>9}  {row['mean_secs']:>7}",
+            f"  {a:12s} {row['acc']:>5}  {row['mean_gen_toks']:>9}  "
+            f"{row['mean_recon_toks']:>9}  {row['mean_secs']:>7}",
             flush=True,
         )
 
