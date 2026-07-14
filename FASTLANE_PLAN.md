@@ -220,6 +220,40 @@ Reads:
    (none low) is the one configuration where generation-time injection could
    still show value. The premature-wrap-up mechanism would likely persist.
 
+### CHASE — hard problems (2026-07-14): caveat closed, AGAINST the thesis
+
+Same instrument, GSM8K filtered to >=7 reference steps (mean 7.4, harder):
+
+| context | acc (hard) | acc (easy, for ref) |
+|---|---|---|
+| none | 0.492 | 0.698 |
+| text | **0.730** | 0.826 |
+| gist_true | **0.111** | 0.326 |
+| gist_minus | 0.222 | 0.465 |
+| gist_pred | 0.222 | 0.488 |
+
+The headroom hypothesis was RIGHT — and it damns the thoughts. none dropped to
+0.49 (harder, as intended), and TEXT context opened up to +0.24 over none (vs
++0.13 on easy) — more headroom, exactly predicted. But thoughts didn't
+capitalize; they got WORSE (gist_true 0.11, half the easy-problem number).
+gist_pred == gist_minus again (predicted thought adds nothing). So: the model
+uses legible context MORE on hard problems, and compressed-thought context LESS.
+The premature-wrap-up failure amplifies with more content to (mis)read.
+
+Bearing on the base-vs-instruct question: text context works and IMPROVES with
+difficulty, so the failure is NOT the base model's instruction-following — it's
+the frozen model's inability to fully READ injected compressed KV during
+generation (the same limit the render lane needed a trained decoder to overcome).
+An instruct model injects KV identically and would hit the same wall; an
+instruct swap is therefore unlikely to rescue generation-time injection. (Worth
+one confirmation someday, not a priority.)
+
+**FINAL for the generation-time thesis: compressed thoughts do NOT work as
+generation-time context, at any difficulty. Validated capabilities stand
+(encoder, render+ledger, the likelihood ladder). The fast lane — in every form
+tried (draft-verify, confidence gate, open-loop chain, anchored burst,
+front-loaded injection) — is closed.**
+
 **Standing conclusion for the thread: compressed thoughts are validated for
 LIKELIHOOD (memory/compression: the ladder) and for RECONSTRUCTION (render
 lane), but not as generation-time context in this configuration. Predictor
