@@ -51,13 +51,26 @@ predicted next thoughts  [B, L-1, 8, 3584]   (position i predicts step i+1)
 
 ```mermaid
 flowchart TB
-    G["gists [L,8,3584]"] -->|"slot_proj 3584→384"| X["[L,8,384]"]
-    SE["slot-index embedding (8)"] --> X
-    PE["step-position embedding (256)"] --> X
-    X -->|"flatten to L*8 tokens"| T["block-causal transformer<br/>4 layers · 8 heads · norm-first"]
-    T -->|"out_proj 384→3584"| O["predicted thought [L-1,8,3584]"]
-    T -->|"pool_proj 8*3584→384"| R["retrieval vector (for scoring only)"]
+    G["<b>Input</b> · window of thoughts<br/>each step = 8 slot-vectors, no words"]:::io
+    G -->|"[B, L, 8, 3584]"| SP["<b>slot_proj</b><br/>Linear 3584 → 384<br/><i>shrink each slot to the work width</i>"]:::op
+    SP -->|"[B, L, 8, 384]"| EMB["<b>+ position tags</b><br/>slot-index emb (8 → 384)<br/>step-position emb (256 → 384)"]:::op
+    EMB -->|"flatten → [B, L×8, 384]"| TR["<b>Block-causal transformer</b><br/>4 layers · 8 heads · FF 1536 · pre-norm"]:::trunk
+    MASK["<b>step-causal mask</b><br/>step i reads slots of steps 0…i,<br/>nothing later → read-out at i predicts i+1"]:::note -.-> TR
+    TR -->|"unflatten → [B, L, 8, 384]"| FORK(( )):::dot
+    FORK -->|"384 → 3584"| OUT["<b>out_proj</b> — the predicted thought<br/>[B, L−1, 8, 3584]<br/><i>position i predicts step i+1</i>"]:::out
+    FORK -->|"8×3584 → 384"| POOL["<b>pool_proj</b> — scoring vector only<br/>[B, L−1, 384]<br/><i>~11M params · never makes a thought</i>"]:::pool
+
+    classDef io fill:#eef2f5,stroke:#c4cfd8,color:#131a21;
+    classDef op fill:#ffffff,stroke:#c4cfd8,color:#131a21;
+    classDef trunk fill:#dff0f1,stroke:#0e7c86,color:#0a5b63,stroke-width:2px;
+    classDef out fill:#dff0f1,stroke:#0e7c86,color:#0a5b63,stroke-width:2px;
+    classDef pool fill:#f6ecdc,stroke:#b26a12,color:#8a5210,stroke-width:2px;
+    classDef note fill:#fafbfc,stroke:#c4cfd8,color:#5c6b78;
+    classDef dot fill:#0e7c86,stroke:#0e7c86;
 ```
+
+The teal path is the thought the model produces; the amber `pool_proj` head is a
+scoring-only readout (see below). Tensor shapes ride on the arrows.
 
 - **`slot_proj` (3584 → 384).** Each of the 8 slot vectors is shrunk to the
   working width. All the transformer's thinking happens at 384, not 3584 — that's
