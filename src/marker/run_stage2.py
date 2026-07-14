@@ -190,7 +190,11 @@ def encode_corpus(
         # encode sentence-by-sentence (variable span lengths -> one at a time)
         slots = [encode_gist(pm, gist, [sp]).float()[0] for sp in spans]  # each [k, hidden]
         if questions is not None:
-            q_ids = tok(questions[i], add_special_tokens=False).input_ids[: max_span * 2]
+            # cap at max_span, NOT more: the Stage-1 encoder never saw spans
+            # beyond ~96 tokens; a 192-token question-gist is out-of-distribution
+            # in both length and RoPE positions and would poison row 0 of every
+            # window (Fable v2 review, issue 1)
+            q_ids = tok(questions[i], add_special_tokens=False).input_ids[:max_span]
             if len(q_ids) < 2:
                 continue
             slots.insert(0, encode_gist(pm, gist, [q_ids]).float()[0])
@@ -344,6 +348,9 @@ def _eval_smoke(device):  # noqa: ANN001
     seqs = [torch.randn(140, k, d) for _ in range(2)]  # 210 pairs > 128
     ev = evaluate(m, seqs, 4, IdentityWhitener(), device)
     assert "recall@5_128" in ev and ev["pool"] > 128, f"eval smoke incomplete: {ev}"
+    # the with_q path is separate new code — crash its GPU bugs now too
+    evq = evaluate(m, seqs, 4, IdentityWhitener(), device, with_q=True)
+    assert "recall@5_128" in evq and evq["pool"] > 0, f"with_q eval smoke incomplete: {evq}"
     print(f"EVAL_SMOKE_OK {ev}", flush=True)
 
 

@@ -18,7 +18,7 @@ DATASET="${DATASET:-open-r1/OpenR1-Math-220k}"
 UNIT="${UNIT:-sentence}"                        # match v1's encoding unit
 NDOCS="${NDOCS:-8000}"
 STEPS="${STEPS:-6000}"
-DMODEL="${DMODEL:-512}"
+DMODEL="${DMODEL:-384}"                          # = v1: attribution stays clean (Fable v2 review)
 LAYERS="${LAYERS:-4}"
 HARDNEG="${HARDNEG:-0.5}"
 OUTSUB="${OUTSUB:-stage2_cot_openr1_v2}"
@@ -29,7 +29,7 @@ echo "→ Searching RTX 3090 (rel>=0.98 inet>=500 cuda>=12.4)..."
 OFFER_ID=""
 for try in 1 2 3 4 5; do
   OFFER_ID=$(vastai search offers \
-    'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cuda_vers>=12.4 disk_space>=100 reliability>=0.98 inet_down>=500 rentable=true' \
+    'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cpu_ram>=49152 cuda_vers>=12.4 disk_space>=100 reliability>=0.98 inet_down>=500 rentable=true' \
     --order 'reliability-' --limit 1 --raw 2>/dev/null | \
     python3 -c "import sys,json
 try: o=json.load(sys.stdin); print(o[0]['id'] if o else '')

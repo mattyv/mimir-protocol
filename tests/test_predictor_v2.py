@@ -55,16 +55,13 @@ def test_info_nce_within_prefers_aligned():
 
 
 def test_info_nce_within_is_per_window():
-    # candidates come only from the SAME window: making other windows' targets
-    # identical to the prediction must not change the loss
+    # the batched loss must equal the mean of per-window losses computed in
+    # ISOLATION — a cross-window-leaking implementation (e.g. flattening the
+    # batch into one candidate pool) fails this. (Fable v2 review: the previous
+    # version of this test was vacuous and passed a leaking implementation.)
     torch.manual_seed(1)
     p = torch.randn(3, 4, 8)
     t = torch.randn(3, 4, 8)
-    base = info_nce_within(p, t)
-    t2 = t.clone()
-    t2[2] = p[0, 0].expand(4, 8)  # decoy clones in a DIFFERENT window
-    assert torch.allclose(base, info_nce_within(p, t2), atol=1e-5) or True  # window 2's own loss changes
-    # stricter: window 0's contribution unchanged
-    l0 = info_nce_within(p[:1], t[:1])
-    l0_after = info_nce_within(p[:1], t2[:1])
-    assert torch.allclose(l0, l0_after)
+    batched = info_nce_within(p, t)
+    isolated = torch.stack([info_nce_within(p[i : i + 1], t[i : i + 1]) for i in range(3)]).mean()
+    assert torch.allclose(batched, isolated, atol=1e-5)
