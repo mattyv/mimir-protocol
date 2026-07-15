@@ -373,6 +373,48 @@ Next (RUNNING): rerun the reconstitute solve-test with reader-v2. If gist_render
 0.49 -> ~0.65+, the memory story validates end-to-end: store 8 vectors/step,
 reconstitute on demand, solve at near-text accuracy.
 
+### READING-WHILE-SOLVING RESULT (2026-07-15): null proxy, thread CLOSED (Fable call C)
+
+The last live idea: attend injected gist KV DIRECTLY during solving (reader
+adapter active), consuming the 3x KV-residency saving without transcribing.
+Cheap proxy = a `gist_read` arm (render adapter active during the solve decode)
+vs a `none_read` control (render active, zero gists). Hard GSM8K n=63, paired,
+4090 (66 min, $~1.1; the 3090 attempt RC=124 timed out — run_frontload pushes
+only at the end, fix owed):
+
+| arm | acc |
+|---|---|
+| none | 0.524 |
+| text | 0.730 |
+| gist_true (raw inject, default) | 0.159 |
+| gist_render (reconstitute->solve) | 0.619 |
+| none_read (render on, no gists) | 0.000 |
+| gist_read (render on, gists) | 0.016 |
+
+Paired gist_read − none_read = +0.016, McNemar p~1.0 → NULL. But none_read=0.000
+shows the render adapter active during solving destroys solving ENTIRELY (its
+policy is transcribe-then-stop-loop), so the null is "wrong tool," not "gists
+unreadable." Generations confirm gist_read READS the gists — it emits step-1
+content given only as a gist — then loops; weak POSITIVE evidence gists survive
+KV injection.
+
+Decision C (close), reasoning = the ceiling, not a training-failure prior: a
+dedicated solve-time read-head (B', ~$30-60) is capped above by gist_render 0.619
+(perfect gist-reading's downstream value), which LOSES to text 0.730 and barely
+beats none 0.524. Fable priors: ~35% B' beats none, ~5% it reaches the text bar
+the user cares about (render F1~0.9 bounds what 8 vectors carry). Even success
+buys a latency optimization of an already-dominated pathway. Reopen ONLY if a
+deployment has a BINDING KV budget (text can't stay resident) AND accepts ~0.62.
+
+## THREAD STATUS: generation-time use of thoughts is CLOSED.
+Every lane tried and killed: draft-verify, confidence gate, open-loop chain,
+anchored burst, front-loaded raw injection, reconstitute-then-solve (works but
+dominated), reading-while-solving (null proxy + ceiling). Validated wins that
+STAND: encoder (text->8-vec, gap_closed 0.88), render+ledger (8-vec->text F1
+0.99 / numbers 100%), and the 8-slot structure-retention result (struct-NLL
+0.39 vs 4.48). The honest identity: a validated compression+reconstruction
+system for reasoning steps, not a generation accelerator.
+
 ### RECONSTITUTE-V2 RESULT (2026-07-15): net-positive — the memory lane works
 
 Reconstitute solve-test rerun with reader-v2, same hard config (n=63, mean 7.4
