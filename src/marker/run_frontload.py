@@ -272,8 +272,12 @@ def main() -> None:  # noqa: PLR0915
         nums = extract_ledger(step_text)
         led = tok(" ".join(nums) + "\n", add_special_tokens=False).input_ids if nums else []
         pm.set_adapter("render")
-        rec = _render_reconstruct(pm, kv, cs, step_ids_i[0], args.max_span, {nl_id}, prefix_ids=led)
-        pm.set_adapter("default")
+        try:
+            rec = _render_reconstruct(
+                pm, kv, cs, step_ids_i[0], args.max_span, {nl_id}, prefix_ids=led
+            )
+        finally:
+            pm.set_adapter("default")
         return tok.decode(rec).strip(), len(rec)
 
     @torch.no_grad()

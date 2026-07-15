@@ -88,9 +88,12 @@ def test_solve_arm_reads_gist_read_through_render_adapter_and_restores_default()
 
 
 def test_solve_arm_leaves_other_arms_on_default_untouched():
-    pm = _FakeAdapterModel()
-    _solve_arm(pm, "gist_true", lambda cache, pos, logits: ("x", 1), "CACHE", 3, "LOGITS")
-    assert pm.calls == []  # never touches the adapter for a non-gist_read arm
+    for arm in ARMS:
+        if arm == "gist_read":
+            continue
+        pm = _FakeAdapterModel()
+        _solve_arm(pm, arm, lambda cache, pos, logits: ("x", 1), "CACHE", 3, "LOGITS")
+        assert pm.calls == [], arm  # never touches the adapter for a non-gist_read arm
 
 
 def test_solve_arm_restores_default_even_if_generate_raises():
@@ -120,7 +123,10 @@ def test_smoke_manifest_covers_every_arm_and_logs_every_problem():
         capture_output=True,
         text=True,
         timeout=1800,
-        env={**os.environ, "PYTHONPATH": "src"},
+        env={
+            **os.environ,
+            "PYTHONPATH": "src" + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        },
     )
     assert proc.returncode == 0, proc.stdout[-4000:] + "\n" + proc.stderr[-4000:]
     (line,) = (
