@@ -9,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from marker.run_frontload import ARMS, _n_inject_for, _solve_arm, answer_done, context_split
+from marker.run_frontload import (
+    ARMS,
+    _n_inject_for,
+    _solve_arm,
+    _with_read_adapter,
+    answer_done,
+    context_split,
+)
 
 
 def test_context_split_half_capped_and_bounded():
@@ -35,14 +42,20 @@ def test_answer_done_requires_marker_digit_and_newline():
     assert answer_done("#### 1,000\nnext")
 
 
-# ── gist_read arm ─────────────────────────────────────────────────────────────
+# ── gist_read / none_read arms ────────────────────────────────────────────────
 # gist_read must build the IDENTICAL injected KV cache as gist_true (same
 # injection code path, same depth) and differ ONLY in which adapter is active
-# during the final free-generate solve decode.
+# during the final free-generate solve decode. none_read is the load-bearing
+# control: same (empty) injection as `none`, same render-adapter solve as
+# gist_read.
 
 
 def test_gist_read_is_wired_into_arms():
     assert "gist_read" in ARMS
+
+
+def test_none_read_is_wired_into_arms():
+    assert "none_read" in ARMS
 
 
 def test_gist_read_injects_same_depth_as_gist_true():
@@ -59,6 +72,13 @@ def test_gist_read_injects_same_depth_as_gist_true():
     assert _n_inject_for("gist_pred", 4) == 4
 
 
+def test_none_read_injects_nothing_like_none():
+    # none_read's prompt/injection must be identical to `none` -- zero gists --
+    # so it isolates ONLY the render-adapter-active-during-solve variable.
+    for m in (2, 3, 4):
+        assert _n_inject_for("none_read", m) == _n_inject_for("none", m) == 0
+
+
 class _FakeAdapterModel:
     """Stands in for the PEFT-wrapped model: records set_adapter calls without
     needing a real model, so the adapter-switch invariant is fast to check."""
@@ -72,7 +92,8 @@ class _FakeAdapterModel:
         self.active = name
 
 
-def test_solve_arm_reads_gist_read_through_render_adapter_and_restores_default():
+@pytest.mark.parametrize("read_arm", ["gist_read", "none_read"])
+def test_solve_arm_reads_read_arms_through_render_adapter_and_restores_default(read_arm):
     pm = _FakeAdapterModel()
     seen_adapter_during_generate = {}
 
@@ -80,7 +101,7 @@ def test_solve_arm_reads_gist_read_through_render_adapter_and_restores_default()
         seen_adapter_during_generate["adapter"] = pm.active
         return "text", 5
 
-    text, ntok = _solve_arm(pm, "gist_read", fake_free_generate, "CACHE", 3, "LOGITS")
+    text, ntok = _solve_arm(pm, read_arm, fake_free_generate, "CACHE", 3, "LOGITS")
     assert (text, ntok) == ("text", 5)
     assert seen_adapter_during_generate["adapter"] == "render"  # active DURING decode
     assert pm.calls == ["render", "default"]  # switch then restore, in order
@@ -89,23 +110,86 @@ def test_solve_arm_reads_gist_read_through_render_adapter_and_restores_default()
 
 def test_solve_arm_leaves_other_arms_on_default_untouched():
     for arm in ARMS:
-        if arm == "gist_read":
+        if arm.endswith("_read"):
             continue
         pm = _FakeAdapterModel()
         _solve_arm(pm, arm, lambda cache, pos, logits: ("x", 1), "CACHE", 3, "LOGITS")
-        assert pm.calls == [], arm  # never touches the adapter for a non-gist_read arm
+        assert pm.calls == [], arm  # never touches the adapter for a non-`_read` arm
 
 
-def test_solve_arm_restores_default_even_if_generate_raises():
+@pytest.mark.parametrize("read_arm", ["gist_read", "none_read"])
+def test_solve_arm_restores_default_even_if_generate_raises(read_arm):
     pm = _FakeAdapterModel()
 
     def raising_free_generate(cache, pos, logits):
         raise RuntimeError("boom")
 
     with pytest.raises(RuntimeError, match="boom"):
-        _solve_arm(pm, "gist_read", raising_free_generate, "CACHE", 3, "LOGITS")
+        _solve_arm(pm, read_arm, raising_free_generate, "CACHE", 3, "LOGITS")
     assert pm.calls == ["render", "default"]  # finally-restore still fired
     assert pm.active == "default"  # not left stuck on "render"
+
+
+# ── Fix 2: the render adapter must be active for the FIRST generated token ────
+# _with_read_adapter is the shared helper _run uses to compute the logits that
+# SELECT token 0 (the priming forward, either the post-injection newline
+# read-through for gist_read, or the redone prefill for none_read). Pinning
+# it here is the mechanical stand-in for "adapter is render at the moment
+# token-0 logits are produced" without needing a real model.
+
+
+@pytest.mark.parametrize("read_arm", ["gist_read", "none_read"])
+def test_with_read_adapter_runs_fn_under_render_for_read_arms(read_arm):
+    pm = _FakeAdapterModel()
+    seen = {}
+
+    def fn():
+        seen["adapter"] = pm.active  # the adapter active WHILE fn (the logits
+        # forward) runs -- this is the token-0 timing invariant
+        return "logits-for-token-0"
+
+    result = _with_read_adapter(pm, read_arm, fn)
+    assert result == "logits-for-token-0"
+    assert seen["adapter"] == "render"
+    assert pm.calls == ["render", "default"]  # switch then restore
+    assert pm.active == "default"  # restored after
+
+
+def _record_active_adapter(pm, seen):  # noqa: ANN001
+    """Test helper: returns a no-arg fn that records pm's active adapter into
+    `seen` when called. Pulled out of the loop below so ruff (B023) doesn't
+    flag a closure over a loop variable -- fn is called immediately, within
+    the same iteration, so the closure is safe, but a named helper is clearer
+    either way."""
+
+    def fn():
+        seen["adapter"] = pm.active
+        return "logits"
+
+    return fn
+
+
+def test_with_read_adapter_runs_fn_under_default_for_non_read_arms():
+    for arm in ARMS:
+        if arm.endswith("_read"):
+            continue
+        pm = _FakeAdapterModel()
+        seen = {}
+        assert _with_read_adapter(pm, arm, _record_active_adapter(pm, seen)) == "logits"
+        assert seen["adapter"] == "default"
+        assert pm.calls == [], arm  # adapter never touched for non-`_read` arms
+
+
+def test_with_read_adapter_restores_default_even_if_fn_raises():
+    pm = _FakeAdapterModel()
+
+    def raising():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _with_read_adapter(pm, "gist_read", raising)
+    assert pm.calls == ["render", "default"]
+    assert pm.active == "default"
 
 
 @pytest.mark.slow
@@ -138,3 +222,9 @@ def test_smoke_manifest_covers_every_arm_and_logs_every_problem():
     assert n_scored > 0
     assert len(manifest["per_problem"]) == n_scored * len(ARMS)
     assert {r["arm"] for r in manifest["per_problem"]} == set(ARMS)
+    # Fix 3: full gen text is logged ONLY for the `_read` arms
+    for r in manifest["per_problem"]:
+        if r["arm"].endswith("_read"):
+            assert "gen" in r and isinstance(r["gen"], str) and r["gen"]
+        else:
+            assert "gen" not in r

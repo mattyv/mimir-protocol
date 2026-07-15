@@ -46,7 +46,16 @@ from marker.predictor import NextThoughtPredictor
 from marker.run_bridge import predict_step
 from marker.run_burst import _decode_step, _inject, _prefill
 
-ARMS = ("none", "text", "gist_true", "gist_minus", "gist_pred", "gist_render", "gist_read")
+ARMS = (
+    "none",
+    "text",
+    "gist_true",
+    "gist_minus",
+    "gist_pred",
+    "gist_render",
+    "gist_read",
+    "none_read",
+)
 # gist_render = RECONSTITUTE-THEN-SOLVE (the BS-call experiment): the raw model
 # can't READ injected thoughts while generating, but the render adapter — a
 # trained gist-reader on this same frozen model — can. Transcribe the m thoughts
@@ -62,6 +71,30 @@ ARMS = ("none", "text", "gist_true", "gist_minus", "gist_pred", "gist_render", "
 # ACTIVE for the final free-generate solve decode instead of switching it off.
 # Isolates one variable against gist_true: does having the reader "on" while
 # generating change how well the injected thoughts are used?
+#
+# none_read = THE LOAD-BEARING CONTROL for gist_read. Same prompt as `none`
+# (question only, zero gists injected -- see _n_inject_for) but ALSO solves
+# with the render adapter active, exactly like gist_read. Without this arm,
+# a gist_read win could just mean "render happens to be a better solver in
+# general," nothing to do with reading the injected thoughts; none_read pins
+# that down as the true floor.
+#
+# Pre-registered read (corrected from an earlier, wrong framing that gated
+# on gist_read's raw accuracy alone -- e.g. "below 0.35 => shelve it,
+# path C"; that's wrong because raw accuracy can't separate "thoughts aren't
+# readable" from "render can't solve well regardless of input"): the pulse
+# is the PAIRED delta acc(gist_read) - acc(none_read), McNemar-tested on the
+# per_problem correct flags (paired by problem id) -- roughly +0.13 at n=63
+# clears p<0.05. A positive delta is an existence proof that reading injected
+# thoughts through this adapter carries real signal, enough to justify
+# training a dedicated read-head. A null result does NOT close the idea: the
+# render adapter is a transcription specialist here (trained for single
+# reconstructed thoughts, F1 0.99 w/ ledger) being asked to read m thoughts
+# AND solve -- roughly 20x out of its training distribution -- so "no lift"
+# is ambiguous between "thoughts aren't readable" and "wrong adapter for the
+# job." No threshold/gate code lives here; the McNemar calc runs offline
+# against per_problem (see Fix 3's "gen" field for genuine-solve vs
+# transcribe-then-solve classification).
 
 
 def context_split(n_steps: int, cap: int = 4) -> int:
@@ -87,7 +120,9 @@ def _n_inject_for(arm: str, m: int) -> int:
     the KV cache (the model's per-layer memory of everything read so far).
     gist_read injects the SAME m true gists as gist_true -- same injection
     code path, same depth -- it only differs in which adapter is active while
-    reading them back out during the final free-generate decode (_solve_arm)."""
+    reading them back out during the final free-generate decode (_solve_arm).
+    none_read injects zero, identical to `none` -- it's the render-adapter
+    control, not a gist arm."""
     return {
         "none": 0,
         "text": 0,
@@ -96,23 +131,38 @@ def _n_inject_for(arm: str, m: int) -> int:
         "gist_read": m,
         "gist_minus": m - 1,
         "gist_pred": m,
+        "none_read": 0,
     }[arm]
 
 
-def _solve_arm(pm, arm, free_generate, cache, pos, logits):  # noqa: ANN001
-    """Run the final free-generate solve decode for one arm. Every arm decodes
-    under the default adapter except gist_read, which switches to the render
-    adapter (the trained gist-reader) so the model reads back its own injected
-    thoughts through it, then switches back. The finally-restore is adapter-
-    state hygiene (so a later arm never accidentally decodes under "render"),
-    not error-swallowing -- an exception from free_generate still propagates."""
-    if arm != "gist_read":
-        return free_generate(cache, pos, logits)
+def _with_read_adapter(pm, arm, fn):  # noqa: ANN001
+    """Run fn() (no args) with the render adapter (the trained gist-reader)
+    active if `arm` is one of the `_read` arms (gist_read, none_read); every
+    other arm runs fn() under whatever adapter is already active (default).
+    Always restores "default" afterward for a `_read` arm -- this is adapter-
+    state hygiene (so the next arm never accidentally runs under "render"),
+    not error-swallowing: an exception from fn() still propagates through the
+    finally.
+
+    Shared by two call sites: the final free-generate solve decode
+    (_solve_arm) and, in _run, whichever forward pass produces the logits
+    that SELECT the first generated token (Fix 2) -- both need "is this a
+    `_read` arm, and if so run under render" with the same restore-on-exit."""
+    if not arm.endswith("_read"):
+        return fn()
     pm.set_adapter("render")
     try:
-        return free_generate(cache, pos, logits)
+        return fn()
     finally:
         pm.set_adapter("default")
+
+
+def _solve_arm(pm, arm, free_generate, cache, pos, logits):  # noqa: ANN001
+    """Run the final free-generate solve decode for one arm. `_read` arms
+    (gist_read, none_read) decode under the render adapter; every other arm
+    decodes under default. See _with_read_adapter for the adapter-switch and
+    restore-on-exit contract."""
+    return _with_read_adapter(pm, arm, lambda: free_generate(cache, pos, logits))
 
 
 def main() -> None:  # noqa: PLR0915
@@ -311,14 +361,32 @@ def main() -> None:  # noqa: PLR0915
                     kv, _, _ = gist_kv(pm, gist, step_ids[i])
                     akv = _shift(kv, pos - len(step_ids[i]))
                 cache, pos = _inject(pm, cache, pos, akv)
-            # newline read-through primes the first free token after the thoughts
-            out = pm(
-                torch.tensor([[nl_id]], device=device),
-                past_key_values=cache,
-                position_ids=torch.tensor([[pos]], device=device),
-                use_cache=True,
-            )
-            cache, pos, logits = out.past_key_values, pos + 1, out.logits[0, -1]
+
+            # newline read-through primes the first free token after the
+            # thoughts. This forward's logits are what _decode_step argmaxes
+            # to pick token 0 of the free-generate solve -- for a `_read` arm
+            # (gist_read) that pick must happen under the render adapter (Fix
+            # 2: previously this ran under default, then _solve_arm switched
+            # to render only AFTER token 0 was already chosen from the
+            # default-adapter distribution -- a poisoned first token on
+            # every gist_read generation).
+            def _prime():
+                out = pm(
+                    torch.tensor([[nl_id]], device=device),
+                    past_key_values=cache,
+                    position_ids=torch.tensor([[pos]], device=device),
+                    use_cache=True,
+                )
+                return out.past_key_values, pos + 1, out.logits[0, -1]
+
+            cache, pos, logits = _with_read_adapter(pm, arm, _prime)
+        elif arm.endswith("_read"):
+            # none_read has no injected thoughts (n_inject == 0), so there's
+            # no priming forward above to switch -- the plain prefill logits
+            # ARE what picks token 0. Recompute that same prefill under render
+            # so none_read's token-0 pick is timed the same way as gist_read's
+            # (render active at the moment the token-0 logits are produced).
+            cache, pos, logits = _with_read_adapter(pm, arm, lambda: _prefill(pm, ids))
         text, ntok = _solve_arm(pm, arm, _free_generate, cache, pos, logits)
         return text, ntok, recon_toks
 
@@ -326,7 +394,10 @@ def main() -> None:  # noqa: PLR0915
     samples = []
     per_problem = []  # one {pid, arm, correct} record per (problem, arm) pair,
     # for EVERY scored problem (not just the dumped samples) -- so paired
-    # per-problem stats (e.g. McNemar) are computable downstream.
+    # per-problem stats (e.g. McNemar) are computable downstream. The `_read`
+    # arms (gist_read, none_read) also carry the full generation text (Fix 3)
+    # so a later pass can classify a pass as genuine-solve vs
+    # transcribe-then-solve; other arms stay at the 3-field shape.
     step_counts, m_counts = [], []
     for pi, (q, gold, ref) in enumerate(probs):
         steps = split_solution_steps(ref)
@@ -344,7 +415,10 @@ def main() -> None:  # noqa: PLR0915
             agg[a]["toks"] += ntok
             agg[a]["recon"] += recon
             agg[a]["n"] += 1
-            per_problem.append({"pid": pi, "arm": a, "correct": bool(ok)})
+            rec = {"pid": pi, "arm": a, "correct": bool(ok)}
+            if a.endswith("_read"):
+                rec["gen"] = text
+            per_problem.append(rec)
             if pi < args.dump_samples:
                 samples.append(
                     {
