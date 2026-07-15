@@ -373,6 +373,38 @@ Next (RUNNING): rerun the reconstitute solve-test with reader-v2. If gist_render
 0.49 -> ~0.65+, the memory story validates end-to-end: store 8 vectors/step,
 reconstitute on demand, solve at near-text accuracy.
 
+### RECONSTITUTE-V2 RESULT (2026-07-15): net-positive — the memory lane works
+
+Reconstitute solve-test rerun with reader-v2, same hard config (n=63, mean 7.4
+steps, m~4 context steps reconstituted per problem):
+
+| context | v1 reader | **v2 reader** |
+|---|---|---|
+| none (solve alone) | 0.492 | 0.492 |
+| text (real words) | 0.730 | 0.730 |
+| gist_true (raw injection) | 0.111 | 0.111 |
+| **gist_render (reconstitute→solve)** | 0.492 | **0.603** |
+
+The lane is now NET-POSITIVE: gist_render 0.603 > none 0.492 (+0.11), where v1
+was a dead tie. It closes ~46% of the compression penalty (the none→text gap),
+sits far above raw injection (0.11), and the per-problem dumps show it landing
+correct exactly where raw injection fails. The reader fix (relations 0.64→0.92)
+propagated to end-to-end accuracy, as the compounding math predicted (forecast
+~0.65; got 0.60 — a touch under, because a clean reconstruction still requires
+the model to reason).
+
+**End-to-end validation of the memory story:** store ~8 vectors/step instead of
+~25 tokens of KV, reconstitute on demand via the render reader, and solve at
+0.60 vs 0.49 alone — a real, net-positive capability. Compression is USABLE, not
+free: it still trails full text 0.73, so you trade ~13 pts of accuracy for the
+~3x KV-memory saving.
+
+Calibration: +0.11 at n=63 is real-looking but near the resolution limit
+(paired McNemar ~±0.10-0.12); the mechanistic chain (relation fidelity 0.92,
+per-example dumps, dose-response vs gist_minus/pred) makes it coherent, but a
+confirm run at n~200 would bank it. The k=16 / CoT-encoder retrains remain
+UNjustified — the gist held the structure all along; the reader was the wall.
+
 **Standing conclusion for the thread: compressed thoughts are validated for
 LIKELIHOOD (memory/compression: the ladder) and for RECONSTRUCTION (render
 lane), but not as generation-time context in this configuration. Predictor
