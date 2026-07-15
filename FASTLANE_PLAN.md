@@ -348,6 +348,31 @@ exact 0.64 -> >=0.85 on this probe, then rerun reconstitute expecting
 gist_render 0.49 -> ~0.65+. The k=16 / CoT-encoder retrains are NOT justified
 by this evidence.
 
+### READER-V2 RESULT (2026-07-15): bar CLEARED — reader was the bottleneck
+
+Reader retrained on 4000 docs / 6000 steps (5x data, 3x steps). Same probe:
+
+| metric | v1 | **v2** | bar |
+|---|---|---|---|
+| relations exact (hard) | 0.636 | **0.921** | 0.85 ✓ |
+| op-sequence match (hard) | 0.807 | **0.966** | |
+| relations exact (easy) | 0.697 | **0.921** | |
+| token F1 (hard) | 0.894 | 0.900 | — |
+
+The bar (0.85) is beaten by +0.07; relations 0.64 -> 0.92 (+0.28). Token-F1
+barely moved (0.894 -> 0.900) — the entire gain is in STRUCTURE fidelity, the
+thing F1 was blind to and the probe exists to see. More data fixed the reader's
+precision-writing; the "more data alone won't teach precision" prior was wrong.
+Wrong-gist relations stay low (0.27) — v2 reads the gist more, not the prior.
+
+Compounding forecast: 0.92 relations over m~4 context steps => 0.92^4 = 0.72 of
+problems fully clean (vs v1's 0.64^4 = 0.17). Reconstitute gist_render should
+climb from 0.49 toward the text ceiling 0.73.
+
+Next (RUNNING): rerun the reconstitute solve-test with reader-v2. If gist_render
+0.49 -> ~0.65+, the memory story validates end-to-end: store 8 vectors/step,
+reconstitute on demand, solve at near-text accuracy.
+
 **Standing conclusion for the thread: compressed thoughts are validated for
 LIKELIHOOD (memory/compression: the ladder) and for RECONSTRUCTION (render
 lane), but not as generation-time context in this configuration. Predictor
