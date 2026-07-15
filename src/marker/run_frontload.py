@@ -346,9 +346,17 @@ def main() -> None:  # noqa: PLR0915
                 recon_toks += n
             prompt += "".join(ln + "\n" for ln in lines if ln)
         ids = tok(prompt, add_special_tokens=False).input_ids
-        cache, pos, logits = _prefill(pm, ids)
-
         n_inject = _n_inject_for(arm, m)
+        if arm.endswith("_read") and not n_inject:
+            # none_read has no injected thoughts, so there's no newline-prime
+            # forward below -- the prefill logits themselves pick token 0.
+            # Run the ONE prefill under render (Fix 2) so none_read's token-0
+            # pick is timed the same way as gist_read's (render active at the
+            # moment the token-0 logits are produced).
+            cache, pos, logits = _with_read_adapter(pm, arm, lambda: _prefill(pm, ids))
+        else:
+            cache, pos, logits = _prefill(pm, ids)
+
         if n_inject:
             summ = encode_gist(pm, gist, step_ids[:m]).float()  # [m, k, hidden] true summaries
             for i in range(n_inject):
@@ -380,13 +388,6 @@ def main() -> None:  # noqa: PLR0915
                 return out.past_key_values, pos + 1, out.logits[0, -1]
 
             cache, pos, logits = _with_read_adapter(pm, arm, _prime)
-        elif arm.endswith("_read"):
-            # none_read has no injected thoughts (n_inject == 0), so there's
-            # no priming forward above to switch -- the plain prefill logits
-            # ARE what picks token 0. Recompute that same prefill under render
-            # so none_read's token-0 pick is timed the same way as gist_read's
-            # (render active at the moment the token-0 logits are produced).
-            cache, pos, logits = _with_read_adapter(pm, arm, lambda: _prefill(pm, ids))
         text, ntok = _solve_arm(pm, arm, _free_generate, cache, pos, logits)
         return text, ntok, recon_toks
 
