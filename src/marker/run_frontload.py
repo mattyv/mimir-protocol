@@ -46,7 +46,7 @@ from marker.predictor import NextThoughtPredictor
 from marker.run_bridge import predict_step
 from marker.run_burst import _decode_step, _inject, _prefill
 
-ARMS = ("none", "text", "gist_true", "gist_minus", "gist_pred", "gist_render")
+ARMS = ("none", "text", "gist_true", "gist_minus", "gist_pred", "gist_render", "gist_read")
 # gist_render = RECONSTITUTE-THEN-SOLVE (the BS-call experiment): the raw model
 # can't READ injected thoughts while generating, but the render adapter — a
 # trained gist-reader on this same frozen model — can. Transcribe the m thoughts
@@ -55,6 +55,13 @@ ARMS = ("none", "text", "gist_true", "gist_minus", "gist_pred", "gist_render")
 # step = the ledger numbers + the first token (the validated render config).
 # Prediction: recovers to ~= the text arm => thoughts work in generation
 # THROUGH their reader, and the ~3x KV-memory story is validated end-to-end.
+#
+# gist_read = READ-THROUGH-YOUR-OWN-ADAPTER: injects the SAME m true thoughts
+# as gist_true (identical KV injection, no text sidecar, no reconstitution --
+# see _n_inject_for) but leaves the render adapter (the trained gist-reader)
+# ACTIVE for the final free-generate solve decode instead of switching it off.
+# Isolates one variable against gist_true: does having the reader "on" while
+# generating change how well the injected thoughts are used?
 
 
 def context_split(n_steps: int, cap: int = 4) -> int:
@@ -73,6 +80,39 @@ def answer_done(text: str) -> bool:
         return False
     tail = text.split("####")[-1]
     return any(c.isdigit() for c in tail) and "\n" in tail
+
+
+def _n_inject_for(arm: str, m: int) -> int:
+    """How many leading true-step gists (thought vectors) this arm injects into
+    the KV cache (the model's per-layer memory of everything read so far).
+    gist_read injects the SAME m true gists as gist_true -- same injection
+    code path, same depth -- it only differs in which adapter is active while
+    reading them back out during the final free-generate decode (_solve_arm)."""
+    return {
+        "none": 0,
+        "text": 0,
+        "gist_render": 0,
+        "gist_true": m,
+        "gist_read": m,
+        "gist_minus": m - 1,
+        "gist_pred": m,
+    }[arm]
+
+
+def _solve_arm(pm, arm, free_generate, cache, pos, logits):  # noqa: ANN001
+    """Run the final free-generate solve decode for one arm. Every arm decodes
+    under the default adapter except gist_read, which switches to the render
+    adapter (the trained gist-reader) so the model reads back its own injected
+    thoughts through it, then switches back. The finally-restore is adapter-
+    state hygiene (so a later arm never accidentally decodes under "render"),
+    not error-swallowing -- an exception from free_generate still propagates."""
+    if arm != "gist_read":
+        return free_generate(cache, pos, logits)
+    pm.set_adapter("render")
+    try:
+        return free_generate(cache, pos, logits)
+    finally:
+        pm.set_adapter("default")
 
 
 def main() -> None:  # noqa: PLR0915
@@ -254,14 +294,7 @@ def main() -> None:  # noqa: PLR0915
         ids = tok(prompt, add_special_tokens=False).input_ids
         cache, pos, logits = _prefill(pm, ids)
 
-        n_inject = {
-            "none": 0,
-            "text": 0,
-            "gist_render": 0,
-            "gist_true": m,
-            "gist_minus": m - 1,
-            "gist_pred": m,
-        }[arm]
+        n_inject = _n_inject_for(arm, m)
         if n_inject:
             summ = encode_gist(pm, gist, step_ids[:m]).float()  # [m, k, hidden] true summaries
             for i in range(n_inject):
@@ -282,11 +315,14 @@ def main() -> None:  # noqa: PLR0915
                 use_cache=True,
             )
             cache, pos, logits = out.past_key_values, pos + 1, out.logits[0, -1]
-        text, ntok = _free_generate(cache, pos, logits)
+        text, ntok = _solve_arm(pm, arm, _free_generate, cache, pos, logits)
         return text, ntok, recon_toks
 
     agg = {a: {"correct": 0, "toks": 0, "recon": 0, "n": 0, "secs": 0.0} for a in ARMS}
     samples = []
+    per_problem = []  # one {pid, arm, correct} record per (problem, arm) pair,
+    # for EVERY scored problem (not just the dumped samples) -- so paired
+    # per-problem stats (e.g. McNemar) are computable downstream.
     step_counts, m_counts = [], []
     for pi, (q, gold, ref) in enumerate(probs):
         steps = split_solution_steps(ref)
@@ -304,6 +340,7 @@ def main() -> None:  # noqa: PLR0915
             agg[a]["toks"] += ntok
             agg[a]["recon"] += recon
             agg[a]["n"] += 1
+            per_problem.append({"pid": pi, "arm": a, "correct": bool(ok)})
             if pi < args.dump_samples:
                 samples.append(
                     {
@@ -327,6 +364,7 @@ def main() -> None:  # noqa: PLR0915
         "mean_ref_steps": mean(step_counts),
         "mean_context_m": mean(m_counts),
         "samples": samples,
+        "per_problem": per_problem,
         "arms": {},
     }
     print("\n[FRONTLOAD] arm          acc    gen_toks  recon_toks   mean_s", flush=True)
