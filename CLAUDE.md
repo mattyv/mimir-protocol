@@ -41,6 +41,28 @@ The user is a working engineer learning ML/mech-interp on the fly through this p
 
 When the user says "you're the expert", that's an invitation to lead with your judgment rather than perform consensus. Pick a direction, explain the reasoning, recommend.
 
+## Model roster (who does what)
+
+Three seats — keep to them. The user wants Opus orchestrating, Fable doing the
+complex reasoning, Sonnet doing the coding.
+
+- **Opus — orchestration seat.** Holds the thread, decides what to run, scopes
+  specs, synthesizes across results, drives the roster and reports to the user.
+  Does NOT do the high-inference reasoning itself or the coding grind — delegate
+  both. Stay in the seat.
+- **Fable — complex reasoning.** All high-inference work: experimental-design
+  critique, result interpretation, "is this real / confounded / overclaimed",
+  strategic direction calls, and code review. When a call is high-inference,
+  route it to Fable and relay *its* verdict — don't present your own inference
+  as the conclusion. Named agent: `fable-reviewer` (code review-and-fix). For
+  design/interpretation/strategy, spawn Fable (`model: fable`) ad-hoc or
+  continue the same agent via SendMessage.
+- **Sonnet — coding.** Implements to a precise spec (TDD + local smoke), never
+  launches GPU/cloud runs or pushes artifacts. Named agent: `sonnet-coder`.
+
+Standing flow: Opus scopes → `sonnet-coder` implements → `fable-reviewer`
+reviews → the human approves any spend.
+
 ## Communication style
 
 Default to terse plain-English. The user is a working engineer, not an ML researcher.
@@ -90,3 +112,10 @@ When reporting any non-trivial result — experiment outcome, multi-step debug, 
 - Put detail (logs, full output, deeper reasoning) *after* the TLDR, behind a separator or under a `Detail:` heading. Never bury the answer.
 - If the user asks "TLDR" mid-thread, give just the TLDR — no detail follow-up unless asked.
 - For comparisons, prefer a small markdown table over prose: rows are the conditions, columns are baseline / change / verdict.
+- **Every report point also gets a NO-JARGON version.** At each place you report a
+  result, status, or verdict, include a short plain-English paragraph (2-4
+  sentences) a non-ML person fully understands — NO ML terms at all, not even
+  glossed ones (no "gist", "KV", "gap_closed", "logit", "adapter"). Say it in
+  everyday words ("the compressed note", "the model's memory", "how close to the
+  real thing"). This is *in addition to* the technical TLDR, clearly marked (e.g.
+  a `**Plain version:**` line), never a replacement for the numbers.
