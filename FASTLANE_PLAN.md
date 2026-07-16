@@ -508,3 +508,36 @@ and we then need it as text. Node destroyed cleanly; run cost ~$0.50.
 transient HF 504 at push time loses the result unless recovered from logs — the
 same incremental/timeout-safe push fix already owed on run_frontload applies to
 run_predprobe. Fix before the next launch.
+
+### PREDPROBE follow-up — readout-swap rerun NOT run (redundant; Fable adjudicated)
+
+Before spending on Fable's proposed "score P/B/W/N through the bridge's validated
+SOLVING readout instead of render," we found the bridge ladder + rollout ALREADY
+are that experiment, at larger n (same predictor stage2_cot_openr1 + bridge_validated):
+  bridge_pred 0.619  vs  shuffled floor 0.284  vs  conversion ceiling 0.817
+  => predicted thought reaches ~76% of ceiling in the working (solving) readout.
+The only missing condition is the magnitude-matched noised control, and it's no
+longer decision-relevant (0.62-vs-0.28 already kills "predictor output is junk,"
+which was noise's only job; the predprobe's P<N ordering was a render-DIALECT
+artifact, not a predictor defect). Decision: **don't run — $0.50 for a number
+that changes nothing.**
+
+**Strategic conclusion (Fable) for the coarse-to-fine / fuzzy-thought direction:**
+- (a) single-step predicted-thought quality = ANSWERED, real (0.62, ~76% ceiling).
+  The strategic gate: this is "assembly around working parts," NOT a
+  training-signal project.
+- (b) open-loop chaining = ANSWERED: teacher-forced flat ~0.6-0.7 to depth 12, but
+  free-run drifts to floor by depth ~3. This PRESCRIBES the vision's commit-point
+  architecture (re-anchor every ~2 steps) rather than blocking it.
+- (c) sharpen a PREDICTED thought back to correct WORDS = the ONLY open piece.
+  Still blocked by render-can't-read-bridge-KV (the predprobe wall). Needed only at
+  commit points — which (b) forces every ~2-3 steps anyway, so it doubles as the
+  re-anchor.
+
+**Next dollar (Fable, when the user wants it):** the render pipe — but FIRST the
+cheap test: skip the render adapter, just let the FROZEN model generate the step's
+text with the predicted thought injected (solving proves the model can USE the
+content; whether it can VERBALIZE it is unmeasured, ~1 small eval). Retrain render
+on bridge-KV only if that fails. NOTE (Opus): this generate-from-injection path is
+adjacent to closed lanes (gist_read null; raw-injection-as-context poisons 0.111) —
+scope carefully / Fable-design-review before spending, it may be the same wall.
