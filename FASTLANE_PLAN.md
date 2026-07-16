@@ -471,3 +471,40 @@ burst work can't clobber it.)
 Diffusion thought-sampler (only if regression head plateaus — it has: top-1 0.30
 + flat confidence); 32B; the still-owed gate-3 Mimir confirmations (separate
 track).
+
+## PREDPROBE RESULT — render-of-predicted-gist (the coarse-to-fine gate)
+
+Serves the user's fuzzy-thought / coarse-to-fine reset: does a PREDICTED gist,
+sharpened by render, keep its arithmetic structure? Five conditions, gated
+verdict pre-registered by Fable (results/predprobe_recovered.json, 7B, n=193
+hard / 150 easy). Recovered from the node log — the HF push 504'd and the
+per_step array truncated, but the per-condition aggregate is complete.
+
+relations-exact (hard):
+  true_gistkv  0.912  <- Path A, reproduces the validated 0.92 ceiling (gate 0 OK)
+  true_bridged 0.162  <- Path B on TRUTH
+  wrong_bridged 0.118 <- Path B floor (scrambled)
+  pred_bridged 0.029  <- the number we wanted
+  noised_bridged 0.088
+  H = B-W = 0.044  ->  GATE 1: BRIDGE_IS_WALL (easy identical: H=0.024)
+
+**Verdict (Fable, high-inference): outcome (c) — plumbing blocker, NOT a verdict
+on the direction.** Path A reads native gist-KV almost perfectly (0.912); the
+moment a thought goes through the bridge (summary->KV), render can't read it —
+a TRUE thought (0.162) barely beats a SCRAMBLED one (0.118). Root cause is a
+dialect mismatch: render_adapter_ledger was only ever trained on gist_kv output,
+never on bridge output (the bridge itself is fine — separately validated at 0.62
+gap_closed on the SOLVING readout). So the predictor's quality is UNMEASURED, not
+falsified. One free hint: pred (0.029) sits below noise (0.088) -> predictor
+outputs may be off the gist manifold (checkable offline, no spend).
+
+**Next move (Fable, ranked): swap the readout, not the pipe** — re-score
+P/B/W/N by injection-for-solving NLL (the metric the bridge is already validated
+on), no retraining, one eval run; do the free offline predictor-output-stats
+check first. Retrain render on bridge-KV (one LoRA run) only if P shows signal
+and we then need it as text. Node destroyed cleanly; run cost ~$0.50.
+
+**Owed infra debt this exposed:** the manifest pushes ONLY at the end, so a
+transient HF 504 at push time loses the result unless recovered from logs — the
+same incremental/timeout-safe push fix already owed on run_frontload applies to
+run_predprobe. Fix before the next launch.

@@ -1,0 +1,23 @@
+{
+  "note": "Aggregate recovered from poller log tail (node destroyed; HF push 504'd; per_step array truncated in log but aggregate complete). n_problems=120/set, window=8.",
+  "results": {
+    "hard": {
+      "true_gistkv":            {"f1": 0.8998, "numrec": 0.9814, "rel": 0.9118, "nll_full": 0.2593, "nll_struct": 0.3397, "n": 193},
+      "true_bridged":           {"f1": 0.4055, "numrec": 0.7960, "rel": 0.1618, "nll_full": 3.1660, "nll_struct": 4.2206, "n": 193},
+      "wrong_bridged":          {"f1": 0.3821, "numrec": 0.7563, "rel": 0.1176, "nll_full": 3.3602, "nll_struct": 4.4782, "n": 193},
+      "pred_bridged":           {"f1": 0.3491, "numrec": 0.6805, "rel": 0.0294, "nll_full": 3.3416, "nll_struct": 4.4855, "n": 193},
+      "noised_bridged":         {"f1": 0.3250, "numrec": 0.7218, "rel": 0.0882, "nll_full": 3.3519, "nll_struct": 4.4250, "n": 193},
+      "pred_bridged_no_ledger": {"f1": 0.1895, "numrec": 0.0931, "rel": 0.0000, "nll_full": 3.6976, "nll_struct": 4.3585, "n": 193},
+      "GATE": {"h": 0.0442, "gate": 1, "verdict": "BRIDGE_IS_WALL"}
+    },
+    "easy": {
+      "true_gistkv":            {"f1": 0.9122, "numrec": 0.9913, "rel": 0.9373, "nll_full": 0.2555, "nll_struct": 0.3334, "n": 150},
+      "true_bridged":           {"f1": 0.4241, "numrec": 0.8251, "rel": 0.1412, "nll_full": 2.8868, "nll_struct": 3.9045, "n": 150},
+      "wrong_bridged":          {"f1": 0.3905, "numrec": 0.7931, "rel": 0.1176, "nll_full": 3.0221, "nll_struct": 4.0957, "n": 150},
+      "pred_bridged":           {"f1": 0.3730, "numrec": 0.6920, "rel": 0.0824, "nll_full": 3.0433, "nll_struct": 4.1254, "n": 150},
+      "noised_bridged":         {"f1": 0.3438, "numrec": 0.7516, "rel": 0.1176, "nll_full": 3.0447, "nll_struct": 4.0914, "n": 150},
+      "pred_bridged_no_ledger": {"f1": 0.2123, "numrec": 0.0801, "rel": 0.0000, "nll_full": 3.3196, "nll_struct": 3.9516, "n": 150},
+      "GATE": {"h": 0.0236, "gate": 1, "verdict": "BRIDGE_IS_WALL"}
+    }
+  }
+}
