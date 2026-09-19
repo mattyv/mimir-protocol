@@ -22,7 +22,10 @@ WINDOW="${WINDOW:-8}"                        # predictor training window (do not
 GPU="${GPU:-RTX_3090}"
 TIMEOUT="${TIMEOUT:-90m}"
 
-echo "→ Searching ${GPU} (rel>=0.98 inet>=500 cuda>=12.4, cpu_ram>=32 disk>=100)..."
+# cpu_ram is in MB in the vast search API (CLAUDE.md hardware sizing:
+# cpu_ram>=<GB*1024>; cf. vast_stage2_v2.sh's 49152=48GB). 32768 = 32GB host
+# RAM for the fp16 gist store + five [N,8,3584] fp32 condition tensors.
+echo "→ Searching ${GPU} (rel>=0.98 inet>=500 cuda>=12.4, cpu_ram>=32GB disk>=100)..."
 OFFER_ID=""
 for try in 1 2 3 4 5; do
   OFFER_ID=$(vastai search offers \
@@ -65,9 +68,9 @@ timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_
   || { kill \$HB; echo "SETUPFAIL (download too slow)"; echo "ALLDONE"; exit 1; }
 echo "=== SUMMARY PROBE (dataset=${DATASET} window=${WINDOW} pred=${SUBDIR}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_summary_probe \
-  --model-name ${MODEL} --repo ${REPO} \
-  --artifacts-repo ${REPO} --subdir ${SUBDIR} --out-repo ${REPO} \
-  --dataset ${DATASET} --window ${WINDOW} 2>&1 | tee /root/summary_probe.log
+  --model-name "${MODEL}" --repo "${REPO}" \
+  --artifacts-repo "${REPO}" --subdir "${SUBDIR}" --out-repo "${REPO}" \
+  --dataset "${DATASET}" --window "${WINDOW}" 2>&1 | tee /root/summary_probe.log
 echo "SUMMARY_PROBE_RC=\${PIPESTATUS[0]}" | tee -a /root/summary_probe.log
 kill \$HB 2>/dev/null
 echo "ALLDONE" | tee -a /root/summary_probe.log

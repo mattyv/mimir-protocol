@@ -32,6 +32,7 @@ Smoke: PYTHONPATH=src python -m marker.run_summary_probe --smoke
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 from pathlib import Path
 
@@ -56,6 +57,37 @@ from marker.summaryprobe import (
 )
 
 # ── model-free plumbing (unit-tested without loading anything) ──────────────
+
+
+def _smoke_varied_cot_texts(n: int) -> list[str]:
+    """n synthetic multi-step traces for --smoke, with the OPERATOR ORDER
+    permuted per doc (doc i uses permutation i % 24 of +,-,*,/). run_stage2's
+    _smoke_cot_texts uses ONE fixed template, so there op = f(step position)
+    exactly, the `shallow` (position/length) control scores 1.0, chance_p
+    pins at 1.0 and the verdict is RED by construction -- the GREEN/YELLOW
+    branch logic never runs. Permuting the order per doc breaks
+    op-determined-by-position, so the smoke exercises the real verdict path
+    (the smoke test asserts shallow < 1.0). Operands are picked so every
+    relation is exact positive-integer arithmetic."""
+    perms = list(itertools.permutations(("+", "-", "*", "/")))
+    out = []
+    for i in range(n):
+        lines = [f"Start with {3 + i} items."]
+        c = 3 + i
+        for j, op in enumerate(perms[i % len(perms)]):
+            a, b = 3 + ((i + 2 * j) % 7), 2 + ((3 * i + j) % 5)
+            if op == "+":
+                c = a + b
+            elif op == "-":
+                a, c = a + b, a
+            elif op == "*":
+                c = a * b
+            else:
+                a, c = a * b, a
+            lines.append(f"Then compute {a} {op} {b} = {c}.")
+        lines.append(f"#### {c}")
+        out.append("\n".join(lines))
+    return out
 
 
 def _items_from_docs(docs: list[list[tuple[str, list[int]]]]) -> tuple[list[dict], int]:
@@ -101,16 +133,23 @@ def _condition_features(items, summs, predictor, window, noise_gen05, noise_gen1
     before it touches the predictor or noised() -- a Linear layer's fp32
     weights against an fp16 input hard-crashes ("expected ... same dtype",
     the same trap test_vector_builder.py already hits elsewhere in this
-    repo), so the upcast happens once per doc, not left to chance downstream."""
+    repo), so the upcast happens once per doc, not left to chance downstream.
+    Devices: `summs` lives on CPU (_encode_single_span stores it there) while
+    the predictor may sit on CUDA -- predict_step does NO device move of its
+    own, so the doc's summaries are shuttled to the predictor's device for
+    the forward and the result brought back, keeping every returned condition
+    tensor on CPU (train_probe's nn.Linear and the labels are CPU; a CUDA
+    feature tensor would crash the first probe fit on the real GPU run)."""
     from marker.run_bridge import noised, predict_step  # noqa: PLC0415
 
+    pdev = next(predictor.parameters()).device
     clean, n05, n10, pred, hist = [], [], [], [], []
     for it in items:
         summ, n = summs[it["doc"]].float(), it["n"]
         clean.append(summ[n])
         n05.append(noised(summ[n], 0.5, noise_gen05))
         n10.append(noised(summ[n], 1.0, noise_gen10))
-        pred.append(predict_step(predictor, summ, n, window))
+        pred.append(predict_step(predictor, summ.to(pdev), n, window).float().cpu())
         hist.append(summ[n - 1])
     return {
         "clean": torch.stack(clean),
@@ -210,12 +249,18 @@ def _run_probes(items, y, feat_all, n_components=128, max_steps=2000, patience=2
         for c in ("clean", "noised_05", "noised_10", "pred")
     }
 
+    # The control's VAL labels are permuted too: val is carved out of the
+    # train side, and early-stopping the shuffled model on TRUE val labels
+    # would let checkpoint selection chase real label signal -- a
+    # true-label channel into the very control that exists to certify the
+    # pipeline carries none (it inflates `shuffled` and can fake INVALID).
     y_shuf = shuffle_labels_train(y[idx_fit], seed=seed)
+    y_shuf_val = shuffle_labels_train(y[idx_val], seed=seed + 100)
     model_shuf = train_probe(
         xtr_p,
         y_shuf,
         xv_p,
-        y[idx_val],
+        y_shuf_val,
         len(OP_CLASSES),
         max_steps=max_steps,
         patience=patience,
@@ -350,7 +395,7 @@ def _encode_single_span(pm, gist, ids_list):  # noqa: ANN001
     (see _condition_features) before any arithmetic that needs it."""
     from marker.gist_model import encode_gist  # noqa: PLC0415
 
-    return torch.stack([encode_gist(pm, gist, [ids]).float()[0] for ids in ids_list]).half()
+    return torch.stack([encode_gist(pm, gist, [ids]).float()[0] for ids in ids_list]).half().cpu()
 
 
 @torch.no_grad()
@@ -368,7 +413,9 @@ def _sanity_cos_single_vs_batched(pm, gist, docs, summs, target_n=50):
         if len(cos_vals) >= target_n:
             break
         ids_list = [ids for _, ids in doc]
-        batched = encode_gist(pm, gist, ids_list).float()  # [n_steps, k, d]
+        # .cpu(): the encode runs on the model's device (CUDA on the real
+        # run) but `summs` is stored on CPU -- cosine across devices crashes
+        batched = encode_gist(pm, gist, ids_list).float().cpu()  # [n_steps, k, d]
         single = summs[di].float()  # stored fp16 -- upcast before comparing
         for s in range(batched.shape[0]):
             if len(cos_vals) >= target_n:
@@ -407,7 +454,7 @@ def main() -> None:  # noqa: PLR0915
     from marker.predictor import NextThoughtPredictor  # noqa: PLC0415
     from marker.reason_check import split_solution_steps  # noqa: PLC0415
     from marker.run_confidence import _predictor_from_state  # noqa: PLC0415
-    from marker.run_stage2 import _load_stage1, _smoke_cot_texts  # noqa: PLC0415
+    from marker.run_stage2 import _load_stage1  # noqa: PLC0415
 
     pm, gist, tok = _load_stage1(
         args.model_name, args.repo, device, device == "cuda" and not args.smoke
@@ -434,7 +481,7 @@ def main() -> None:  # noqa: PLR0915
 
     # ── data: GSM8K test, streaming; keep ALL docs with >=3 steps ────────────
     if args.smoke:
-        texts = _smoke_cot_texts(20)
+        texts = _smoke_varied_cot_texts(20)
     else:
         from datasets import load_dataset  # noqa: PLC0415
 
@@ -458,6 +505,20 @@ def main() -> None:  # noqa: PLR0915
     # ── encode: single-span per step, fp16 on CPU per doc ────────────────────
     summs = [_encode_single_span(pm, gist, [ids for _, ids in doc]) for doc in docs]
     cos_single_vs_batched = _sanity_cos_single_vs_batched(pm, gist, docs, summs, target_n=50)
+    if cos_single_vs_batched is not None and cos_single_vs_batched < 0.99:
+        # Report loudly, do NOT abort: the probe and the pushed cache use
+        # single-span encodes throughout, so the run's own numbers are
+        # internally consistent -- but a low value means the encoder's output
+        # for the SAME step shifts under per-doc batch padding, which is
+        # itself a finding about encode stability and a caveat when comparing
+        # against harnesses that batch per doc (e.g. run_predprobe).
+        print(
+            f"[SUMPROBE WARNING] cos_single_vs_batched={cos_single_vs_batched} < 0.99 -- "
+            "single-span vs per-doc-batched encodes of the same step disagree; the probe "
+            "stays valid (single-span throughout) but cross-harness comparisons are not "
+            "apples-to-apples.",
+            flush=True,
+        )
 
     # ── labels + the shared (doc, n) item list ───────────────────────────────
     items, n_dropped_no_relation = _items_from_docs(docs)

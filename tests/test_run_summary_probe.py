@@ -25,6 +25,7 @@ from marker.run_summary_probe import (
     _prepare,
     _run_probes,
     _shallow_features,
+    _smoke_varied_cot_texts,
     _split_indices,
     _transform,
     _write_cache_shards,
@@ -59,6 +60,32 @@ def test_items_from_docs_op_and_n_tokens():
     docs = [_doc("start.", "6 / 2 = 3.")]
     items, _ = _items_from_docs(docs)
     assert items[0] == {"doc": 0, "n": 1, "op": "/", "n_tokens": 3}
+
+
+# ── _smoke_varied_cot_texts: op is NOT a function of step position ──────────
+
+
+def test_smoke_varied_texts_vary_operator_at_every_position():
+    # run_stage2's fixed template makes op = f(position) exactly, which pins
+    # `shallow` at 1.0 and the verdict at RED by construction. The smoke
+    # fixture must break that: at every step position, different docs use
+    # different operators.
+    from marker.reason_check import split_solution_steps
+    from marker.summaryprobe import op_label
+
+    texts = _smoke_varied_cot_texts(20)
+    ops_at = {}
+    for t in texts:
+        steps = split_solution_steps(t)
+        assert len(steps) >= 3
+        for n, s in enumerate(steps):
+            if n == 0:
+                assert op_label(s) is None  # intro line, no relation
+            else:
+                op = op_label(s)
+                assert op in {"+", "-", "*", "/"}, (n, s)
+                ops_at.setdefault(n, set()).add(op)
+    assert all(len(ops) > 1 for ops in ops_at.values()), ops_at
 
 
 # ── _shallow_features: one-hot(min(n,7)) + n_tokens, no gist content ────────
@@ -155,7 +182,11 @@ def test_split_indices_partitions_every_item_exactly_once():
     idx_fit, idx_val, idx_test, train_docs, test_docs, val_docs = _split_indices(items, seed=0)
     all_idx = set(idx_fit) | set(idx_val) | set(idx_test)
     assert all_idx == set(range(len(items)))
-    assert not (set(idx_fit) & set(idx_val) & set(idx_test))
+    # pairwise disjoint (a triple intersection is vacuously empty whenever
+    # ANY pair is disjoint -- it would miss a fit/val overlap)
+    assert not (set(idx_fit) & set(idx_val))
+    assert not (set(idx_fit) & set(idx_test))
+    assert not (set(idx_val) & set(idx_test))
     assert set(train_docs) & set(test_docs) == set()
     assert set(val_docs) <= set(train_docs)
 
@@ -251,6 +282,49 @@ def test_run_probes_returns_all_required_cells_and_a_known_verdict():
     )
 
 
+def test_run_probes_shuffled_control_never_sees_true_val_labels(monkeypatch):
+    # The shuffled control certifies the pipeline carries no label signal.
+    # Its model is early-stopped on val loss -- if those val labels were the
+    # TRUE ones, checkpoint selection could chase real label signal and
+    # inflate `shuffled` (fake INVALID). Both its train AND val labels must
+    # be permuted.
+    import marker.run_summary_probe as rsp
+
+    torch.manual_seed(0)
+    items = _synthetic_items(n_docs=30, steps_per_doc=4)
+    y = encode_labels([it["op"] for it in items])
+    n, k, d = len(items), 2, 6
+    clean = torch.randn(n, k, d)
+    feat_all = {
+        "clean": clean,
+        "noised_05": clean.clone(),
+        "noised_10": clean.clone(),
+        "pred": clean.clone(),
+        "hist": clean.clone(),
+    }
+    idx_val = _split_indices(items, seed=0)[1]
+    y_val_true = y[idx_val]
+
+    calls = []
+    orig = rsp.train_probe
+
+    def spy(x_train, y_train, x_val, y_val, *a, **kw):
+        calls.append((y_train.clone(), y_val.clone()))
+        return orig(x_train, y_train, x_val, y_val, *a, **kw)
+
+    monkeypatch.setattr(rsp, "train_probe", spy)
+    rsp._run_probes(items, y, feat_all, n_components=4, max_steps=20, patience=10)
+
+    # call order in _run_probes: P_clean, shuffled, P_pred, P_noised_10,
+    # P_hist, shallow -- the shuffled fit is the second call
+    _, y_val_shuf = calls[1]
+    assert sorted(y_val_shuf.tolist()) == sorted(y_val_true.tolist())  # a permutation...
+    assert not torch.equal(y_val_shuf, y_val_true)  # ...not the true labels
+    # every OTHER fit early-stops on the true val labels
+    for i in (0, 2, 3, 4, 5):
+        assert torch.equal(calls[i][1], y_val_true), i
+
+
 # ── _write_cache_shards: index covers every step, shard dtype is fp16 ───────
 
 
@@ -321,6 +395,10 @@ def test_smoke_manifest_has_all_cells_and_a_verdict():
     }
     assert manifest["n_items"] > 0
     assert manifest["cos_single_vs_batched"] is not None
+    # the varied-operator smoke fixture must keep op from being a pure
+    # function of position -- otherwise chance_p pins at 1.0 and the verdict
+    # is RED by construction, never exercising the GREEN/YELLOW branch logic
+    assert manifest["cells"]["shallow"] < 1.0, manifest["cells"]
     for key in ("pred_vs_clean", "pred_vs_hist", "noised_05_vs_clean", "noised_10_vs_clean"):
         assert key in manifest["cosines"]
     assert "train_docs" in manifest["split"] and "test_docs" in manifest["split"]
