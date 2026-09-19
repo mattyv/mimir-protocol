@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Stage-3 render training on a Vast RTX 3090 (run_render.py): teach a small
-# decoder to reconstruct a step's text from its thought. Trains the 'render'
-# LoRA against the frozen Stage-1 encoder; evals reconstruction F1 quantiles +
+# Stage-3 render training on Vast (run_render.py): teach a small decoder to
+# reconstruct a step's text from its thought. Trains the 'render' LoRA
+# against the frozen Stage-1 encoder; evals reconstruction F1 quantiles +
 # number-recall; pushes the adapter. ~$0.3-0.5, ~1-1.5h.
+#
+# Bilingual reader (KVSRC=mixed): also trains on bridge_validated KV, warm-
+# started from an existing (encoder-only) render adapter, so the result reads
+# BOTH dialects without losing the first. Real invocation:
+#   GPU=RTX_4090 KVSRC=mixed WARM=render_adapter_ledger \
+#     OUTSUB=render_adapter_oneform STEPS=3000 LR=1e-4 ./scripts/vast_render.sh
 #
 #   HF_TOKEN=... ./scripts/vast_render.sh
 set -euo pipefail
@@ -15,13 +21,20 @@ DATASET="${DATASET:-openai/gsm8k}"
 UNIT="${UNIT:-line}"
 NDOCS="${NDOCS:-800}"
 STEPS="${STEPS:-2000}"
-TIMEOUT="${TIMEOUT:-2h}"
+LR="${LR:-2e-4}"
+GPU="${GPU:-RTX_3090}"
+KVSRC="${KVSRC:-gist}"
+WARM="${WARM:-}"
+OUTSUB="${OUTSUB:-}"
+EVALCAP="${EVALCAP:-150}"
+BRIDGESUB="${BRIDGESUB:-bridge_validated}"
+TIMEOUT="${TIMEOUT:-4h}"
 
-echo "→ Searching RTX 3090 (rel>=0.98 inet>=500 cuda>=12.4)..."
+echo "→ Searching ${GPU} (rel>=0.98 inet>=500 cuda>=12.4)..."
 OFFER_ID=""
 for try in 1 2 3 4 5; do
   OFFER_ID=$(vastai search offers \
-    'gpu_name=RTX_3090 num_gpus=1 gpu_ram>=23 cuda_vers>=12.4 disk_space>=100 reliability>=0.98 inet_down>=500 rentable=true' \
+    "gpu_name=${GPU} num_gpus=1 gpu_ram>=23 cuda_vers>=12.4 disk_space>=100 cpu_ram>=32768 reliability>=0.98 inet_down>=500 rentable=true" \
     --order 'reliability-' --limit 1 --raw 2>/dev/null | \
     python3 -c "import sys,json
 try: o=json.load(sys.stdin); print(o[0]['id'] if o else '')
@@ -57,10 +70,12 @@ python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get
 echo "=== download ${MODEL} (authenticated, 20min cap) ==="
 timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2 \
   || { kill \$HB; echo "SETUPFAIL (download too slow)"; echo "ALLDONE"; exit 1; }
-echo "=== run: render training (ndocs=${NDOCS} steps=${STEPS} ledger=${LEDGER:-}) ==="
+echo "=== run: render training (ndocs=${NDOCS} steps=${STEPS} kv-source=${KVSRC} warm=${WARM:-<none>} out-subdir=${OUTSUB:-<default>}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_render \
   --model-name ${MODEL} --repo ${REPO} --out-repo ${REPO} --dataset ${DATASET} --unit ${UNIT} \
-  --n-docs ${NDOCS} --steps ${STEPS} ${LEDGER:+--ledger} 2>&1 | tee /root/render.log
+  --n-docs ${NDOCS} --steps ${STEPS} --lr ${LR} --ledger \
+  --kv-source ${KVSRC} --bridge-subdir ${BRIDGESUB} --eval-cap ${EVALCAP} \
+  ${WARM:+--warm-start-subdir ${WARM}} ${OUTSUB:+--out-subdir ${OUTSUB}} 2>&1 | tee /root/render.log
 kill \$HB 2>/dev/null
 echo "RENDER_RC=\${PIPESTATUS[0]}" | tee -a /root/render.log
 echo "ALLDONE" | tee -a /root/render.log
