@@ -541,3 +541,30 @@ content; whether it can VERBALIZE it is unmeasured, ~1 small eval). Retrain rend
 on bridge-KV only if that fails. NOTE (Opus): this generate-from-injection path is
 adjacent to closed lanes (gist_read null; raw-injection-as-context poisons 0.111) —
 scope carefully / Fable-design-review before spending, it may be the same wall.
+
+## BILINGUAL READER RESULT (2026-09-19): reader learns the converter dialect — mostly via the ledger
+
+Retrained the reader (render LoRA) on BOTH encoder KV and converter KV
+(bridge_validated), warm-started from render_adapter_ledger, 3000 steps, LR 1e-4,
+ledger on. Pushed to HF `render_adapter_oneform/`. Manifest:
+results/render_adapter_oneform_manifest.json. Node ~70 min on a 4090, ~$0.85.
+Step-0 baseline (untouched reader) reproduced the probe: gist 0.912 / bridge
+0.206 / wrong 0.176 — harness valid.
+
+relations-exact, held-out gsm8k (n=150):
+| dialect | step0 | final |
+|---|---|---|
+| gist (encoder KV) | 0.912 | 0.956 |
+| bridge (converter KV) | 0.206 | **0.794** |
+| wrong_bridged (cross-doc floor) | 0.176 | **0.529** |
+| bridge_no_ledger | 0.000 | 0.000 |
+| margin bridge − wrong | 0.030 | **0.265** |
+fresh synthetic templates: bridge 0.567 vs wrong 0.533 → margin 0.034.
+Training loss: gist dialect → 0.02/token; bridge dialect plateaued ~1.0-1.2.
+
+Pre-registered proceed-to-probe bar (bridge ≥ 0.40 AND margin ≥ 0.30): bridge
+passes, margin FAILS (0.265; ~0 on fresh data). The floor rose 0.18→0.53 while
+bridge_no_ledger stayed 0.0: most of the apparent gain is the reader learning to
+rebuild the step from the handed numbers (ledger) plus generic structure, not
+from thought-specific content in the converter's KV. Probe NOT launched pending
+Fable's interpretation (recorded below when it lands).
