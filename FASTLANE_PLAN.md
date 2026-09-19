@@ -568,3 +568,40 @@ bridge_no_ledger stayed 0.0: most of the apparent gain is the reader learning to
 rebuild the step from the handed numbers (ledger) plus generic structure, not
 from thought-specific content in the converter's KV. Probe NOT launched pending
 Fable's interpretation (recorded below when it lands).
+
+**Fable verdict (2026-09-19): probe NOT launched; converter is the wall by design.**
+- The 0.79 is ledger-flattered: the ledger hands all numbers incl. the result, so
+  the operator is usually inferable from numbers alone — that is the 0.53 floor
+  (identical on gsm8k and fresh). Only the margin is thought-specific: 0.265 on
+  gsm8k (~5 SE, but plausibly step-FAMILY leakage), 0.03 on fresh templates
+  where gist KV scores 0.975 on the same reader/records — the converter's KV
+  fails to convey even a 4-way operator choice.
+- Cause is the converter's objective: bridge_validated is trained on next-step
+  NLL with input noise (invariant at cos ~0.89). The next step rarely needs the
+  previous operator, so "lossless for solving" (0.817) coexists with "operator
+  dropped". Reader capacity is not the constraint (same LoRA holds gist at 0.02).
+  Loss-plateau evidence is 8 single-record prints — supporting, not decisive;
+  next run should log per-dialect running means.
+- Running the probe would pass its own gate 1 (H≈0.27) yet read P through a pipe
+  that carries family-level, not step-level, structure — GREEN and RED both
+  uninterpretable. $0.50 for a known outcome.
+- Retire `bridge_no_ledger` as a diagnostic (ledger-trained reader is
+  ledger-dependent in every dialect); add `wrong_gist` and `gist_no_ledger`
+  cells next time.
+
+**Next, ranked (Fable):**
+(c) FIRST, ~$0.30: summary-content probe. Encode 1-2k held-out step summaries,
+    label operator via extract_relations, fit a logistic probe summary→operator
+    on CPU; re-score on noised(0.5) (what the bridge ignores), noised(1.0) (the
+    predictor's error distance), and actual predictor outputs. Decides whether
+    the operator survives predictor-sized noise at all. If it collapses, no
+    reader/bridge can read structure from a PREDICTED thought — P is dead by
+    construction and the commit-every-~2-steps design is the answer.
+(a') SECOND, ~$1: train a second bridge `bridge_render` on ledger_render_nll
+    through the bilingual reader, same noise schedule; leave bridge_validated
+    untouched. Probe needs no code (--bridge-subdir). Bar: margin ≥ 0.30 gsm8k
+    AND ≥ 0.15 fresh.
+(b) "One form" reader: pushback — a final-layer summary has no KV; something
+    must map it to something attendable. The seam can be reshaped (soft prompt,
+    residual injection), not removed, and must be trained under predictor
+    noise. Only if (a') fails while (c) says the information is present.
