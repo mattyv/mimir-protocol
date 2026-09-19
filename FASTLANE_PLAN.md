@@ -605,3 +605,59 @@ Fable's interpretation (recorded below when it lands).
     must map it to something attendable. The seam can be reshaped (soft prompt,
     residual injection), not removed, and must be trained under predictor
     noise. Only if (a') fails while (c) says the information is present.
+
+## SUMMARY-CONTENT PROBE RESULT (2026-09-19): the predicted thought does not carry the step's operator — RED, structural
+
+Does the arithmetic operator survive in the 8x3584 summary? Linear probe,
+doc-disjoint, GSM8K test (993 docs, 1974 labelled steps; 1200 no-relation steps
+dropped). Manifest: results/summary_probe_manifest.json. Node ~$0.30 total
+(incl. one aborted launch); summaries cached at HF summary_cache_gsm8k_test/.
+
+| cell (test n=383) | acc | Wilson 95% |
+|---|---|---|
+| majority / position+length / shuffled labels | 0.339 / 0.339 / 0.295 | valid |
+| true summary (clean) | **0.825** | 0.78-0.86 |
+| true summary + predictor-sized random noise (cos 0.71) | 0.739-0.783 | 0.69-0.82 |
+| **predicted summary** (cos 0.65 to truth) | **0.423** | 0.37-0.47 |
+| previous step's summary alone → op_n | 0.436 | 0.39-0.49 |
+| clean-trained probe applied to predictions | 0.198 | one-class collapse ("-" recall 0.97) |
+
+**Fable verdict:** RED stands and is structural. Random noise at the predictor's
+distance costs 0.04-0.09; the real prediction costs 0.40 — the predictor's error
+is not random, it removes exactly the operator-bearing component (a regressor
+under residual uncertainty emits the conditional mean: a blend across operators
+that reads as none). The prediction carries about op_n exactly what the previous
+true step carries (0.42 vs 0.44, near-identical per-class recall), nothing more.
+Root cause is an INPUT-INFORMATION bound, not training: from text, op_n given the
+previous operator = 0.354, given the whole operator history = 0.388 (majority
+0.346). The next operator lives in the QUESTION, which the v1 predictor never
+sees. Same-input retraining (scheduled sampling, more steps/data) cannot add it.
+- "Render a predicted thought into correct words" is dead by construction for
+  this predictor (95%). Matches the bilingual reader's fresh-template margin 0.03.
+- Odds a question-conditioned v2 / gist-transformer clears the GREEN line
+  (P_pred ≥ 0.63 and ≥ P_hist+0.05): ~20%; "reliably renderable" (~0.75+): <10%.
+  Approach-level (a small continuous regressor carrying discrete structure): ~15%.
+  Unless a predictor COMMITS to a mode (samples), it emits blends that render generic.
+- Bridge/reader noise recipe (isotropic ratio 1.0 ≈ "predictor distance") is
+  calibrated to the wrong error model: matching cosine is not matching structure.
+  Anything that must consume predictions should train on actual predictions.
+- Window: the by-n "no cliff" curve has NO power here (97.9% of items have n≤5;
+  the 8+ bin is one item). v1's training window is unrecorded and most likely 6;
+  predict_step's slice is identical under w=6/8 for n≤5, so GSM8K-based results
+  are unaffected; run_rollout (OpenR1, long docs, default 8) is the one place to
+  re-check. Fix at source: record `window` in every stage2 manifest.
+- cos_single_vs_batched 0.979 on the 7B: not material (bridge ignores cos 0.89).
+
+**Standing conclusion:** the render-of-predicted lane is STOPPED for v1. The
+validated identity stands: compression (encoder 0.88) + memory (reader 0.99 /
+reconstitute-then-solve 0.60 vs 0.49) + commit-point re-anchoring. A predicted
+thought is a topical neighbourhood, not a decision.
+
+**The one remaining flip-test (~$0.20):** encode the 993 questions single-span;
+probe [question gist ‖ summ[n-1]] → op_n, same split/pipeline. Bar 0.63 (the
+pre-registered GREEN line). Clears → a question-conditioned v2 is justified
+(~$5-8), gated by this same probe re-run CPU-only on its cached predictions.
+< 0.50 → stop for good: even the question's gist does not linearly carry the next
+operator. Free CPU add-ons from the cache: P_fullhist (window history → op_n),
+cos(clean[n], clean[n-1]), pairwise cos(pred_i,pred_j) vs clean — settle
+copy-vs-blend. Do NOT launch v2 on the current basis.
