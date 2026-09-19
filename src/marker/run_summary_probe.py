@@ -167,6 +167,25 @@ def _mean_cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return round(float(F.cosine_similarity(af, bf, dim=-1).mean()), 4)
 
 
+def _cos_by_n(
+    a: torch.Tensor, b: torch.Tensor, items: list[dict], cap: int = 8
+) -> dict[str, float]:
+    """Mean whole-summary cosine between paired batches, binned by the item's
+    step index n (n >= cap pooled as "cap+"). The window diagnostic: if the
+    predictor's sentence-position rows past its trained window were never
+    learned, pred-vs-clean cosine drops off a cliff at that n."""
+    af, bf = a.reshape(a.shape[0], -1), b.reshape(b.shape[0], -1)
+    cos = F.cosine_similarity(af, bf, dim=-1)
+    bins: dict[str, list[float]] = {}
+    for it, c in zip(items, cos.tolist(), strict=True):
+        key = f"{cap}+" if it["n"] >= cap else str(it["n"])
+        bins.setdefault(key, []).append(c)
+    return {
+        k: round(sum(v) / len(v), 4)
+        for k, v in sorted(bins.items(), key=lambda kv: int(kv[0].rstrip("+")))
+    }
+
+
 def _split_indices(items: list[dict], seed: int = 0):
     """Doc-disjoint 80/20 train/test, then a doc-disjoint 10% val slice carved
     out of the 80% train side (for early stopping) -- one split shared by
@@ -342,16 +361,31 @@ def _run_probes(items, y, feat_all, n_components=128, max_steps=2000, patience=2
     return cells, details
 
 
-def _assert_window_matches(window: int, remote_manifest: dict) -> None:
+def _assert_window_matches(window: int, remote_manifest: dict) -> str:
     """Fail loud if --window doesn't match the predictor's OWN training
     window (stage2_cot_openr1/manifest.json) -- predict_step's windowing only
-    stays in-distribution (sentence-position embeddings) when they agree."""
-    remote_window = remote_manifest.get("window")
+    stays in-distribution (sentence-position embeddings) when they agree.
+    Older stage-2 manifests (the cot_openr1 one) never recorded the window at
+    all: then we cannot check, so WARN loudly and run with --window exactly as
+    every downstream harness (bridge, rollout, predprobe) did, so this probe's
+    numbers stay comparable to theirs. Returns the window's provenance for the
+    manifest; `pred_vs_clean_by_n` is the empirical check (a cliff at some n
+    means positions past the trained window were never learned)."""
+    if "window" not in remote_manifest:
+        print(
+            f"[SUMPROBE WARNING] predictor manifest has no 'window' key -- cannot verify; "
+            f"using --window {window} as the downstream harnesses did (read "
+            "cosines.pred_vs_clean_by_n for a cliff)",
+            flush=True,
+        )
+        return "assumed (predictor manifest lacks 'window')"
+    remote_window = remote_manifest["window"]
     assert remote_window == window, (
         f"--window {window} != predictor's trained window {remote_window!r} "
         "(read from the predictor's own manifest.json) -- sentence-position "
         "embeddings would run out-of-distribution"
     )
+    return "manifest"
 
 
 def _write_cache_shards(docs, summs, out_dir, shard_size=100):  # noqa: ANN001
@@ -463,6 +497,7 @@ def main() -> None:  # noqa: PLR0915
 
     # ── predictor (stage2_cot_openr1) -- no whitener: that subdir's is an
     # identity stub, so raw .float() summaries feed the probe directly ───────
+    window_source = "smoke"
     if args.smoke:
         predictor = NextThoughtPredictor(d=gist.shape[-1], k=k, d_model=48, layers=2, heads=4)
     else:
@@ -476,7 +511,7 @@ def main() -> None:  # noqa: PLR0915
         remote_manifest = json.loads(
             Path(hf_hub_download(args.artifacts_repo, f"{args.subdir}/manifest.json")).read_text()
         )
-        _assert_window_matches(args.window, remote_manifest)
+        window_source = _assert_window_matches(args.window, remote_manifest)
     predictor = predictor.to(device).eval()
 
     # ── data: GSM8K test, streaming; keep ALL docs with >=3 steps ────────────
@@ -531,6 +566,7 @@ def main() -> None:  # noqa: PLR0915
     cosines = {
         "pred_vs_clean": _mean_cos(feat_all["pred"], feat_all["clean"]),
         "pred_vs_hist": _mean_cos(feat_all["pred"], feat_all["hist"]),
+        "pred_vs_clean_by_n": _cos_by_n(feat_all["pred"], feat_all["clean"], items),
         "noised_05_vs_clean": _mean_cos(feat_all["noised_05"], feat_all["clean"]),
         "noised_10_vs_clean": _mean_cos(feat_all["noised_10"], feat_all["clean"]),
     }
@@ -545,6 +581,7 @@ def main() -> None:  # noqa: PLR0915
     manifest = {
         "n_docs": len(docs),
         "window": args.window,
+        "window_source": window_source,
         "n_items": len(items),
         "n_dropped_no_relation": n_dropped_no_relation,
         "cos_single_vs_batched": cos_single_vs_batched,

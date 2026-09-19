@@ -19,6 +19,7 @@ from marker.predictor import NextThoughtPredictor
 from marker.run_summary_probe import (
     _assert_window_matches,
     _condition_features,
+    _cos_by_n,
     _fit_and_score_shallow,
     _items_from_docs,
     _mean_cos,
@@ -353,6 +354,25 @@ def test_assert_window_matches_passes_when_equal():
 def test_assert_window_matches_raises_when_different():
     with pytest.raises(AssertionError):
         _assert_window_matches(8, {"window": 6})
+
+
+def test_assert_window_matches_warns_and_assumes_when_key_missing(capsys):
+    # the real stage2_cot_openr1 manifest has no "window" key (older writer):
+    # must NOT raise, must say so, must report the provenance for the manifest
+    src = _assert_window_matches(8, {"best": {}, "final": {}, "whiten": "off"})
+    assert "assumed" in src
+    assert "WARNING" in capsys.readouterr().out
+    assert _assert_window_matches(8, {"window": 8}) == "manifest"
+
+
+def test_cos_by_n_bins_by_step_index_and_pools_the_tail():
+    items = [{"n": 1}, {"n": 1}, {"n": 3}, {"n": 9}, {"n": 12}]
+    a = torch.eye(5, 6)  # 5 items, flattened dim 6
+    b = a.clone()
+    b[1] = -a[1]  # one n=1 item flipped -> mean cos for n=1 is 0.0
+    out = _cos_by_n(a[:, None, :], b[:, None, :], items, cap=8)
+    assert out == {"1": 0.0, "3": 1.0, "8+": 1.0}
+    assert list(out) == ["1", "3", "8+"]  # ordered by n
 
 
 # ── end-to-end smoke ─────────────────────────────────────────────────────────
