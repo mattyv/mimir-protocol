@@ -13,6 +13,14 @@ def test_extract_relations_normalizes():
     assert extract_relations(t) == ["1.5|*|4|6", "6|*|2|12", "1000|+|2|1002"]
 
 
+def test_extract_relations_allows_optional_dollar_after_equals():
+    # summary-probe bug fix: GSM8K money lines write the result as "= $64" --
+    # the '$' must not block the match (it doesn't change existing behaviour:
+    # no '$' still matches exactly as before, see test_extract_relations_normalizes)
+    t = "She has 24 + 40 = $64 now."
+    assert extract_relations(t) == ["24|+|40|64"]
+
+
 def test_relation_score_catches_wrong_structure_that_f1_misses():
     gold = "She runs 6 * 2 = 12 miles."
     good = "So she runs 6 * 2 = 12 miles in total."

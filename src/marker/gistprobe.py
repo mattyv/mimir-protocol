@@ -15,9 +15,15 @@ import re
 import torch
 
 _REL = re.compile(
-    r"(\d[\d,]*(?:\.\d+)?)\s*([+\-*/x×÷])\s*(\d[\d,]*(?:\.\d+)?)\s*=\s*(\d[\d,]*(?:\.\d+)?)"
+    r"(\d[\d,]*(?:\.\d+)?)\s*([+\-*/x×÷])\s*(\d[\d,]*(?:\.\d+)?)\s*=\s*\$?(\d[\d,]*(?:\.\d+)?)"
 )
 _OPS = {"x": "*", "×": "*", "÷": "/"}
+
+# NOTE: the optional '$' after '=' (summary-probe bug fix) is a strict
+# ADDITION -- it only matches an extra leading '$' on the result, it never
+# changes what matched before. Relations-exact numbers published earlier
+# (gistprobe's reconstitute result, PREDPROBE) were measured against the
+# stricter regex (no '$' allowed) and are unaffected by this widening.
 
 
 def extract_relations(text: str) -> list[str]:
