@@ -11,15 +11,23 @@ against the SAME fit/eval encode -- --smoke always runs both):
      `return_hidden` flag).
   B. fit/eval sets: GSM8K train + OpenR1 steps (fit, doc-disjoint from eval,
      stored to disk in per-slot shards); GSM8K test + a fresh synthetic
-     template set (eval).
+     template set (eval). The shards + fit index are pushed to HF right
+     after the encode (--push-shards, background thread) so the expensive
+     encode is never lost again (node 51724858); --load-shards downloads
+     them and skips the encode entirely (the cache is also stage-2's input).
   C. dictionaries: k-means-based codebooks (gist_dict.py), one slot's shard
-     loaded at a time.
+     loaded at a time, fp16 on the GPU with chunked fp32 math (see
+     gist_dict._CHUNK_ROWS for the peak-memory budget). Each dictionary is
+     pushed the moment it is built; a failing config lands in
+     manifest["configs"][cfg]["error"] and the rest still build.
   D. --eval: native / quantized / wrong_doc_quantized / random_ids conditions
      through the trained reader (render_adapter_oneform), reusing
      run_render's scoring.
   E. --diagnose: CPU-only reconstruction cosines, usage stats, naive-Bayes
      op-from-IDs, a probe on centroid readouts.
-  F. manifest + (non-smoke) push.
+  F. manifest + (non-smoke) push; [GISTDICT PARTIAL] manifest lines are
+     printed after every phase so a killed run still leaves its numbers in
+     the log.
 
 Run (GPU):
     HF_TOKEN=... PYTHONPATH=src python -u -m marker.run_gist_dict \\
@@ -34,6 +42,8 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import threading
+import traceback
 from pathlib import Path
 from typing import NamedTuple
 
@@ -262,6 +272,16 @@ def load_readouts(out_dir) -> torch.Tensor:  # noqa: ANN001
 # ── C. dictionaries ──────────────────────────────────────────────────────────
 
 
+def config_names(ks: list[int], res_k1: int, res_k2: int, ro_k: int, whole_k: int) -> list[str]:
+    """The configured dictionary names, in build order -- the single naming
+    authority build_all_dicts and --eval-configs validation both read."""
+    return [f"kv_K{K}" for K in ks] + [
+        f"kv_res_{res_k1}x{res_k2}",
+        f"ro_K{ro_k}",
+        f"whole_K{whole_k}",
+    ]
+
+
 def build_all_dicts(
     shard_dir,  # noqa: ANN001
     k_slots: int,
@@ -274,29 +294,53 @@ def build_all_dicts(
     whole_proj_dim: int | None,
     seed: int = 0,
     device: str = "cpu",
+    on_built=None,  # noqa: ANN001
+    errors: dict | None = None,
 ):
     """Builds every configured dictionary from the on-disk shards, loading
     at most one slot at a time (per gist_dict.build_dict_* + build_dict_whole
-    contracts). k-means runs on `device` (spec section C: GPU when available
-    -- Lloyd's on [40k, 28672] x K=4096 x 20 iters is ~1e14 FLOPs, hours on
-    CPU, seconds-per-slot on the card the model already occupies); every
-    stored entry comes back on CPU regardless (builder contract). Returns
-    (dicts, fit_ids): dicts[cfg] is a tokenize/detokenize-ready dict;
+    contracts). Slot matrices stay fp16 on `device` -- gist_dict's k-means
+    fp32-accumulates in row chunks, so the peak per config is one fp16 slot
+    matrix + ~1.2 GB of fp32 working set (see gist_dict._CHUNK_ROWS for the
+    full budget), never the ~13.8 GB of fp32 matrices that OOMed node
+    51724858. Every stored entry comes back on CPU regardless (builder
+    contract).
+
+    `on_built(name, dict_)` fires IMMEDIATELY after each config is built --
+    the caller saves/pushes it there, so a later config's failure can never
+    strand an earlier finished one (node 51724858 again: the kv_res OOM lost
+    every already-built dictionary because the push waited for ALL configs).
+    A config that raises is recorded in `errors[name]` and the NEXT config
+    still builds; the CUDA cache is emptied between configs either way.
+
+    Returns (dicts, fit_ids): dicts[cfg] is a tokenize/detokenize-ready dict;
     fit_ids[cfg] is [N, k_slots] long -- the fit set's OWN tokenized ids, a
     free byproduct of the k-means assignment (never recomputed by re-running
     tokenize over the whole fit set)."""
-    readouts = load_readouts(shard_dir)  # [N, k_slots, Dr] fp16, kept resident
+    readouts = load_readouts(shard_dir)  # [N, k_slots, Dr] fp16, kept resident on CPU
 
     def _slot_ro(s):
-        return readouts[:, s, :].float().to(device)
+        return readouts[:, s, :].to(device)  # fp16; builders fp32-accumulate
 
     def _slot_mat(s):
-        return load_slot_shard(shard_dir, s).float().to(device)
+        return load_slot_shard(shard_dir, s).to(device)  # fp16, never .float()ed whole
 
     dicts: dict[str, dict] = {}
     fit_ids: dict[str, torch.Tensor] = {}
 
-    for K in ks:
+    def _register(name, kind, ids, *, slots=None, entry=None):
+        d = {"cfg": name, "kind": kind, "geometry": geometry}
+        if entry is not None:
+            d["entry"] = entry
+        else:
+            d["slots"] = slots
+        dicts[name] = d
+        fit_ids[name] = ids
+        print(f"built {name}", flush=True)
+        if on_built is not None:
+            on_built(name, d)
+
+    def _build_kv(K):
         slots, assigns = [], []
         for s in range(k_slots):
             mat = _slot_mat(s)
@@ -304,51 +348,67 @@ def build_all_dicts(
             slots.append(entry)
             assigns.append(assign)
             del mat
-        name = f"kv_K{K}"
-        dicts[name] = {"cfg": name, "kind": "kv", "geometry": geometry, "slots": slots}
-        fit_ids[name] = torch.stack(assigns, dim=1)
-        print(f"built {name}", flush=True)
+        _register(f"kv_K{K}", "kv", torch.stack(assigns, dim=1), slots=slots)
 
-    slots, assigns = [], []
-    for s in range(k_slots):
-        mat = _slot_mat(s)
-        entry, a1, a2 = build_dict_kv_residual(mat, _slot_ro(s), res_k1, res_k2, seed=seed)
-        slots.append(entry)
-        assigns.append(a1 * res_k2 + a2)
-        del mat
-    name = f"kv_res_{res_k1}x{res_k2}"
-    dicts[name] = {"cfg": name, "kind": "kv_res", "geometry": geometry, "slots": slots}
-    fit_ids[name] = torch.stack(assigns, dim=1)
-    print(f"built {name}", flush=True)
+    def _build_res():
+        slots, assigns = [], []
+        for s in range(k_slots):
+            # mat is CONSUMED (overwritten with residuals in place) -- a
+            # fresh shard load per config makes that safe
+            mat = _slot_mat(s)
+            entry, a1, a2 = build_dict_kv_residual(mat, _slot_ro(s), res_k1, res_k2, seed=seed)
+            slots.append(entry)
+            assigns.append(a1 * res_k2 + a2)
+            del mat
+        _register(f"kv_res_{res_k1}x{res_k2}", "kv_res", torch.stack(assigns, dim=1), slots=slots)
 
-    slots, assigns = [], []
-    for s in range(k_slots):
-        mat = _slot_mat(s)
-        entry, assign = build_dict_ro(_slot_ro(s), mat, ro_k, seed=seed)
-        slots.append(entry)
-        assigns.append(assign)
-        del mat
-    name = f"ro_K{ro_k}"
-    dicts[name] = {"cfg": name, "kind": "ro", "geometry": geometry, "slots": slots}
-    fit_ids[name] = torch.stack(assigns, dim=1)
-    print(f"built {name}", flush=True)
+    def _build_ro():
+        slots, assigns = [], []
+        for s in range(k_slots):
+            mat = _slot_mat(s)
+            entry, assign = build_dict_ro(_slot_ro(s), mat, ro_k, seed=seed)
+            slots.append(entry)
+            assigns.append(assign)
+            del mat
+        _register(f"ro_K{ro_k}", "ro", torch.stack(assigns, dim=1), slots=slots)
 
-    entry, assign = build_dict_whole(
-        _slot_mat, k_slots, whole_k, seed=seed, proj_dim=whole_proj_dim, proj_seed=seed
-    )
-    # per-slot mean readouts for the whole dict too (spec C stores mu for
-    # every config; quantized_readouts / the centroid probe need it)
-    from marker.gist_dict import _cluster_means  # noqa: PLC0415
+    def _build_whole():
+        entry, assign = build_dict_whole(
+            _slot_mat, k_slots, whole_k, seed=seed, proj_dim=whole_proj_dim, proj_seed=seed
+        )
+        # per-slot mean readouts for the whole dict too (spec C stores mu for
+        # every config; quantized_readouts / the centroid probe need it)
+        from marker.gist_dict import _cluster_means  # noqa: PLC0415
 
-    for s in range(k_slots):
-        entry["slots"][s]["mu_readout"] = _cluster_means(
-            readouts[:, s, :].float(), assign, whole_k
-        ).half()
-    name = f"whole_K{whole_k}"
-    dicts[name] = {"cfg": name, "kind": "whole", "geometry": geometry, "entry": entry}
-    fit_ids[name] = assign.unsqueeze(1).expand(-1, k_slots).clone()
-    print(f"built {name}", flush=True)
+        for s in range(k_slots):
+            entry["slots"][s]["mu_readout"] = _cluster_means(
+                readouts[:, s, :], assign, whole_k
+            ).half()
+        _register(
+            f"whole_K{whole_k}",
+            "whole",
+            assign.unsqueeze(1).expand(-1, k_slots).clone(),
+            entry=entry,
+        )
 
+    plans = [(f"kv_K{K}", lambda K=K: _build_kv(K)) for K in ks]
+    plans += [
+        (f"kv_res_{res_k1}x{res_k2}", _build_res),
+        (f"ro_K{ro_k}", _build_ro),
+        (f"whole_K{whole_k}", _build_whole),
+    ]
+    assert [n for n, _ in plans] == config_names(ks, res_k1, res_k2, ro_k, whole_k)
+    for name, fn in plans:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- one config's OOM must not strand the rest
+            traceback.print_exc()
+            if errors is not None:
+                errors[name] = f"{type(e).__name__}: {e}"
+            print(f"[GISTDICT] build {name} FAILED -- continuing: {e}", flush=True)
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     return dicts, fit_ids
 
 
@@ -356,6 +416,65 @@ def save_dict(dict_: dict, out_dir) -> None:  # noqa: ANN001
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     torch.save(dict_, out / f"dict_{dict_['cfg']}.pt")
+
+
+def _per_config_saver(dict_out, out_repo, smoke: bool):  # noqa: ANN001
+    """The on_built hook main wires into build_all_dicts: save the finished
+    dictionary to disk, then push it to HF IMMEDIATELY -- per config, never
+    after all configs (upload_folder skips files already on the hub, so each
+    call transfers only the new dictionary). A config built = a config safe
+    off the node."""
+
+    def _on_built(name, dict_):  # noqa: ANN001
+        save_dict(dict_, dict_out)
+        if not smoke and out_repo:
+            _push_with_retry(out_repo, str(dict_out), "gist_dict")
+            print(f"pushed {name} to {out_repo}/gist_dict", flush=True)
+
+    return _on_built
+
+
+# ── fit-shard cache: push after encode, load to skip the encode ─────────────
+
+
+def write_fit_index(shard_dir, fit_items, geometry: dict, d: int, dr: int, too_long: int) -> None:  # noqa: ANN001
+    """fit_index.json: everything --load-shards needs to skip the encode --
+    doc keys (the probe's doc-disjoint split), token ids and texts (op
+    labels), geometry and the drop counter. Without it the shards are just
+    unlabeled rows. Doc keys (tuples) are stored as lists; load_fit_index
+    re-tuples them, since they are set/dict members downstream."""
+    payload = {
+        "geometry": geometry,
+        "d": d,
+        "dr": dr,
+        "n_fit_too_long": too_long,
+        "items": [[list(doc_key), list(ids), text] for doc_key, ids, text in fit_items],
+    }
+    (Path(shard_dir) / "fit_index.json").write_text(json.dumps(payload))
+
+
+def load_fit_index(shard_dir):  # noqa: ANN001
+    """-> (fit_items, geometry, d, dr, n_too_long), the exact tuple shape
+    write_fit_index consumed (doc keys back as tuples)."""
+    p = json.loads((Path(shard_dir) / "fit_index.json").read_text())
+    items = [(tuple(dk), ids, text) for dk, ids, text in p["items"]]
+    return items, p["geometry"], p["d"], p["dr"], p["n_fit_too_long"]
+
+
+def fetch_fit_shards(repo_id, k_slots: int) -> Path:  # noqa: ANN001
+    """Downloads <repo>/gist_dict/fit_shards -> local shard dir (the HF
+    cache's copy; read-only is fine, every consumer only reads). Fails loud
+    on an incomplete cache -- a missing slot shard means the pushing run died
+    mid-upload and the encode must be redone, not silently under-fit."""
+    from huggingface_hub import snapshot_download  # noqa: PLC0415
+
+    loc = snapshot_download(repo_id, allow_patterns=["gist_dict/fit_shards/*"])
+    shard_dir = Path(loc) / "gist_dict" / "fit_shards"
+    expected = [f"slot_{s}.safetensors" for s in range(k_slots)]
+    expected += ["readouts.safetensors", "fit_index.json"]
+    missing = [f for f in expected if not (shard_dir / f).exists()]
+    assert not missing, f"fit-shard cache on {repo_id} incomplete: missing {missing}"
+    return shard_dir
 
 
 # ── D. GPU eval: native / quantized / wrong_doc_quantized / random_ids ──────
@@ -778,6 +897,21 @@ def main() -> None:  # noqa: PLR0915
         "node's wall-clock budget.",
     )
     ap.add_argument("--probe-fit-cap", type=int, default=20000)
+    ap.add_argument(
+        "--push-shards",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="upload the fp16 fit shards + readouts + fit index to "
+        "<out-repo>/gist_dict/fit_shards right after the encode, in a "
+        "background thread overlapped with k-means -- the resumable cache "
+        "--load-shards reads, and stage-2's input",
+    )
+    ap.add_argument(
+        "--load-shards",
+        action="store_true",
+        help="download gist_dict/fit_shards from --out-repo and SKIP the fit "
+        "encode (same model/geometry required; verified against a probe encode)",
+    )
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--diagnose", action="store_true")
     ap.add_argument("--cache-dir", default="/tmp/gist_dict_cache")  # noqa: S108
@@ -828,30 +962,47 @@ def main() -> None:  # noqa: PLR0915
     print(f"eval sets: {len(eval_gsm8k)} gsm8k, {len(eval_fresh)} fresh", flush=True)
 
     counters = {"too_long": 0}
-    fit_doc_iters = (
-        [_gsm8k_docs("train", args.n_fit, args.dataset, smoke=args.smoke)]
-        if args.smoke
-        else [
-            _gsm8k_docs("train", args.n_fit, args.dataset),
-            _openr1_docs(args.n_fit, args.openr1_dataset),
-        ]
-    )
-    fit_items = build_fit_items(
-        fit_doc_iters, tok, args.max_span, args.n_fit, eval_gsm8k_docs | eval_fresh_docs, counters
-    )
-    print(f"fit set: {len(fit_items)} steps ({counters['too_long']} dropped, too long)", flush=True)
-
-    # ── A. encode the fit set, streamed straight to per-slot shards ────────
-    def _fit_kv_readout_stream():
-        for _doc_key, ids, _text in fit_items:
-            kv, readout, _cs = encode_canonical(
-                pm, gist, ids, base=args.base, max_span=args.max_span
-            )
-            yield kv, readout
+    shard_dir = Path(args.cache_dir) / "fit_shards"
+    stored_geometry = stored_dr = None
+    if args.load_shards:
+        assert args.out_repo, "--load-shards needs --out-repo (where the shard cache lives)"
+        shard_dir = fetch_fit_shards(args.out_repo, k_slots)
+        fit_items, stored_geometry, _stored_d, stored_dr, counters["too_long"] = load_fit_index(
+            shard_dir
+        )
+        n_fit_actual = len(fit_items)
+        print(
+            f"loaded {n_fit_actual} fit steps from {args.out_repo}/gist_dict/fit_shards "
+            "(encode skipped)",
+            flush=True,
+        )
+    else:
+        fit_doc_iters = (
+            [_gsm8k_docs("train", args.n_fit, args.dataset, smoke=args.smoke)]
+            if args.smoke
+            else [
+                _gsm8k_docs("train", args.n_fit, args.dataset),
+                _openr1_docs(args.n_fit, args.openr1_dataset),
+            ]
+        )
+        fit_items = build_fit_items(
+            fit_doc_iters,
+            tok,
+            args.max_span,
+            args.n_fit,
+            eval_gsm8k_docs | eval_fresh_docs,
+            counters,
+        )
+        print(
+            f"fit set: {len(fit_items)} steps ({counters['too_long']} dropped, too long)",
+            flush=True,
+        )
 
     # geometry read from a real probe encode (run_bridge.py's own convention)
     # -- never hardcoded, since a different base model changes every one of
-    # these numbers.
+    # these numbers. Under --load-shards the probe also cross-checks the
+    # downloaded cache against THIS model (a cache from a different model
+    # would silently cluster garbage).
     probe_ids = fit_items[0][1] if fit_items else tok("hi", add_special_tokens=False).input_ids
     probe_kv, probe_readout, _ = encode_canonical(
         pm, gist, probe_ids, base=args.base, max_span=args.max_span
@@ -866,53 +1017,24 @@ def main() -> None:  # noqa: PLR0915
     d = geometry["n_layers"] * 2 * n_kv_heads * head_dim
     dr = probe_readout.shape[-1]
 
-    shard_dir = Path(args.cache_dir) / "fit_shards"
-    n_fit_actual = write_fit_shards(_fit_kv_readout_stream(), shard_dir, d, dr, k_slots)
-    print(f"wrote {n_fit_actual} fit steps to {shard_dir}", flush=True)
-
-    # ── C. dictionaries (k-means on the GPU when there is one) ──────────────
-    dicts, fit_ids = build_all_dicts(
-        shard_dir,
-        k_slots,
-        geometry,
-        ks,
-        args.res_k1,
-        args.res_k2,
-        args.ro_k,
-        args.whole_k,
-        args.whole_proj_dim,
-        seed=args.seed,
-        device=device,
-    )
-    dict_out = Path(args.cache_dir) / "dicts"
-    for dict_ in dicts.values():
-        save_dict(dict_, dict_out)
-    # push the fit-set's readouts + tokenized ids (small) alongside the
-    # dictionaries -- NEVER the 18GB-at-40k per-slot KV shards (section F)
-    shutil.copy(shard_dir / "readouts.safetensors", dict_out / "fit_readouts.safetensors")
-    torch.save(fit_ids, dict_out / "fit_ids.pt")
-
-    # EARLY push, BEFORE the eval loop (the render-run lesson: the encode +
-    # k-means above are the expensive irreplaceable part -- if the eval then
-    # hits the wall-clock cap, the dictionaries must already be off the node)
-    if not args.smoke and args.out_repo:
-        _push_with_retry(args.out_repo, str(dict_out), "gist_dict")
-        print(f"pushed dictionaries (early, pre-eval) to {args.out_repo}/gist_dict", flush=True)
-
-    # which configs get the GPU generation loop (all of them always get the
-    # CPU diagnostics -- ids, op-from-IDs, cosines, AMI, readout probe)
-    all_names = list(dicts)
-    if args.eval_configs == "all":
-        eval_names = set(all_names)
-    elif args.eval_configs == "auto":
-        drop = {f"ro_K{args.ro_k}"}
-        if len(ks) > 1:
-            drop.add(f"kv_K{min(ks)}")
-        eval_names = {n for n in all_names if n not in drop}
+    if args.load_shards:
+        assert geometry == stored_geometry and dr == stored_dr, (
+            f"shard cache was encoded with {stored_geometry}/dr={stored_dr}, "
+            f"this model is {geometry}/dr={dr}"
+        )
     else:
-        eval_names = {x for x in args.eval_configs.split(",") if x}
-        unknown = eval_names - set(all_names)
-        assert not unknown, f"--eval-configs names not built: {sorted(unknown)} vs {all_names}"
+        # ── A. encode the fit set, streamed straight to per-slot shards ────
+        def _fit_kv_readout_stream():
+            for _doc_key, ids, _text in fit_items:
+                kv, readout, _cs = encode_canonical(
+                    pm, gist, ids, base=args.base, max_span=args.max_span
+                )
+                yield kv, readout
+
+        n_fit_actual = write_fit_shards(_fit_kv_readout_stream(), shard_dir, d, dr, k_slots)
+        assert n_fit_actual == len(fit_items), (n_fit_actual, len(fit_items))
+        write_fit_index(shard_dir, fit_items, geometry, d, dr, counters["too_long"])
+        print(f"wrote {n_fit_actual} fit steps to {shard_dir}", flush=True)
 
     # op labels: ONLY fit steps with an extractable relation (an unlabeled
     # step has no honest class to assign it to -- dropping it is the
@@ -934,14 +1056,110 @@ def main() -> None:  # noqa: PLR0915
         "n_eval_gsm8k": len(eval_gsm8k),
         "n_eval_fresh": len(eval_fresh),
         "geometry": geometry,
-        "eval_configs": sorted(eval_names),
         "configs": {},
     }
+    natives: dict[str, list] = {}
+    eval_ids_cache: dict[str, dict[str, torch.Tensor]] = {}
+
+    def _emit_manifest():
+        print(f"[GISTDICT MANIFEST] {json.dumps(manifest, default=str)}", flush=True)
+        if not args.smoke and args.out_repo:
+            manifest_dir = Path(args.cache_dir) / "manifest_out"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            (manifest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+            if eval_ids_cache:
+                torch.save(eval_ids_cache, manifest_dir / "eval_ids.pt")
+            _push_with_retry(args.out_repo, str(manifest_dir), "gist_dict")
+            print(f"pushed manifest to {args.out_repo}/gist_dict", flush=True)
+
+    print(f"[GISTDICT PARTIAL] {json.dumps(manifest, default=str)}", flush=True)  # shards done
+
+    # fit-shard cache push, in a BACKGROUND THREAD: ~20 GB fp16 at the
+    # launcher's inet_up>=200 Mbps floor is ~13-17 min, fully overlapped with
+    # the k-means phase below (network vs GPU). Joined -- and its status
+    # recorded -- before the eval loop starts, so a wall-clock death during
+    # eval can never leave the encode half-uploaded and unnoticed.
+    shard_push = {"status": "cached (loaded from HF)" if args.load_shards else "skipped"}
+    shard_push_thread = None
+    if args.push_shards and not args.load_shards and not args.smoke and args.out_repo:
+
+        def _push_shards_bg():
+            try:
+                _push_with_retry(args.out_repo, str(shard_dir), "gist_dict/fit_shards")
+                shard_push["status"] = "ok"
+                print(f"pushed fit shards to {args.out_repo}/gist_dict/fit_shards", flush=True)
+            except Exception as e:  # noqa: BLE001 -- a failed cache push must not kill the run
+                shard_push["status"] = f"error: {e}"
+                print(f"[GISTDICT] fit-shard push FAILED (run continues): {e}", flush=True)
+
+        shard_push_thread = threading.Thread(target=_push_shards_bg, daemon=True)
+        shard_push_thread.start()
+
+    # ── C. dictionaries (k-means on the GPU when there is one). Each config
+    # is saved + pushed the moment it finishes; a failing config is recorded
+    # in the manifest and the rest still build. ──────────────────────────────
+    dict_out = Path(args.cache_dir) / "dicts"
+    build_errors: dict[str, str] = {}
+    dicts, fit_ids = build_all_dicts(
+        shard_dir,
+        k_slots,
+        geometry,
+        ks,
+        args.res_k1,
+        args.res_k2,
+        args.ro_k,
+        args.whole_k,
+        args.whole_proj_dim,
+        seed=args.seed,
+        device=device,
+        on_built=_per_config_saver(dict_out, args.out_repo, args.smoke),
+        errors=build_errors,
+    )
+    for name, msg in build_errors.items():
+        manifest["configs"].setdefault(name, {})["error"] = msg
+
+    # readouts + fit ids (small) alongside the dictionaries -- the 20GB
+    # per-slot KV shards live under gist_dict/fit_shards, never here
+    dict_out.mkdir(parents=True, exist_ok=True)
+    shutil.copy(shard_dir / "readouts.safetensors", dict_out / "fit_readouts.safetensors")
+    torch.save(fit_ids, dict_out / "fit_ids.pt")
+    if not args.smoke and args.out_repo:
+        _push_with_retry(args.out_repo, str(dict_out), "gist_dict")
+        print(f"pushed fit ids + readouts (pre-eval) to {args.out_repo}/gist_dict", flush=True)
+
+    if shard_push_thread is not None:
+        shard_push_thread.join()
+    manifest["fit_shards_push"] = shard_push["status"]
+    print(f"[GISTDICT PARTIAL] {json.dumps(manifest, default=str)}", flush=True)  # dicts done
+
+    if not dicts:
+        manifest["verdict"] = None
+        _emit_manifest()
+        raise SystemExit(f"every dictionary build failed: {build_errors}")
+
+    # which configs get the GPU generation loop (all of them always get the
+    # CPU diagnostics -- ids, op-from-IDs, cosines, AMI, readout probe)
+    all_names = list(dicts)
+    expected_names = config_names(ks, args.res_k1, args.res_k2, args.ro_k, args.whole_k)
+    if args.eval_configs == "all":
+        eval_names = set(all_names)
+    elif args.eval_configs == "auto":
+        drop = {f"ro_K{args.ro_k}"}
+        if len(ks) > 1:
+            drop.add(f"kv_K{min(ks)}")
+        eval_names = {n for n in all_names if n not in drop}
+    else:
+        eval_names = {x for x in args.eval_configs.split(",") if x}
+        unknown = eval_names - set(expected_names)
+        assert not unknown, f"--eval-configs names not configured: {sorted(unknown)}"
+        skipped = eval_names - set(all_names)
+        if skipped:
+            print(f"[GISTDICT] eval-configs skipped (build failed): {sorted(skipped)}", flush=True)
+        eval_names &= set(all_names)
+    manifest["eval_configs"] = sorted(eval_names)
 
     # ── eval-step canonical encodes + per-config ids (needed by BOTH the
     # GPU eval and the CPU diagnostics) ─────────────────────────────────────
-    natives: dict[str, list] = {}
-    eval_ids_cache: dict[str, dict[str, torch.Tensor]] = {}
     if args.eval or args.diagnose:
         pm.set_adapter("default")
         natives["gsm8k"] = [
@@ -1130,16 +1348,7 @@ def main() -> None:  # noqa: PLR0915
     else:
         manifest["verdict"] = None
 
-    print(f"[GISTDICT MANIFEST] {json.dumps(manifest, default=str)}", flush=True)
-
-    if not args.smoke and args.out_repo:
-        manifest_dir = Path(args.cache_dir) / "manifest_out"
-        manifest_dir.mkdir(parents=True, exist_ok=True)
-        (manifest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
-        if eval_ids_cache:
-            torch.save(eval_ids_cache, manifest_dir / "eval_ids.pt")
-        _push_with_retry(args.out_repo, str(manifest_dir), "gist_dict")
-        print(f"pushed manifest to {args.out_repo}/gist_dict", flush=True)
+    _emit_manifest()
 
 
 if __name__ == "__main__":

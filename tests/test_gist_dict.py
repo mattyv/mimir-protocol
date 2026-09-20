@@ -101,6 +101,38 @@ def test_kmeans_rejects_k_greater_than_n():
         kmeans(x, K=10, seed=0)
 
 
+def test_kmeans_pp_init_chunked_matches_unchunked_bitwise():
+    # each row's distance is independent of the chunking, so any chunk size
+    # must give the SAME seeded picks (the memory fix must not change the
+    # algorithm)
+    x = torch.randn(57, 9, generator=torch.Generator().manual_seed(5))
+    a = kmeans_pp_init(x, K=6, seed=3, chunk_rows=7)
+    b = kmeans_pp_init(x, K=6, seed=3, chunk_rows=10_000)
+    assert torch.equal(a, b)
+
+
+def test_kmeans_chunked_matches_unchunked():
+    x = torch.randn(80, 6, generator=torch.Generator().manual_seed(6))
+    c1, a1, u1 = kmeans(x, K=5, iters=15, seed=2, chunk_rows=11)
+    c2, a2, u2 = kmeans(x, K=5, iters=15, seed=2, chunk_rows=10_000)
+    assert torch.equal(a1, a2)
+    assert torch.equal(u1, u2)
+    assert torch.allclose(c1, c2, atol=1e-5)
+
+
+def test_kmeans_fp16_input_matches_fp32_on_separable_blobs():
+    # the real run hands kmeans fp16 slot matrices; on well-separated blobs
+    # the fp16 path must find the same partition and fp32 centroids
+    g = torch.Generator().manual_seed(0)
+    centers = torch.tensor([[0.0, 0.0], [50.0, 0.0], [0.0, 50.0]])
+    x = torch.cat([c.unsqueeze(0) + 0.1 * torch.randn(30, 2, generator=g) for c in centers])
+    c32, a32, _ = kmeans(x, K=3, iters=20, seed=0)
+    c16, a16, _ = kmeans(x.half(), K=3, iters=20, seed=0)
+    assert c16.dtype == torch.float32
+    assert torch.equal(a16, a32)
+    assert torch.allclose(c16, c32, atol=0.01)
+
+
 # ── dict builders + tokenize/detokenize round trip ──────────────────────────
 
 
@@ -163,6 +195,20 @@ def test_residual_dict_entry_equals_c1_plus_c2():
     back2 = kv_slot_matrix(detokenize(ids2, full_dict, geo))
     want2 = (entry["c1"][1].float() + entry["c2"][1].float()).unsqueeze(0).expand(8, -1)
     assert torch.allclose(back2, want2)
+
+
+def test_residual_build_consumes_input_in_place():
+    # memory contract: the stage-1 residual is written INTO slot_mats, never
+    # into a second full [N, D] matrix next to the original (holding both,
+    # 2 x 40k x 28672 fp32 ≈ 9.2 GB, is what OOMed node 51724858)
+    slot_mats, slot_ro = _slot_fit_data(n=30, d=8, dr=3, seed=9)
+    orig = slot_mats.clone()
+    entry, a1, _a2 = build_dict_kv_residual(slot_mats, slot_ro, K1=3, K2=2, iters=5, seed=0)
+    assert not torch.equal(slot_mats, orig)
+    # what's left in the buffer IS the stage-1 residual (entry["c1"] is the
+    # half-cast of the fp32 stage-1 centroids, hence the loose atol)
+    want = orig - entry["c1"].float()[a1]
+    assert torch.allclose(slot_mats, want, atol=1e-2)
 
 
 def test_ro_dict_tokenize_uses_readout_not_kv():

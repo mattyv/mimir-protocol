@@ -19,12 +19,19 @@ NFIT="${NFIT:-40000}"                          # fit-set steps (GSM8K train + Op
 NEVAL="${NEVAL:-200}"                          # GSM8K TEST eval steps (Wilson CI ~±0.04 at p≈0.9)
 KS="${KS:-256,1024,4096}"                      # comma-separated K for the plain kv_K* configs
 GPU="${GPU:-RTX_3090}"
-# Wall-clock budget: 40k single-span fit encodes (~1.5-2.5h on 4-bit 7B) +
-# GPU k-means (~15m) + native scored once + 4 GPU-eval configs x (200+150)
-# steps x 2 generated conditions (~1.5-2h) + CPU diagnostics (~30m). The
-# dictionaries are pushed BEFORE the eval starts, so a timeout can only cost
-# the eval, never the expensive encode+k-means.
+# Wall-clock budget (node 51724858 measured): 40k fit encodes ~60-80m on the
+# 4-bit 7B + chunked GPU k-means ~15-35m (the fit-shard push, ~20GB fp16 ≈
+# 13-17m at inet_up>=200, runs in a BACKGROUND thread overlapped with it) +
+# native scored once + 4 GPU-eval configs x (200+150) steps x 2 generated
+# conditions (~1.5-2h) + CPU diagnostics (~30m) ≈ 3.5-4.5h. Each dictionary
+# is pushed the moment it is built and the shards right after the encode, so
+# a timeout or OOM can only cost work not yet done -- never the encode.
 TIMEOUT="${TIMEOUT:-330m}"
+# LOAD_SHARDS=1 resumes from the pushed fit-shard cache on ${REPO} (skips the
+# encode; requires a previous run to have gotten past the shard push).
+LOAD_SHARDS="${LOAD_SHARDS:-}"
+RESUME_FLAG=""
+[ -n "$LOAD_SHARDS" ] && RESUME_FLAG="--load-shards"
 
 # cpu_ram is in GB in the vast search API (CLAUDE.md's own "cpu_ram>=<GB*1024>"
 # guidance predates the fix in commit "vast_render: cpu_ram search clause is
@@ -32,10 +39,12 @@ TIMEOUT="${TIMEOUT:-330m}"
 # convention vast_summary_probe.sh already uses, a plain GB number, not
 # GB*1024). 40k fit steps' fp16 KV shards run ~2.3GB PER SLOT (never all 8
 # slots at once, see gist_dict.py/run_gist_dict.py's shard-streaming design)
-# plus small readouts -- 32GB host RAM comfortably covers the peak.
-# inet_up>=200: the pre-eval early push uploads the dictionaries + fit
-# readouts (~10-13GB); a node with fast download but a trickle upload would
-# burn the eval budget on the push.
+# plus small readouts -- 32GB host RAM comfortably covers the peak (k-means
+# itself now runs on fp16 GPU tensors with chunked fp32 math, ~4GB VRAM on
+# top of the resident model; see gist_dict._CHUNK_ROWS).
+# inet_up>=200: the background fit-shard push uploads ~20GB fp16 (≈13-17min
+# at 200Mbps, overlapped with k-means) plus ~6GB of dictionaries; a node
+# with fast download but a trickle upload would burn the eval budget on it.
 echo "→ Searching ${GPU} (rel>=0.98 inet_down>=500 inet_up>=200 cuda>=12.4, cpu_ram>=32GB disk>=100)..."
 OFFER_ID=""
 for try in 1 2 3 4 5; do
@@ -81,6 +90,7 @@ echo "=== GIST DICTIONARY FIDELITY (dataset=${DATASET} n-fit=${NFIT} n-eval=${NE
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_dict \
   --model-name "${MODEL}" --repo "${REPO}" --out-repo "${REPO}" \
   --dataset "${DATASET}" --n-fit "${NFIT}" --n-eval "${NEVAL}" --ks "${KS}" \
+  --push-shards ${RESUME_FLAG} \
   --eval --diagnose 2>&1 | tee /root/gist_dict.log
 echo "GIST_DICT_RC=\${PIPESTATUS[0]}" | tee -a /root/gist_dict.log
 kill \$HB 2>/dev/null

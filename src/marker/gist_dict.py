@@ -60,20 +60,54 @@ def slot_matrix_to_kv(mat: torch.Tensor, n_layers: int, n_kv_heads: int, head_di
 
 # ── k-means (k-means++ init, Lloyd's iterations) ────────────────────────────
 
+# Row-chunk size for every full-matrix pass below. Memory bound, real
+# geometry (N=40k, D=28672, K=4096, fp16 x on the GPU next to the 4-bit 7B):
+# x itself 2.3 GB + fp32 centroids 0.47 GB + one chunk's fp32 cast 0.24 GB +
+# one chunk's [chunk, K] distances 0.03 GB + fp32 mean-sums 0.47 GB
+# ≈ 3.5 GB k-means peak, ~9.5-10 GB total with the ~6 GB model resident --
+# vs the 23.6 GB card. The old unchunked path (full fp32 copy + full
+# residual copy + a full-matrix cdist temporary, ~13.8 GB of fp32 matrices)
+# OOMed node 51724858 inside build_dict_kv_residual.
+_CHUNK_ROWS = 2048
 
-def kmeans_pp_init(x: torch.Tensor, K: int, seed: int = 0) -> torch.Tensor:
+
+def _row_sq_norms(x: torch.Tensor, chunk_rows: int = _CHUNK_ROWS) -> torch.Tensor:
+    """[N] fp32 squared row norms, computed in row chunks (x may be fp16;
+    never a full fp32 copy of it)."""
+    out = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
+    for lo in range(0, x.shape[0], chunk_rows):
+        rows = slice(lo, min(lo + chunk_rows, x.shape[0]))
+        out[rows] = x[rows].float().pow(2).sum(dim=1)
+    return out
+
+
+def kmeans_pp_init(
+    x: torch.Tensor, K: int, seed: int = 0, chunk_rows: int = _CHUNK_ROWS
+) -> torch.Tensor:
     """k-means++ seeding: returns K row-indices into x, deterministic under
     seed (a fresh CPU torch.Generator, never the global RNG -- callers must
-    get bit-identical picks across repeated calls with the same seed)."""
+    get bit-identical picks across repeated calls with the same seed).
+
+    Distances to the newest centroid are computed in ROW CHUNKS in fp32 (x
+    may be fp16), via ||x||^2 - 2 x.c + ||c||^2 clamped at 0: peak extra
+    memory is O(chunk_rows * D), never an [N, D]-sized temporary. (The old
+    single-row torch.cdist here materialized a full-matrix-sized [N, 1, D]
+    diff -- the exact 4.27 GiB allocation that OOMed node 51724858.) Each
+    row's distance is independent of the chunking, so any chunk_rows gives
+    bit-identical picks."""
     n = x.shape[0]
     assert n >= K, f"K={K} > N={n} points to seed from"
     g = torch.Generator().manual_seed(seed)
     idx = [int(torch.randint(0, n, (1,), generator=g))]
     d2 = torch.full((n,), float("inf"), device=x.device)
+    x_sq = _row_sq_norms(x, chunk_rows)
     for _ in range(1, K):
-        last = x[idx[-1]].unsqueeze(0)
-        dist = torch.cdist(x, last).squeeze(1) ** 2
-        d2 = torch.minimum(d2, dist)
+        c = x[idx[-1]].float()
+        c_sq = float(c.pow(2).sum())
+        for lo in range(0, n, chunk_rows):
+            rows = slice(lo, min(lo + chunk_rows, n))
+            dist = (x_sq[rows] - 2.0 * (x[rows].float() @ c) + c_sq).clamp_min_(0)
+            d2[rows] = torch.minimum(d2[rows], dist)
         total = d2.sum()
         # every remaining point coinciding with a chosen centroid (total<=0)
         # falls back to uniform so multinomial doesn't get an all-zero row.
@@ -85,35 +119,47 @@ def kmeans_pp_init(x: torch.Tensor, K: int, seed: int = 0) -> torch.Tensor:
     return torch.tensor(idx, dtype=torch.long)
 
 
-def kmeans(x: torch.Tensor, K: int, iters: int = 20, seed: int = 0):
+def kmeans(x: torch.Tensor, K: int, iters: int = 20, seed: int = 0, chunk_rows: int = _CHUNK_ROWS):
     """Lloyd's k-means, k-means++ init, deterministic under seed. Runs on
     whatever device `x` is already on (the caller moves data to GPU before
     calling, when available -- this module makes no device decisions of its
-    own). Returns (centroids [K, D] float32, assignments [N] long,
-    usage [K] long). A cluster that loses every member keeps its last
+    own). `x` may be fp16 OR fp32: every distance and mean is accumulated in
+    fp32 over row chunks of `chunk_rows`, so peak extra memory is
+    O(K*D + chunk_rows*(D+K)) fp32 on top of x itself -- never a full [N, D]
+    fp32 copy or an [N, K] distance matrix (see _CHUNK_ROWS for the real-run
+    budget). The assignment argmin drops the per-row ||x||^2 term (constant
+    across centroids). Returns (centroids [K, D] float32, assignments [N]
+    long, usage [K] long). A cluster that loses every member keeps its last
     centroid (usage 0 is the caller's dead-entry signal, not this function's
     problem to paper over)."""
     n = x.shape[0]
     assert n >= K, f"K={K} > N={n} fit points"
-    x = x.float()
-    idx = kmeans_pp_init(x, K, seed).to(x.device)
-    centroids = x[idx].clone()
+    idx = kmeans_pp_init(x, K, seed, chunk_rows=chunk_rows).to(x.device)
+    centroids = x[idx].float()
     assignments = torch.full((n,), -1, dtype=torch.long, device=x.device)
     for _ in range(iters):
-        dist = torch.cdist(x, centroids)
-        new_assign = dist.argmin(dim=1)
+        c_sq = centroids.pow(2).sum(dim=1)  # [K]
+        new_assign = torch.empty(n, dtype=torch.long, device=x.device)
+        for lo in range(0, n, chunk_rows):
+            rows = slice(lo, min(lo + chunk_rows, n))
+            d = x[rows].float() @ centroids.t()
+            d.mul_(-2.0).add_(c_sq)  # ||x-c||^2 minus the row-constant ||x||^2
+            new_assign[rows] = d.argmin(dim=1)
+            del d
         converged = torch.equal(new_assign, assignments)
         assignments = new_assign
         if converged:
             break
-        # vectorized centroid update (index_add scatter-mean): a python loop
-        # over K clusters is fine at test scale but is K x iters serialized
-        # gathers at K=4096 on the real run -- same semantics, one kernel
+        # chunked index_add scatter-mean: same semantics as one full
+        # index_add (rows processed in the same order), fp32 accumulation
         sums = torch.zeros_like(centroids)
-        sums.index_add_(0, assignments, x)
+        for lo in range(0, n, chunk_rows):
+            rows = slice(lo, min(lo + chunk_rows, n))
+            sums.index_add_(0, assignments[rows], x[rows].float())
         counts = torch.bincount(assignments, minlength=K)
         nonempty = counts > 0
-        centroids[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1).to(x.dtype)
+        centroids[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1).float()
+        del sums
     usage = torch.bincount(assignments, minlength=K)
     return centroids, assignments, usage
 
@@ -125,9 +171,10 @@ def build_dict_kv(slot_mats: torch.Tensor, slot_readouts: torch.Tensor, K: int, 
     """One slot's fit-set KV vectors [N, D] + matching readouts [N, Dr] ->
     (entry, assignments). entry = {"centroids" fp16[K,D], "mu_readout"
     fp16[K,Dr], "usage" long[K], "K", "seed"} -- the kv_K256/1024/4096
-    per-slot config."""
+    per-slot config. slot_mats/slot_readouts may be fp16 (all math is
+    fp32-accumulated chunk-wise) and may live on different devices."""
     centroids, assign, usage = kmeans(slot_mats, K, iters, seed)
-    mu = _cluster_means(slot_readouts, assign, K)
+    mu = _cluster_means(slot_readouts, assign.to(slot_readouts.device), K)
     # entries live on CPU whatever device the k-means ran on: they get
     # torch.save'd, and tokenize/detokenize pin their math to CPU
     entry = {
@@ -149,12 +196,22 @@ def build_dict_kv_residual(
     `[8] ids` interface stays uniform across configs); the mean readout is
     stored SPARSELY over the occupied joint buckets (mu_ids + mu_readout):
     K1*K2 can be ~1e6, and a dense table would be tens of GB for buckets no
-    fit step ever landed in."""
+    fit step ever landed in.
+
+    CONSUMES slot_mats: the stage-1 residual is written back into it IN
+    PLACE, chunk-wise -- holding the slot matrix AND a separate full residual
+    matrix (2 x 40k x 28672 fp32 ≈ 9.2 GB next to the resident 7B) is what
+    OOMed node 51724858. A caller that needs the original rows again reloads
+    its shard (build_all_dicts loads a fresh copy per config anyway)."""
     stage1, assign1, usage1 = kmeans(slot_mats, K1, iters, seed)
-    resid = slot_mats - stage1[assign1]
-    stage2, assign2, usage2 = kmeans(resid, K2, iters, seed + 1)
+    n = slot_mats.shape[0]
+    for lo in range(0, n, _CHUNK_ROWS):
+        rows = slice(lo, min(lo + _CHUNK_ROWS, n))
+        resid = slot_mats[rows].float() - stage1[assign1[rows]]
+        slot_mats[rows] = resid.to(slot_mats.dtype)
+    stage2, assign2, usage2 = kmeans(slot_mats, K2, iters, seed + 1)
     joint = assign1 * K2 + assign2
-    mu_ids, mu = _cluster_means_sparse(slot_readouts, joint)
+    mu_ids, mu = _cluster_means_sparse(slot_readouts, joint.to(slot_readouts.device))
     entry = {
         "c1": stage1.half().cpu(),
         "c2": stage2.half().cpu(),
@@ -175,7 +232,7 @@ def build_dict_ro(slot_readouts: torch.Tensor, slot_mats: torch.Tensor, K: int, 
     back an injectable gist-KV); `centroids_ro` is kept separately for
     tokenize (which must cluster-assign a QUERY readout, never a KV)."""
     centroids_ro, assign, usage = kmeans(slot_readouts, K, iters, seed)
-    mean_kv = _cluster_means(slot_mats, assign, K)
+    mean_kv = _cluster_means(slot_mats, assign.to(slot_mats.device), K)
     mu = _cluster_means(slot_readouts, assign, K)
     entry = {
         "centroids": mean_kv.half().cpu(),
@@ -228,7 +285,7 @@ def build_dict_whole(
         g = torch.Generator().manual_seed(proj_seed)
         proj_blocks = []
         for s in range(k_slots):
-            mat = slot_loader(s).float()
+            mat = slot_loader(s)  # fp16 stays fp16: casts below are per-chunk
             # generated on CPU (seeded CPU generator), stored HALF -- and the
             # build itself uses the half-rounded values, so tokenize (which
             # reads the stored half blocks back) computes distances in the
@@ -236,9 +293,13 @@ def build_dict_whole(
             block = torch.randn(mat.shape[1], proj_dim, generator=g) / math.sqrt(proj_dim)
             block = block.half()
             proj_blocks.append(block)
-            contrib = mat @ block.float().to(mat.device)
-            x_for_dist = contrib if x_for_dist is None else x_for_dist + contrib
-            del mat
+            blockf = block.float().to(mat.device)
+            if x_for_dist is None:
+                x_for_dist = torch.zeros(mat.shape[0], proj_dim, device=mat.device)
+            for lo in range(0, mat.shape[0], _CHUNK_ROWS):
+                rows = slice(lo, min(lo + _CHUNK_ROWS, mat.shape[0]))
+                x_for_dist[rows] += mat[rows].float() @ blockf
+            del mat, blockf
     else:
         chunks = []
         for s in range(k_slots):
@@ -249,7 +310,7 @@ def build_dict_whole(
     del x_for_dist
     slots = []
     for s in range(k_slots):
-        mat = slot_loader(s).float()
+        mat = slot_loader(s)
         slots.append({"centroids": _cluster_means(mat, assign.to(mat.device), K).half().cpu()})
         del mat
     entry = {
@@ -267,9 +328,12 @@ def build_dict_whole(
 def _cluster_means(x: torch.Tensor, assign: torch.Tensor, K: int) -> torch.Tensor:
     """Mean of x's rows per assignment bucket 0..K-1; an empty bucket gets an
     all-zero row (never a NaN from dividing by zero members). Runs on x's
-    device (vectorized index_add scatter-mean, not a python loop over K)."""
+    device; the fp32 cast happens per row chunk (x may be a full fp16 slot
+    matrix -- never a second full fp32 copy of it), accumulation is fp32."""
     out = torch.zeros(K, x.shape[1], dtype=torch.float32, device=x.device)
-    out.index_add_(0, assign, x.float())
+    for lo in range(0, x.shape[0], _CHUNK_ROWS):
+        rows = slice(lo, min(lo + _CHUNK_ROWS, x.shape[0]))
+        out.index_add_(0, assign[rows], x[rows].float())
     counts = torch.bincount(assign, minlength=K).clamp_min(1)
     return out / counts.unsqueeze(1).float()
 
@@ -283,7 +347,9 @@ def _cluster_means_sparse(
     would be tens of GB, while at most N of those ids are ever occupied)."""
     uniq, inv = torch.unique(assign, return_inverse=True)
     means = torch.zeros(uniq.numel(), x.shape[1], dtype=torch.float32, device=x.device)
-    means.index_add_(0, inv, x.float())
+    for lo in range(0, x.shape[0], _CHUNK_ROWS):
+        rows = slice(lo, min(lo + _CHUNK_ROWS, x.shape[0]))
+        means.index_add_(0, inv[rows], x[rows].float())
     counts = torch.bincount(inv, minlength=uniq.numel()).clamp_min(1)
     return uniq, means / counts.unsqueeze(1).float()
 

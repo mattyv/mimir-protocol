@@ -129,6 +129,89 @@ def test_write_fit_shards_drops_nothing_when_stream_is_short():
     assert n == 1
 
 
+# ── build_all_dicts resilience: per-config on_built, failure isolation ─────
+
+
+def _write_tiny_shards(tmp_path, n=12, k_slots=2, dr=3):
+    from marker.run_gist_dict import write_fit_shards
+
+    geo = {"n_layers": 1, "n_kv_heads": 1, "head_dim": 3}
+    d = geo["n_layers"] * 2 * geo["n_kv_heads"] * geo["head_dim"]
+    kvs = [_fake_kv(k_slots, geo=geo, seed=i) for i in range(n)]
+    ros = [
+        torch.randn(k_slots, dr, generator=torch.Generator().manual_seed(50 + i)) for i in range(n)
+    ]
+    write_fit_shards(zip(kvs, ros, strict=True), tmp_path, d, dr, k_slots)
+    return geo, d, dr
+
+
+def test_build_all_dicts_on_built_fires_per_config_and_failure_continues(tmp_path):
+    from marker.run_gist_dict import build_all_dicts
+
+    geo, _d, _dr = _write_tiny_shards(tmp_path, n=12, k_slots=2)
+    geometry = {**geo, "k_slots": 2}
+    calls, errors = [], {}
+    # res_k1=50 > n=12 -> the kv_res config MUST fail (kmeans K>N assert)
+    dicts, fit_ids = build_all_dicts(
+        tmp_path,
+        2,
+        geometry,
+        ks=[4],
+        res_k1=50,
+        res_k2=2,
+        ro_k=3,
+        whole_k=3,
+        whole_proj_dim=3,
+        seed=0,
+        device="cpu",
+        on_built=lambda name, d_: calls.append((name, d_["cfg"])),
+        errors=errors,
+    )
+    # on_built fired the moment each config finished, in build order, and
+    # the failing config neither fired it nor stopped the ones after it
+    assert calls == [("kv_K4", "kv_K4"), ("ro_K3", "ro_K3"), ("whole_K3", "whole_K3")]
+    assert set(dicts) == {"kv_K4", "ro_K3", "whole_K3"}
+    assert set(fit_ids) == set(dicts)
+    assert list(errors) == ["kv_res_50x2"]
+    assert "AssertionError" in errors["kv_res_50x2"]
+
+
+def test_per_config_saver_pushes_immediately_after_each_build(tmp_path, monkeypatch):
+    import marker.run_gist_dict as rgd
+
+    pushes = []
+    monkeypatch.setattr(
+        rgd, "_push_with_retry", lambda repo, folder, sub: pushes.append((repo, folder, sub))
+    )
+    on_built = rgd._per_config_saver(tmp_path / "dicts", "user/repo", smoke=False)
+    dict_ = {"cfg": "kv_K4", "kind": "kv", "geometry": {}, "slots": []}
+    on_built("kv_K4", dict_)
+    assert (tmp_path / "dicts" / "dict_kv_K4.pt").exists()
+    assert pushes == [("user/repo", str(tmp_path / "dicts"), "gist_dict")]
+    # smoke / missing out-repo: still saved locally, never pushed
+    on_smoke = rgd._per_config_saver(tmp_path / "d2", "user/repo", smoke=True)
+    on_smoke("kv_K4", dict_)
+    assert (tmp_path / "d2" / "dict_kv_K4.pt").exists()
+    assert len(pushes) == 1
+
+
+# ── fit-shard cache index: what --load-shards reads back ───────────────────
+
+
+def test_fit_index_round_trips_doc_keys_as_tuples(tmp_path):
+    from marker.run_gist_dict import load_fit_index, write_fit_index
+
+    items = [
+        (("gsm8k_train", 0), [1, 2, 3], "a step"),
+        (("openr1", 4), [7], "x"),
+    ]
+    geometry = {"n_layers": 1, "n_kv_heads": 1, "head_dim": 3, "k_slots": 2}
+    write_fit_index(tmp_path, items, geometry, d=6, dr=3, too_long=5)
+    got_items, got_geo, got_d, got_dr, got_tl = load_fit_index(tmp_path)
+    assert got_items == items  # doc keys back as TUPLES (hashable downstream)
+    assert (got_geo, got_d, got_dr, got_tl) == (geometry, 6, 3, 5)
+
+
 # ── canonical encode: keys land at [base, base+k_slots) -- tiny real model ──
 
 
