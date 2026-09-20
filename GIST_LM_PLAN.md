@@ -85,3 +85,49 @@ with a sampling head PLUS retrieval snap at inference. A pure sampling head fixe
 Reasoning capacity (that is why G7); numbers (computed at commit; value-dependent branching is
 planned blind); quantization loss on NOVEL slot combinations (stage 3 re-measures rendering on
 predicted IDs — stage 1 only covers snapped real steps); dead dictionary entries (report usage).
+
+## STAGE 1 RESULT (2026-09-20): discretization holds; the reader is the bottleneck — CONDITIONAL GO
+
+Three launches (OOM in residual k-means; fp32/fp16 mismatch in the eval; then clean), ~$2.15.
+Manifest: results/gist_dict_manifest.json. Fit 40k steps (GSM8K train + OpenR1), eval 200 GSM8K
+test steps + 150 fresh; gate 0 native 0.93 / 1.00 (canonical placement valid). Shards, all six
+dictionaries, fit ids + readouts are on HF `gist_dict/` (resumable: LOAD_SHARDS=1 LOAD_DICTS=1).
+
+| config | R gsm8k | R fresh | op-from-IDs | quantized rel (gsm8k/fresh) | wrong-doc floor | dead |
+|---|---|---|---|---|---|---|
+| kv_K1024 | 0.71 | 0.33 | 0.92 | 0.77 / 0.42 | 0.375 / 0.13 | 0 |
+| **kv_K4096** | 0.67 | **0.91** | **0.91** | 0.73 / 0.94 | 0.32 / 0.31 | 0 |
+| kv_res_1024x1024 | 0.77 | 0.41 | 0.79 | 0.785 / 0.51 | 0.30 / 0.16 | 98% of joint cells |
+| whole_K4096 | 0.50 | 0.04 | 0.55 | 0.64 / 0.17 | 0.35 / 0.14 | 0 |
+Reconstruction cosine per slot 0.996-0.999 (norm-weighted; layers 24-26 at 0.86-0.90). Usage
+entropy 0.94, no dead per-slot entries. Op lives in slot 7 (0.89 alone); slots 2/4/5 carry ~nothing.
+
+**Fable read:** the IDs kept the step; the reader didn't. NLL-margin rises monotonically with
+resolution (0.61 → 0.68 → 0.71) while relations-margin sits at 0.72 ± 0.1 for every per-slot
+config (n=200 → CI ±0.12; the 0.8 bar is undecidable at this n with THIS reader). The reader was
+trained on native gist-KV and misreads the snapped dialect (per-slot independent snapping = slot
+inconsistency it never saw). Op 0.91 vs the old 0.825 is not "NB is better": this eval takes the
+first labelled step per doc (majority 0.45 vs 0.34); margin over majority is equal → snapping
+costs the op nothing. The fresh set is ONE sentence template × 4 ops — relations there = a 4-way
+op choice; K-dependence says K4096 covers an OOD sentence shape that K1024 doesn't (good), weak
+on fidelity. Whole-gist retrieval cannot compose (kills the retrieval VOCABULARY for good);
+residual's dead cells are pigeonhole (40k points / 1.05M cells), and residual-as-tokens would
+double tokens per step — don't adopt.
+
+**Ruling: the mechanical VQVAE verdict is OVERRULED → CONDITIONAL GO.** VQ-VAE's trigger
+("manifold doesn't cluster along structure") is not met. Next, one box, LOAD_SHARDS=1, ~$4-5:
+1. Fine-tune the reader on snapped kv_K4096 KV (pairs: detokenize(tokenize(kv)) → step text, the
+   recipe that learned the converter dialect in one run; ledger on to match the bar).
+2. Re-measure with the SAME pre-registered bar on the same 200 steps: R_gsm8k ≥ 0.8 (op already
+   0.91). Report fresh but not load-bearing; add 3-4 sentence shapes to the fresh generator ($0).
+3. Pass → tokenize the corpus (stage 2) on the same box. Fail → VQ-VAE as the band says.
+No K=16384 (2.4 points per centroid; ~14 examples per (slot,id) for G7), no residual tokens.
+
+**G7 design updates:** (1) NEW RISK: readout-vs-KV cluster agreement is 0.09 — μ_{s,j} (mean
+readout per entry) may be blurry; $0 CPU check before stage 3: per-slot nearest-neighbour cosine
+among μ from dict_kv_K4096.pt; if median > ~0.98 add a trainable per-id low-rank delta (~2M
+params) to input and output rows. (2) Emit slots in descending informativeness [7,1,0,3,6,2,4,5]
+(one constant, flagged). (3) K=4096, 8 tokens/step, slot-masked head unchanged. (4) Stage-3
+rendered-margin bars must be no-ledger vs a no-ledger native (everything in stage 1 is ledger-on).
+(5) Varied fresh set for the stage-3 OOD cell. Odds: stage 3 holds ~50% (discretization risk
+down, soft-token-read risk now concrete); stage 4 ~35-40%.
