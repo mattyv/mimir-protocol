@@ -1,0 +1,1115 @@
+{
+  "n_fit": 40000,
+  "n_fit_too_long": 3370,
+  "n_fit_labeled": 17191,
+  "n_eval_gsm8k": 200,
+  "n_eval_fresh": 150,
+  "geometry": {
+    "n_layers": 28,
+    "n_kv_heads": 4,
+    "head_dim": 128,
+    "k_slots": 8
+  },
+  "configs": {
+    "kv_K1024": {
+      "kind": "per_slot",
+      "conditions": {
+        "quantized": {
+          "rel_exact": 0.77,
+          "rel_exact_ci": [
+            0.7069,
+            0.8229
+          ],
+          "f1_mean": 0.7287,
+          "num_recall": 0.9777,
+          "nll_mean": 1.3176,
+          "n": 200
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.375,
+          "rel_exact_ci": [
+            0.3109,
+            0.4439
+          ],
+          "f1_mean": 0.4976,
+          "num_recall": 0.9648,
+          "nll_mean": 3.1493,
+          "n": 200
+        },
+        "random_ids": {
+          "nll_mean": 2.7614,
+          "n": 200,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 0.93,
+          "rel_exact_ci": [
+            0.8859,
+            0.9578
+          ],
+          "f1_mean": 0.9379,
+          "num_recall": 0.9966,
+          "nll_mean": 0.1566,
+          "n": 200
+        }
+      },
+      "conditions_gsm8k": {
+        "quantized": {
+          "rel_exact": 0.77,
+          "rel_exact_ci": [
+            0.7069,
+            0.8229
+          ],
+          "f1_mean": 0.7287,
+          "num_recall": 0.9777,
+          "nll_mean": 1.3176,
+          "n": 200
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.375,
+          "rel_exact_ci": [
+            0.3109,
+            0.4439
+          ],
+          "f1_mean": 0.4976,
+          "num_recall": 0.9648,
+          "nll_mean": 3.1493,
+          "n": 200
+        },
+        "random_ids": {
+          "nll_mean": 2.7614,
+          "n": 200,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 0.93,
+          "rel_exact_ci": [
+            0.8859,
+            0.9578
+          ],
+          "f1_mean": 0.9379,
+          "num_recall": 0.9966,
+          "nll_mean": 0.1566,
+          "n": 200
+        }
+      },
+      "conditions_fresh": {
+        "quantized": {
+          "rel_exact": 0.42,
+          "rel_exact_ci": [
+            0.344,
+            0.5
+          ],
+          "f1_mean": 0.4689,
+          "num_recall": 1.0,
+          "nll_mean": 1.8933,
+          "n": 150
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.1333,
+          "rel_exact_ci": [
+            0.088,
+            0.197
+          ],
+          "f1_mean": 0.4468,
+          "num_recall": 0.9911,
+          "nll_mean": 2.1041,
+          "n": 150
+        },
+        "random_ids": {
+          "nll_mean": 3.3268,
+          "n": 150,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 1.0,
+          "rel_exact_ci": [
+            0.975,
+            1.0
+          ],
+          "f1_mean": 1.0,
+          "num_recall": 1.0,
+          "nll_mean": 0.001,
+          "n": 150
+        }
+      },
+      "R_gsm8k": 0.7117,
+      "R_fresh": 0.3308,
+      "usage_entropy": 0.9411,
+      "usage_entropy_per_slot": [
+        0.9462,
+        0.9512,
+        0.9422,
+        0.9279,
+        0.9057,
+        0.949,
+        0.9503,
+        0.9562
+      ],
+      "dead_entries": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "op_from_ids": 0.92,
+      "op_from_ids_majority": 0.45,
+      "op_from_ids_per_slot": [
+        0.625,
+        0.66,
+        0.475,
+        0.685,
+        0.475,
+        0.455,
+        0.565,
+        0.825
+      ],
+      "op": 0.92,
+      "reconstruction_cosine": {
+        "per_slot": [
+          0.9962,
+          0.996,
+          0.9948,
+          0.9987,
+          0.9971,
+          0.995,
+          0.9953,
+          0.9986
+        ],
+        "per_layer": [
+          1.0,
+          0.9998,
+          0.998,
+          0.9996,
+          0.97,
+          0.9631,
+          0.9877,
+          0.9804,
+          0.9349,
+          0.9316,
+          0.9465,
+          0.9246,
+          0.9317,
+          0.9776,
+          0.8973,
+          0.9548,
+          0.9346,
+          0.9157,
+          0.9222,
+          0.9736,
+          0.8862,
+          0.9062,
+          0.8974,
+          0.8954,
+          0.8792,
+          0.8589,
+          0.8047,
+          0.9987
+        ]
+      },
+      "op_probe_readout": {
+        "acc": 0.905,
+        "ci": [
+          0.8564,
+          0.9383
+        ],
+        "macro_f1": 0.8859,
+        "recall": {
+          "+": 0.8372,
+          "-": 0.8276,
+          "*": 0.9667,
+          "/": 0.8947
+        },
+        "n": 200,
+        "majority": 0.45
+      }
+    },
+    "kv_K4096": {
+      "kind": "per_slot",
+      "conditions": {
+        "quantized": {
+          "rel_exact": 0.73,
+          "rel_exact_ci": [
+            0.6646,
+            0.7868
+          ],
+          "f1_mean": 0.7466,
+          "num_recall": 0.9783,
+          "nll_mean": 1.1571,
+          "n": 200
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.32,
+          "rel_exact_ci": [
+            0.2593,
+            0.3875
+          ],
+          "f1_mean": 0.4894,
+          "num_recall": 0.968,
+          "nll_mean": 3.3269,
+          "n": 200
+        },
+        "random_ids": {
+          "nll_mean": 2.8613,
+          "n": 200,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 0.93,
+          "rel_exact_ci": [
+            0.8859,
+            0.9578
+          ],
+          "f1_mean": 0.9379,
+          "num_recall": 0.9966,
+          "nll_mean": 0.1566,
+          "n": 200
+        }
+      },
+      "conditions_gsm8k": {
+        "quantized": {
+          "rel_exact": 0.73,
+          "rel_exact_ci": [
+            0.6646,
+            0.7868
+          ],
+          "f1_mean": 0.7466,
+          "num_recall": 0.9783,
+          "nll_mean": 1.1571,
+          "n": 200
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.32,
+          "rel_exact_ci": [
+            0.2593,
+            0.3875
+          ],
+          "f1_mean": 0.4894,
+          "num_recall": 0.968,
+          "nll_mean": 3.3269,
+          "n": 200
+        },
+        "random_ids": {
+          "nll_mean": 2.8613,
+          "n": 200,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 0.93,
+          "rel_exact_ci": [
+            0.8859,
+            0.9578
+          ],
+          "f1_mean": 0.9379,
+          "num_recall": 0.9966,
+          "nll_mean": 0.1566,
+          "n": 200
+        }
+      },
+      "conditions_fresh": {
+        "quantized": {
+          "rel_exact": 0.94,
+          "rel_exact_ci": [
+            0.8899,
+            0.9681
+          ],
+          "f1_mean": 0.6586,
+          "num_recall": 1.0,
+          "nll_mean": 1.3222,
+          "n": 150
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.3133,
+          "rel_exact_ci": [
+            0.2445,
+            0.3914
+          ],
+          "f1_mean": 0.5999,
+          "num_recall": 0.9933,
+          "nll_mean": 1.7192,
+          "n": 150
+        },
+        "random_ids": {
+          "nll_mean": 3.4979,
+          "n": 150,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 1.0,
+          "rel_exact_ci": [
+            0.975,
+            1.0
+          ],
+          "f1_mean": 1.0,
+          "num_recall": 1.0,
+          "nll_mean": 0.001,
+          "n": 150
+        }
+      },
+      "R_gsm8k": 0.6721,
+      "R_fresh": 0.9126,
+      "usage_entropy": 0.9419,
+      "usage_entropy_per_slot": [
+        0.9476,
+        0.9467,
+        0.9472,
+        0.9305,
+        0.922,
+        0.9494,
+        0.9434,
+        0.948
+      ],
+      "dead_entries": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "op_from_ids": 0.91,
+      "op_from_ids_majority": 0.45,
+      "op_from_ids_per_slot": [
+        0.67,
+        0.685,
+        0.44,
+        0.645,
+        0.445,
+        0.45,
+        0.565,
+        0.89
+      ],
+      "op": 0.91,
+      "reconstruction_cosine": {
+        "per_slot": [
+          0.9972,
+          0.9969,
+          0.9966,
+          0.999,
+          0.9979,
+          0.9962,
+          0.9963,
+          0.9989
+        ],
+        "per_layer": [
+          1.0,
+          0.9999,
+          0.9984,
+          0.9996,
+          0.9764,
+          0.9713,
+          0.9904,
+          0.9846,
+          0.9501,
+          0.9468,
+          0.959,
+          0.9424,
+          0.9474,
+          0.9825,
+          0.9206,
+          0.9646,
+          0.949,
+          0.9331,
+          0.9379,
+          0.9794,
+          0.9124,
+          0.9291,
+          0.9227,
+          0.921,
+          0.9117,
+          0.8981,
+          0.8595,
+          0.9991
+        ]
+      },
+      "op_probe_readout": {
+        "acc": 0.86,
+        "ci": [
+          0.8051,
+          0.9013
+        ],
+        "macro_f1": 0.8447,
+        "recall": {
+          "+": 0.7907,
+          "-": 0.7586,
+          "*": 0.9222,
+          "/": 0.8684
+        },
+        "n": 200,
+        "majority": 0.45
+      }
+    },
+    "kv_res_1024x1024": {
+      "kind": "per_slot",
+      "conditions": {
+        "quantized": {
+          "rel_exact": 0.785,
+          "rel_exact_ci": [
+            0.723,
+            0.8363
+          ],
+          "f1_mean": 0.7621,
+          "num_recall": 0.981,
+          "nll_mean": 1.0942,
+          "n": 200
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.3,
+          "rel_exact_ci": [
+            0.2407,
+            0.3668
+          ],
+          "f1_mean": 0.4967,
+          "num_recall": 0.972,
+          "nll_mean": 3.3943,
+          "n": 200
+        },
+        "random_ids": {
+          "nll_mean": 3.0155,
+          "n": 200,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 0.93,
+          "rel_exact_ci": [
+            0.8859,
+            0.9578
+          ],
+          "f1_mean": 0.9379,
+          "num_recall": 0.9966,
+          "nll_mean": 0.1566,
+          "n": 200
+        }
+      },
+      "conditions_gsm8k": {
+        "quantized": {
+          "rel_exact": 0.785,
+          "rel_exact_ci": [
+            0.723,
+            0.8363
+          ],
+          "f1_mean": 0.7621,
+          "num_recall": 0.981,
+          "nll_mean": 1.0942,
+          "n": 200
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.3,
+          "rel_exact_ci": [
+            0.2407,
+            0.3668
+          ],
+          "f1_mean": 0.4967,
+          "num_recall": 0.972,
+          "nll_mean": 3.3943,
+          "n": 200
+        },
+        "random_ids": {
+          "nll_mean": 3.0155,
+          "n": 200,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 0.93,
+          "rel_exact_ci": [
+            0.8859,
+            0.9578
+          ],
+          "f1_mean": 0.9379,
+          "num_recall": 0.9966,
+          "nll_mean": 0.1566,
+          "n": 200
+        }
+      },
+      "conditions_fresh": {
+        "quantized": {
+          "rel_exact": 0.5067,
+          "rel_exact_ci": [
+            0.4275,
+            0.5855
+          ],
+          "f1_mean": 0.5323,
+          "num_recall": 1.0,
+          "nll_mean": 1.5278,
+          "n": 150
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.16,
+          "rel_exact_ci": [
+            0.1099,
+            0.227
+          ],
+          "f1_mean": 0.5039,
+          "num_recall": 0.9956,
+          "nll_mean": 1.8095,
+          "n": 150
+        },
+        "random_ids": {
+          "nll_mean": 3.4932,
+          "n": 150,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 1.0,
+          "rel_exact_ci": [
+            0.975,
+            1.0
+          ],
+          "f1_mean": 1.0,
+          "num_recall": 1.0,
+          "nll_mean": 0.001,
+          "n": 150
+        }
+      },
+      "R_gsm8k": 0.7698,
+      "R_fresh": 0.4127,
+      "usage_entropy": 0.6883,
+      "usage_entropy_per_slot": [
+        0.6978,
+        0.7087,
+        0.6691,
+        0.6782,
+        0.6593,
+        0.6993,
+        0.7005,
+        0.6939
+      ],
+      "dead_entries": [
+        1025679,
+        1023374,
+        1030636,
+        1029890,
+        1031338,
+        1025623,
+        1024888,
+        1026728
+      ],
+      "op_from_ids": 0.79,
+      "op_from_ids_majority": 0.45,
+      "op_from_ids_per_slot": [
+        0.605,
+        0.525,
+        0.425,
+        0.595,
+        0.455,
+        0.47,
+        0.52,
+        0.64
+      ],
+      "op": 0.79,
+      "reconstruction_cosine": {
+        "per_slot": [
+          0.9969,
+          0.9968,
+          0.9959,
+          0.9989,
+          0.9976,
+          0.9959,
+          0.9961,
+          0.9988
+        ],
+        "per_layer": [
+          1.0,
+          0.9999,
+          0.9983,
+          0.9996,
+          0.9741,
+          0.968,
+          0.9892,
+          0.9829,
+          0.9444,
+          0.9403,
+          0.9536,
+          0.9358,
+          0.9413,
+          0.9806,
+          0.9124,
+          0.9614,
+          0.9443,
+          0.9269,
+          0.9319,
+          0.9775,
+          0.9034,
+          0.9206,
+          0.9138,
+          0.9116,
+          0.9003,
+          0.8877,
+          0.8454,
+          0.999
+        ]
+      },
+      "op_probe_readout": {
+        "acc": 0.71,
+        "ci": [
+          0.6436,
+          0.7685
+        ],
+        "macro_f1": 0.6879,
+        "recall": {
+          "+": 0.6279,
+          "-": 0.931,
+          "*": 0.7222,
+          "/": 0.6053
+        },
+        "n": 200,
+        "majority": 0.45
+      }
+    },
+    "whole_K4096": {
+      "kind": "whole",
+      "conditions": {
+        "quantized": {
+          "rel_exact": 0.64,
+          "rel_exact_ci": [
+            0.5714,
+            0.7033
+          ],
+          "f1_mean": 0.6262,
+          "num_recall": 0.9829,
+          "nll_mean": 2.1013,
+          "n": 200
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.35,
+          "rel_exact_ci": [
+            0.2873,
+            0.4184
+          ],
+          "f1_mean": 0.502,
+          "num_recall": 0.9629,
+          "nll_mean": 3.2009,
+          "n": 200
+        },
+        "random_ids": {
+          "nll_mean": 3.5059,
+          "n": 200,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 0.93,
+          "rel_exact_ci": [
+            0.8859,
+            0.9578
+          ],
+          "f1_mean": 0.9379,
+          "num_recall": 0.9966,
+          "nll_mean": 0.1566,
+          "n": 200
+        }
+      },
+      "conditions_gsm8k": {
+        "quantized": {
+          "rel_exact": 0.64,
+          "rel_exact_ci": [
+            0.5714,
+            0.7033
+          ],
+          "f1_mean": 0.6262,
+          "num_recall": 0.9829,
+          "nll_mean": 2.1013,
+          "n": 200
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.35,
+          "rel_exact_ci": [
+            0.2873,
+            0.4184
+          ],
+          "f1_mean": 0.502,
+          "num_recall": 0.9629,
+          "nll_mean": 3.2009,
+          "n": 200
+        },
+        "random_ids": {
+          "nll_mean": 3.5059,
+          "n": 200,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 0.93,
+          "rel_exact_ci": [
+            0.8859,
+            0.9578
+          ],
+          "f1_mean": 0.9379,
+          "num_recall": 0.9966,
+          "nll_mean": 0.1566,
+          "n": 200
+        }
+      },
+      "conditions_fresh": {
+        "quantized": {
+          "rel_exact": 0.1733,
+          "rel_exact_ci": [
+            0.1211,
+            0.2419
+          ],
+          "f1_mean": 0.5028,
+          "num_recall": 0.9956,
+          "nll_mean": 3.0396,
+          "n": 150
+        },
+        "wrong_doc_quantized": {
+          "rel_exact": 0.14,
+          "rel_exact_ci": [
+            0.0934,
+            0.2046
+          ],
+          "f1_mean": 0.5025,
+          "num_recall": 0.9844,
+          "nll_mean": 3.128,
+          "n": 150
+        },
+        "random_ids": {
+          "nll_mean": 4.0092,
+          "n": 150,
+          "nll_only": true
+        },
+        "native": {
+          "rel_exact": 1.0,
+          "rel_exact_ci": [
+            0.975,
+            1.0
+          ],
+          "f1_mean": 1.0,
+          "num_recall": 1.0,
+          "nll_mean": 0.001,
+          "n": 150
+        }
+      },
+      "R_gsm8k": 0.5,
+      "R_fresh": 0.0387,
+      "usage_entropy": 0.9334,
+      "usage_entropy_per_slot": [
+        0.9334,
+        0.9334,
+        0.9334,
+        0.9334,
+        0.9334,
+        0.9334,
+        0.9334,
+        0.9334
+      ],
+      "dead_entries": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "op_from_ids": 0.55,
+      "op_from_ids_majority": 0.45,
+      "op_from_ids_per_slot": [
+        0.575,
+        0.575,
+        0.575,
+        0.575,
+        0.575,
+        0.575,
+        0.575,
+        0.575
+      ],
+      "op": 0.55,
+      "reconstruction_cosine": {
+        "per_slot": [
+          0.9954,
+          0.9955,
+          0.9942,
+          0.9984,
+          0.9967,
+          0.9948,
+          0.9952,
+          0.9984
+        ],
+        "per_layer": [
+          1.0,
+          0.9999,
+          0.9985,
+          0.9997,
+          0.9738,
+          0.9685,
+          0.9895,
+          0.9833,
+          0.938,
+          0.9374,
+          0.9511,
+          0.9287,
+          0.9356,
+          0.9788,
+          0.9037,
+          0.9561,
+          0.9387,
+          0.9209,
+          0.9279,
+          0.9746,
+          0.8885,
+          0.9087,
+          0.8964,
+          0.8935,
+          0.8643,
+          0.8261,
+          0.7511,
+          0.9984
+        ]
+      },
+      "op_probe_readout": {
+        "acc": 0.55,
+        "ci": [
+          0.4808,
+          0.6174
+        ],
+        "macro_f1": 0.4861,
+        "recall": {
+          "+": 0.4884,
+          "-": 0.3103,
+          "*": 0.7222,
+          "/": 0.3947
+        },
+        "n": 200,
+        "majority": 0.45
+      }
+    },
+    "kv_K256": {
+      "kind": "per_slot",
+      "usage_entropy": 0.9437,
+      "usage_entropy_per_slot": [
+        0.9503,
+        0.9621,
+        0.9382,
+        0.9246,
+        0.8983,
+        0.9535,
+        0.9537,
+        0.969
+      ],
+      "dead_entries": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "op_from_ids": 0.84,
+      "op_from_ids_majority": 0.45,
+      "op_from_ids_per_slot": [
+        0.52,
+        0.65,
+        0.45,
+        0.61,
+        0.475,
+        0.45,
+        0.55,
+        0.77
+      ],
+      "op": 0.84,
+      "reconstruction_cosine": {
+        "per_slot": [
+          0.9955,
+          0.9954,
+          0.9932,
+          0.9984,
+          0.9964,
+          0.994,
+          0.9944,
+          0.9983
+        ],
+        "per_layer": [
+          1.0,
+          0.9998,
+          0.9978,
+          0.9995,
+          0.9654,
+          0.9573,
+          0.9859,
+          0.9775,
+          0.9232,
+          0.9206,
+          0.9375,
+          0.9118,
+          0.9206,
+          0.9742,
+          0.881,
+          0.948,
+          0.9249,
+          0.9044,
+          0.9124,
+          0.9696,
+          0.8677,
+          0.8894,
+          0.8782,
+          0.8748,
+          0.8505,
+          0.821,
+          0.7496,
+          0.9984
+        ]
+      },
+      "op_probe_readout": {
+        "acc": 0.805,
+        "ci": [
+          0.7446,
+          0.8539
+        ],
+        "macro_f1": 0.7476,
+        "recall": {
+          "+": 0.7209,
+          "-": 0.5172,
+          "*": 0.9333,
+          "/": 0.8158
+        },
+        "n": 200,
+        "majority": 0.45
+      }
+    },
+    "ro_K1024": {
+      "kind": "per_slot",
+      "usage_entropy": 0.9516,
+      "usage_entropy_per_slot": [
+        0.9481,
+        0.9623,
+        0.9527,
+        0.9497,
+        0.9452,
+        0.9519,
+        0.9458,
+        0.9574
+      ],
+      "dead_entries": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "op_from_ids": 0.77,
+      "op_from_ids_majority": 0.45,
+      "op_from_ids_per_slot": [
+        0.635,
+        0.505,
+        0.47,
+        0.515,
+        0.445,
+        0.475,
+        0.495,
+        0.555
+      ],
+      "op": 0.77,
+      "reconstruction_cosine": {
+        "per_slot": [
+          0.9949,
+          0.9949,
+          0.9922,
+          0.9983,
+          0.9963,
+          0.9934,
+          0.9937,
+          0.9983
+        ],
+        "per_layer": [
+          1.0,
+          0.9999,
+          0.9981,
+          0.9996,
+          0.9667,
+          0.9609,
+          0.9873,
+          0.9796,
+          0.9253,
+          0.9261,
+          0.9427,
+          0.9174,
+          0.9256,
+          0.9757,
+          0.8855,
+          0.9494,
+          0.9292,
+          0.91,
+          0.9183,
+          0.9715,
+          0.8772,
+          0.8984,
+          0.8841,
+          0.8777,
+          0.8434,
+          0.7887,
+          0.6938,
+          0.998
+        ]
+      },
+      "op_probe_readout": {
+        "acc": 0.78,
+        "ci": [
+          0.7176,
+          0.8318
+        ],
+        "macro_f1": 0.7555,
+        "recall": {
+          "+": 0.8372,
+          "-": 0.6552,
+          "*": 0.8333,
+          "/": 0.6842
+        },
+        "n": 200,
+        "majority": 0.45
+      }
+    }
+  },
+  "fit_shards_push": "cached (loaded from HF)",
+  "eval_configs": [
+    "kv_K1024",
+    "kv_K4096",
+    "kv_res_1024x1024",
+    "whole_K4096"
+  ],
+  "native_gsm8k": {
+    "rel_exact": 0.93,
+    "rel_exact_ci": [
+      0.8859,
+      0.9578
+    ],
+    "f1_mean": 0.9379,
+    "num_recall": 0.9966,
+    "nll_mean": 0.1566,
+    "n": 200
+  },
+  "native_fresh": {
+    "rel_exact": 1.0,
+    "rel_exact_ci": [
+      0.975,
+      1.0
+    ],
+    "f1_mean": 1.0,
+    "num_recall": 1.0,
+    "nll_mean": 0.001,
+    "n": 150
+  },
+  "gate0_pass": true,
+  "ro_vs_kv_ami_per_slot": [
+    0.1054,
+    0.0511,
+    0.0878,
+    0.115,
+    0.1072,
+    0.0792,
+    0.1059,
+    0.066
+  ],
+  "ro_vs_kv_ami": 0.0897,
+  "verdict": "VQVAE"
+}
