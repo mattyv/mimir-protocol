@@ -16,10 +16,15 @@ MODEL="${MODEL:-Qwen/Qwen2.5-7B}"
 REPO="${REPO:-mattyvee/mimir-artifacts}"       # stage-1 adapter + render_adapter_oneform
 DATASET="${DATASET:-openai/gsm8k}"
 NFIT="${NFIT:-40000}"                          # fit-set steps (GSM8K train + OpenR1), doc-disjoint from eval
-NEVAL="${NEVAL:-300}"                          # GSM8K TEST eval steps
+NEVAL="${NEVAL:-200}"                          # GSM8K TEST eval steps (Wilson CI ~±0.04 at p≈0.9)
 KS="${KS:-256,1024,4096}"                      # comma-separated K for the plain kv_K* configs
 GPU="${GPU:-RTX_3090}"
-TIMEOUT="${TIMEOUT:-150m}"
+# Wall-clock budget: 40k single-span fit encodes (~1.5-2.5h on 4-bit 7B) +
+# GPU k-means (~15m) + native scored once + 4 GPU-eval configs x (200+150)
+# steps x 2 generated conditions (~1.5-2h) + CPU diagnostics (~30m). The
+# dictionaries are pushed BEFORE the eval starts, so a timeout can only cost
+# the eval, never the expensive encode+k-means.
+TIMEOUT="${TIMEOUT:-330m}"
 
 # cpu_ram is in GB in the vast search API (CLAUDE.md's own "cpu_ram>=<GB*1024>"
 # guidance predates the fix in commit "vast_render: cpu_ram search clause is
@@ -28,11 +33,14 @@ TIMEOUT="${TIMEOUT:-150m}"
 # GB*1024). 40k fit steps' fp16 KV shards run ~2.3GB PER SLOT (never all 8
 # slots at once, see gist_dict.py/run_gist_dict.py's shard-streaming design)
 # plus small readouts -- 32GB host RAM comfortably covers the peak.
-echo "→ Searching ${GPU} (rel>=0.98 inet>=500 cuda>=12.4, cpu_ram>=32GB disk>=100)..."
+# inet_up>=200: the pre-eval early push uploads the dictionaries + fit
+# readouts (~10-13GB); a node with fast download but a trickle upload would
+# burn the eval budget on the push.
+echo "→ Searching ${GPU} (rel>=0.98 inet_down>=500 inet_up>=200 cuda>=12.4, cpu_ram>=32GB disk>=100)..."
 OFFER_ID=""
 for try in 1 2 3 4 5; do
   OFFER_ID=$(vastai search offers \
-    "gpu_name=${GPU} num_gpus=1 gpu_ram>=23 cpu_ram>=32 cuda_vers>=12.4 disk_space>=100 reliability>=0.98 inet_down>=500 rentable=true" \
+    "gpu_name=${GPU} num_gpus=1 gpu_ram>=23 cpu_ram>=32 cuda_vers>=12.4 disk_space>=100 reliability>=0.98 inet_down>=500 inet_up>=200 rentable=true" \
     --order 'reliability-' --limit 1 --raw 2>/dev/null | \
     python3 -c "import sys,json
 try: o=json.load(sys.stdin); print(o[0]['id'] if o else '')
@@ -87,4 +95,6 @@ INSTANCE_ID=$(vastai create instance "$OFFER_ID" \
   --image "$IMAGE" --disk "$DISK_GB" --onstart-cmd "$ONSTART" --env "$ENV_ARG" --raw 2>/dev/null | \
   python3 -c "import sys,json; print(json.load(sys.stdin)['new_contract'])")
 echo "INSTANCE $INSTANCE_ID"
-echo "→ arm the poller:  bash scripts/vast_poll_destroy.sh $INSTANCE_ID 200"
+# poller hard cap MUST exceed TIMEOUT (330m) + setup (~20m), or the poller
+# kills the node while the run is still inside its own budget
+echo "→ arm the poller:  bash scripts/vast_poll_destroy.sh $INSTANCE_ID 380"

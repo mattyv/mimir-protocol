@@ -40,20 +40,19 @@ def _fake_kv(k_slots, geo=_GEO, seed=0):
 # eval-step index back to a step from a DIFFERENT doc ──────────────────────
 
 
-def test_pick_wrong_doc_step_never_same_doc():
-    from marker.run_gist_dict import EvalStep, pick_wrong_doc_step
+def test_pick_wrong_doc_indices_never_same_doc():
+    from marker.run_gist_dict import pick_wrong_doc_indices
 
-    pool = [
-        EvalStep(doc_i=0, ids=[1, 2], text="a"),
-        EvalStep(doc_i=1, ids=[3, 4], text="b"),
-        EvalStep(doc_i=2, ids=[5, 6], text="c"),
-        EvalStep(doc_i=3, ids=[7, 8], text="d"),
-    ]
     gen = torch.Generator().manual_seed(0)
-    wrong = pick_wrong_doc_step(pool, gen)
-    assert len(wrong) == len(pool)
-    for rec, w in zip(pool, wrong, strict=True):
-        assert w.doc_i != rec.doc_i
+    wrong = pick_wrong_doc_indices(4, gen)
+    assert len(wrong) == 4
+    for i, w in enumerate(wrong):
+        assert w != i  # one step per doc: index i IS doc i
+        assert 0 <= w < 4
+
+    # seeded: same generator seed -> same pairing (cross-config comparability)
+    wrong2 = pick_wrong_doc_indices(4, torch.Generator().manual_seed(0))
+    assert wrong == wrong2
 
 
 # ── random_ids: seeded, in-range ────────────────────────────────────────────
@@ -202,12 +201,123 @@ def test_smoke_manifest_runs_full_pipeline_and_has_a_verdict():
     for cfg, cell in manifest["configs"].items():
         for cond in ("native", "quantized", "wrong_doc_quantized", "random_ids"):
             assert cond in cell["conditions"], f"{cfg} missing {cond}"
+        # full metrics for the generated conditions; random_ids is the
+        # NLL-only floor (wall-clock cut), native is the shared once-scored
+        # condition -- all still carry nll_mean and n
+        for cond in ("native", "quantized", "wrong_doc_quantized"):
             for key in ("f1_mean", "rel_exact", "num_recall", "nll_mean", "n"):
                 assert key in cell["conditions"][cond], f"{cfg}/{cond} missing {key}"
+        assert cell["conditions"]["random_ids"].get("nll_only") is True
+        for key in ("nll_mean", "n"):
+            assert key in cell["conditions"]["random_ids"]
         assert "R_gsm8k" in cell and "R_fresh" in cell
         assert "usage_entropy" in cell and "dead_entries" in cell
+        assert len(cell["usage_entropy_per_slot"]) == manifest["geometry"]["k_slots"]
         assert "op_from_ids" in cell
+        assert "op_probe_readout" in cell  # may be None on tiny smoke splits
     assert manifest["verdict"] in {"GO", "RETRIEVAL", "VQVAE", "KILL", "INVALID_HARNESS"}
     assert manifest["n_fit"] > 0
     assert manifest["n_eval_gsm8k"] > 0
     assert manifest["n_eval_fresh"] > 0
+
+
+# ── quantized lookups: kv_res must never materialize the joint table ────────
+
+
+def test_quantized_rows_kv_res_matches_c1_plus_c2():
+    from marker.run_gist_dict import _quantized_rows
+
+    g = torch.Generator().manual_seed(0)
+    c1 = torch.randn(3, 6, generator=g).half()
+    c2 = torch.randn(2, 6, generator=g).half()
+    dict_ = {"kind": "kv_res", "slots": [{"c1": c1, "c2": c2, "K2": 2}]}
+    ids = torch.tensor([0, 1, 5, 4])  # joint ids: (0,0), (0,1), (2,1), (2,0)
+    rows = _quantized_rows(dict_, 0, ids)
+    want = torch.stack(
+        [
+            c1[0].float() + c2[0].float(),
+            c1[0].float() + c2[1].float(),
+            c1[2].float() + c2[1].float(),
+            c1[2].float() + c2[0].float(),
+        ]
+    )
+    assert torch.equal(rows, want)
+
+
+def test_quantized_readouts_kv_res_sparse_lookup_zero_for_unseen_id():
+    from marker.run_gist_dict import quantized_readouts
+
+    mu_ids = torch.tensor([1, 4, 7])
+    mu = torch.arange(9, dtype=torch.float16).reshape(3, 3)  # rows 0..2
+    dict_ = {"kind": "kv_res", "slots": [{"mu_ids": mu_ids, "mu_readout": mu}]}
+    ids = torch.tensor([[4], [1], [3], [9]])  # 3 and 9 (beyond max) never occupied
+    out = quantized_readouts(dict_, ids)
+    assert torch.equal(out[0, 0], mu[1].float())
+    assert torch.equal(out[1, 0], mu[0].float())
+    assert torch.equal(out[2, 0], torch.zeros(3))
+    assert torch.equal(out[3, 0], torch.zeros(3))
+
+
+def test_quantized_readouts_dense_kinds_index_mu():
+    from marker.run_gist_dict import quantized_readouts
+
+    mu = torch.arange(8, dtype=torch.float16).reshape(4, 2)
+    dict_ = {"kind": "kv", "slots": [{"mu_readout": mu}, {"mu_readout": mu * 2}]}
+    ids = torch.tensor([[0, 3], [2, 1]])
+    out = quantized_readouts(dict_, ids)
+    assert out.shape == (2, 2, 2)
+    assert torch.equal(out[0, 0], mu[0].float())
+    assert torch.equal(out[0, 1], (mu * 2)[3].float())
+    assert torch.equal(out[1, 0], mu[2].float())
+
+
+# ── per-slot usage diagnostics ──────────────────────────────────────────────
+
+
+def test_usage_by_slot_is_per_slot_not_slot_zero():
+    from marker.run_gist_dict import usage_by_slot
+
+    # slot 0 uses only id 0 (degenerate); slot 1 uses ids 0..3 uniformly
+    ids = torch.stack(
+        [torch.zeros(8, dtype=torch.long), torch.arange(8, dtype=torch.long) % 4], dim=1
+    )
+    u = usage_by_slot(ids, K=4)
+    assert len(u) == 2
+    assert u[0]["entropy_norm"] == 0.0 and u[0]["dead_entries"] == 3
+    assert u[1]["entropy_norm"] == 1.0 and u[1]["dead_entries"] == 0
+
+
+# ── centroid-readout op probe (summaryprobe recipe on quantized readouts) ───
+
+
+def test_centroid_readout_op_probe_learns_a_separable_mapping():
+    from marker.run_gist_dict import centroid_readout_op_probe
+
+    g = torch.Generator().manual_seed(0)
+    ops = ["+", "-", "*", "/"]
+    n_fit, n_eval, k_slots, dr = 160, 40, 2, 8
+    means = torch.randn(4, dr, generator=g) * 3
+
+    def _make(n, seed):
+        gg = torch.Generator().manual_seed(seed)
+        y = torch.randint(0, 4, (n,), generator=gg)
+        q = means[y].unsqueeze(1).expand(n, k_slots, dr) + 0.05 * torch.randn(
+            n, k_slots, dr, generator=gg
+        )
+        return q, [ops[int(c)] for c in y]
+
+    q_fit, fit_ops = _make(n_fit, 1)
+    q_eval, eval_ops = _make(n_eval, 2)
+    fit_docs = list(range(n_fit))  # one doc per step
+    out = centroid_readout_op_probe(q_fit, fit_ops, fit_docs, q_eval, eval_ops, seed=0, pca_dim=8)
+    assert out is not None
+    assert out["acc"] > 0.9, out
+    assert "majority" in out
+
+
+def test_centroid_readout_op_probe_returns_none_when_fit_too_small():
+    from marker.run_gist_dict import centroid_readout_op_probe
+
+    q = torch.randn(3, 2, 4)
+    out = centroid_readout_op_probe(q, ["+", "-", "+"], [0, 1, 2], q, ["+", "-", "+"])
+    assert out is None

@@ -121,13 +121,16 @@ def _gsm8k_docs(split: str, n: int, dataset="openai/gsm8k", smoke: bool = False)
 
 def _openr1_docs(n: int, dataset: str):
     """Yields (doc_key, [step_text,...]) from an OpenR1-style cot corpus,
-    reusing run_stage2's generic corpus loader + line splitter (the same
-    step-per-line convention run_bridge/run_render use for non-GSM8K cot
-    corpora)."""
+    reusing run_stage2's generic corpus loader + SENTENCE splitter -- the
+    unit every OpenR1 consumer in this repo uses (vast_cot.sh encoded
+    stage2_cot_openr1 with UNIT=sentence; vast_bridge/vast_rollout inherit
+    it), so the fit distribution matches how OpenR1 text was always fed to
+    the encoder. Line-splitting OpenR1's paragraph-y LaTeX solutions would
+    yield mostly over-length units that get dropped."""
     from marker.run_stage2 import _doc_texts, _split_units  # noqa: PLC0415
 
     for i, text in enumerate(_doc_texts(n, "cot", dataset)):
-        yield ("openr1", i), _split_units(text, "line")
+        yield ("openr1", i), _split_units(text, "sentence")
 
 
 def _fresh_docs(n: int):
@@ -145,7 +148,7 @@ def build_eval_set(doc_iter, tok, max_span: int, n_eval: int):  # noqa: ANN001
     """doc_iter yields (doc_key, [step_text,...]) -> (steps, doc_keys). ONE
     scorable step per doc (first step with an extractable op_label AND
     <= max_span tokens) -- eval steps are doc-disjoint from EACH OTHER by
-    construction, so pick_wrong_doc_step's cross-doc pairing never needs a
+    construction, so pick_wrong_doc_indices's cross-doc pairing never needs a
     second step from the same doc."""
     from marker.summaryprobe import op_label  # noqa: PLC0415
 
@@ -217,10 +220,12 @@ def write_fit_shards(step_iter, out_dir, d: int, dr: int, k_slots: int) -> int: 
     n = 0
     try:
         for kv, readout in step_iter:
-            mat = kv_slot_matrix(kv).half().contiguous()  # [k_slots, D]
+            # .cpu() before .numpy(): on the real run the encode lands on
+            # CUDA, and .numpy() on a CUDA tensor raises
+            mat = kv_slot_matrix(kv).half().cpu().contiguous()  # [k_slots, D]
             for s in range(k_slots):
                 handles[s].write(mat[s].numpy().tobytes())
-            ro_handle.write(readout.half().contiguous().numpy().tobytes())
+            ro_handle.write(readout.half().cpu().contiguous().numpy().tobytes())
             n += 1
     finally:
         for h in handles:
@@ -268,17 +273,25 @@ def build_all_dicts(
     whole_k: int,
     whole_proj_dim: int | None,
     seed: int = 0,
+    device: str = "cpu",
 ):
     """Builds every configured dictionary from the on-disk shards, loading
     at most one slot at a time (per gist_dict.build_dict_* + build_dict_whole
-    contracts). Returns (dicts, fit_ids): dicts[cfg] is a tokenize/detokenize-
-    ready dict; fit_ids[cfg] is [N, k_slots] long -- the fit set's OWN
-    tokenized ids, a free byproduct of the k-means assignment (never
-    recomputed by re-running tokenize over the whole fit set)."""
-    readouts = load_readouts(shard_dir).float()  # [N, k_slots, Dr] -- small
+    contracts). k-means runs on `device` (spec section C: GPU when available
+    -- Lloyd's on [40k, 28672] x K=4096 x 20 iters is ~1e14 FLOPs, hours on
+    CPU, seconds-per-slot on the card the model already occupies); every
+    stored entry comes back on CPU regardless (builder contract). Returns
+    (dicts, fit_ids): dicts[cfg] is a tokenize/detokenize-ready dict;
+    fit_ids[cfg] is [N, k_slots] long -- the fit set's OWN tokenized ids, a
+    free byproduct of the k-means assignment (never recomputed by re-running
+    tokenize over the whole fit set)."""
+    readouts = load_readouts(shard_dir)  # [N, k_slots, Dr] fp16, kept resident
 
     def _slot_ro(s):
-        return readouts[:, s, :]
+        return readouts[:, s, :].float().to(device)
+
+    def _slot_mat(s):
+        return load_slot_shard(shard_dir, s).float().to(device)
 
     dicts: dict[str, dict] = {}
     fit_ids: dict[str, torch.Tensor] = {}
@@ -286,7 +299,7 @@ def build_all_dicts(
     for K in ks:
         slots, assigns = [], []
         for s in range(k_slots):
-            mat = load_slot_shard(shard_dir, s).float()
+            mat = _slot_mat(s)
             entry, assign = build_dict_kv(mat, _slot_ro(s), K, seed=seed)
             slots.append(entry)
             assigns.append(assign)
@@ -294,10 +307,11 @@ def build_all_dicts(
         name = f"kv_K{K}"
         dicts[name] = {"cfg": name, "kind": "kv", "geometry": geometry, "slots": slots}
         fit_ids[name] = torch.stack(assigns, dim=1)
+        print(f"built {name}", flush=True)
 
     slots, assigns = [], []
     for s in range(k_slots):
-        mat = load_slot_shard(shard_dir, s).float()
+        mat = _slot_mat(s)
         entry, a1, a2 = build_dict_kv_residual(mat, _slot_ro(s), res_k1, res_k2, seed=seed)
         slots.append(entry)
         assigns.append(a1 * res_k2 + a2)
@@ -305,10 +319,11 @@ def build_all_dicts(
     name = f"kv_res_{res_k1}x{res_k2}"
     dicts[name] = {"cfg": name, "kind": "kv_res", "geometry": geometry, "slots": slots}
     fit_ids[name] = torch.stack(assigns, dim=1)
+    print(f"built {name}", flush=True)
 
     slots, assigns = [], []
     for s in range(k_slots):
-        mat = load_slot_shard(shard_dir, s).float()
+        mat = _slot_mat(s)
         entry, assign = build_dict_ro(_slot_ro(s), mat, ro_k, seed=seed)
         slots.append(entry)
         assigns.append(assign)
@@ -316,16 +331,23 @@ def build_all_dicts(
     name = f"ro_K{ro_k}"
     dicts[name] = {"cfg": name, "kind": "ro", "geometry": geometry, "slots": slots}
     fit_ids[name] = torch.stack(assigns, dim=1)
-
-    def _loader(s):
-        return load_slot_shard(shard_dir, s).float()
+    print(f"built {name}", flush=True)
 
     entry, assign = build_dict_whole(
-        _loader, k_slots, whole_k, seed=seed, proj_dim=whole_proj_dim, proj_seed=seed
+        _slot_mat, k_slots, whole_k, seed=seed, proj_dim=whole_proj_dim, proj_seed=seed
     )
+    # per-slot mean readouts for the whole dict too (spec C stores mu for
+    # every config; quantized_readouts / the centroid probe need it)
+    from marker.gist_dict import _cluster_means  # noqa: PLC0415
+
+    for s in range(k_slots):
+        entry["slots"][s]["mu_readout"] = _cluster_means(
+            readouts[:, s, :].float(), assign, whole_k
+        ).half()
     name = f"whole_K{whole_k}"
     dicts[name] = {"cfg": name, "kind": "whole", "geometry": geometry, "entry": entry}
     fit_ids[name] = assign.unsqueeze(1).expand(-1, k_slots).clone()
+    print(f"built {name}", flush=True)
 
     return dicts, fit_ids
 
@@ -339,16 +361,17 @@ def save_dict(dict_: dict, out_dir) -> None:  # noqa: ANN001
 # ── D. GPU eval: native / quantized / wrong_doc_quantized / random_ids ──────
 
 
-def pick_wrong_doc_step(pool: list[EvalStep], gen: torch.Generator) -> list[EvalStep]:
-    """For each step in `pool` (one per doc, see build_eval_set), the
-    wrong-doc pairing: another step from a DIFFERENT doc
-    (predprobe.pick_cross_doc_step) -- scored later against the CURRENT
-    step's own text (the cheating floor)."""
-    doc_lengths = [1] * len(pool)
+def pick_wrong_doc_indices(n: int, gen: torch.Generator) -> list[int]:
+    """For each eval step i (one per doc, see build_eval_set), the index of a
+    step from a DIFFERENT doc (predprobe.pick_cross_doc_step) -- its KV is
+    scored later against step i's own text (the cheating floor). Indices, not
+    steps: the wrong step's canonical KV is already in the natives list
+    (every eval step is encoded exactly once), so no re-encode."""
+    doc_lengths = [1] * n
     out = []
-    for i in range(len(pool)):
+    for i in range(n):
         dj, _sj = pick_cross_doc_step(i, doc_lengths, gen, step_idx=0)
-        out.append(pool[dj])
+        out.append(dj)
     return out
 
 
@@ -358,15 +381,26 @@ def random_ids(K: int, k_slots: int, gen: torch.Generator) -> list[int]:
     return [int(torch.randint(0, K, (1,), generator=gen)) for _ in range(k_slots)]
 
 
-def _condition_metrics(pm, tok, gold: EvalStep, kv, cs: int, nl_id, max_new: int = MAX_NEW) -> dict:  # noqa: ANN001
+def _condition_metrics(
+    pm, tok, gold: EvalStep, kv, cs: int, nl_id, max_new: int = MAX_NEW, nll_only: bool = False
+) -> dict:  # noqa: ANN001
     """f1/num_recall/rel_exact (run_render._score_record, reused not copied)
     + teacher-forced render NLL of the TRUE step (gistprobe.per_token_ce) --
     the sensitive metric the spec calls out. `render` adapter must already
-    be active."""
-    stop_ids = {nl_id} if nl_id is not None else set()
-    f1, nr, rel = _score_record(pm, tok, gold, kv, cs, False, stop_ids, max_new)
+    be active. Ledger ON (spec section D): the reader's trained frame -- and
+    the gate-0 thresholds -- assume the visible-literals ledger prefix, both
+    for generation and for the teacher-forced NLL. nll_only skips the
+    generation (the random_ids floor's wall-clock cut: its NLL is the
+    sensitive floor metric, its rendered relations are not gate inputs)."""
+    from marker.run_render import _ledger_ids  # noqa: PLC0415
+
+    ledger = _ledger_ids(tok, gold.text)
     tail = list(gold.ids) + ([nl_id] if nl_id is not None else [])
-    ce, _tgt = per_token_ce(pm, kv, cs, [], tail)
+    ce, _tgt = per_token_ce(pm, kv, cs, ledger, tail)
+    if nll_only:
+        return {"nll": float(ce.mean())}
+    stop_ids = {nl_id} if nl_id is not None else set()
+    f1, nr, rel = _score_record(pm, tok, gold, kv, cs, True, stop_ids, max_new)
     return {"f1": f1, "num_recall": nr, "rel": rel, "nll": float(ce.mean())}
 
 
@@ -387,6 +421,16 @@ def _summarize(metrics: list[dict]) -> dict:
     }
 
 
+def _summarize_nll(metrics: list[dict]) -> dict:
+    """Summary for an NLL-only condition (random_ids): just the teacher-forced
+    NLL -- no rendered-relation fields to mistake for real ones."""
+    return {
+        "nll_mean": round(sum(m["nll"] for m in metrics) / max(1, len(metrics)), 4),
+        "n": len(metrics),
+        "nll_only": True,
+    }
+
+
 def _dict_k(dict_: dict) -> int:
     """The valid id range [0, K) for a config, however its entry is shaped:
     kv/ro store K directly; kv_res's id is the JOINT id1*K2+id2 (range
@@ -399,56 +443,86 @@ def _dict_k(dict_: dict) -> int:
     return slot["K"]
 
 
+def _nl_id(tok):  # noqa: ANN001
+    return next((t for t in tok("\n", add_special_tokens=False).input_ids if t), None)
+
+
 @torch.no_grad()
-def eval_config(
+def score_native(pm, tok, eval_steps: list[EvalStep], natives, max_new: int = MAX_NEW) -> dict:  # noqa: ANN001
+    """The native condition, scored ONCE per eval set -- it is
+    config-independent (the step's own canonical KV through the reader), so
+    re-running it per dictionary config would multiply the most expensive
+    GPU loop by the config count for identical numbers. `render` adapter
+    must already be active."""
+    nl = _nl_id(tok)
+    metrics = [
+        _condition_metrics(pm, tok, gold, kv, cs, nl, max_new)
+        for gold, (kv, _ro, cs) in zip(eval_steps, natives, strict=True)
+    ]
+    return _summarize(metrics)
+
+
+def tokenize_eval(natives, dict_) -> torch.Tensor:  # noqa: ANN001
+    """Every eval step's ids under one config -- pure CPU, no reader. Runs
+    for EVERY config (including ones cut from the GPU eval) so op-from-IDs
+    and the AMI diagnostic never depend on which configs got GPU budget."""
+    return torch.tensor(
+        [tokenize(kv, dict_, readout=ro) for kv, ro, _cs in natives], dtype=torch.long
+    )
+
+
+@torch.no_grad()
+def eval_quantized_conditions(
     pm,
     tok,
-    gist,
     eval_steps: list[EvalStep],
+    natives,
+    wrong_idx: list[int],
+    ids: torch.Tensor,
     dict_: dict,
     geometry: dict,
     seed: int = 0,
     max_new: int = MAX_NEW,
 ):  # noqa: ANN001
-    """The 4 conditions of section D on ONE eval set (gsm8k or fresh), for
-    ONE dictionary config. Returns ({"native","quantized",
-    "wrong_doc_quantized","random_ids"} -> summary, ids [N, k_slots])."""
+    """The config-DEPENDENT conditions of section D on one eval set:
+    quantized + wrong_doc_quantized (full generation + NLL), random_ids
+    (teacher-forced NLL only -- the wall-clock cut; see _condition_metrics).
+    `render` adapter must already be active. `ids` is tokenize_eval's output
+    for this config; the wrong step's ids are looked up from the same tensor
+    (its KV was already tokenized as its OWN row)."""
     k_slots = geometry["k_slots"]
-    K_for_random = _dict_k(dict_)
-    wrong_pool = pick_wrong_doc_step(eval_steps, torch.Generator().manual_seed(seed))
     rand_gen = torch.Generator().manual_seed(seed + 1)
-    nl_id = next((t for t in tok("\n", add_special_tokens=False).input_ids if t), None)
-
-    pm.set_adapter("default")
-    natives = [encode_canonical(pm, gist, s.ids, base=BASE) for s in eval_steps]
-    wrong_natives = [encode_canonical(pm, gist, s.ids, base=BASE) for s in wrong_pool]
-
-    metrics = {c: [] for c in ("native", "quantized", "wrong_doc_quantized", "random_ids")}
-    ids_out = []
-    for gold, (kv, readout, cs), (wkv, wreadout, _wcs) in zip(
-        eval_steps, natives, wrong_natives, strict=True
-    ):
-        ids = tokenize(kv, dict_, readout=readout)
-        ids_out.append(ids)
-        wrong_ids = tokenize(wkv, dict_, readout=wreadout)
-        rids = random_ids(K_for_random, k_slots, rand_gen)
-
-        pm.set_adapter("render")
-        metrics["native"].append(_condition_metrics(pm, tok, gold, kv, cs, nl_id, max_new))
+    nl = _nl_id(tok)
+    metrics = {"quantized": [], "wrong_doc_quantized": [], "random_ids": []}
+    for i, gold in enumerate(eval_steps):
+        cs = natives[i][2]
         metrics["quantized"].append(
-            _condition_metrics(pm, tok, gold, detokenize(ids, dict_, geometry), cs, nl_id, max_new)
+            _condition_metrics(
+                pm, tok, gold, detokenize(ids[i].tolist(), dict_, geometry), cs, nl, max_new
+            )
         )
         metrics["wrong_doc_quantized"].append(
             _condition_metrics(
-                pm, tok, gold, detokenize(wrong_ids, dict_, geometry), cs, nl_id, max_new
+                pm,
+                tok,
+                gold,
+                detokenize(ids[wrong_idx[i]].tolist(), dict_, geometry),
+                cs,
+                nl,
+                max_new,
             )
         )
+        rids = random_ids(_dict_k(dict_), k_slots, rand_gen)
         metrics["random_ids"].append(
-            _condition_metrics(pm, tok, gold, detokenize(rids, dict_, geometry), cs, nl_id, max_new)
+            _condition_metrics(
+                pm, tok, gold, detokenize(rids, dict_, geometry), cs, nl, max_new, nll_only=True
+            )
         )
-        pm.set_adapter("default")
-
-    return {c: _summarize(v) for c, v in metrics.items()}, torch.tensor(ids_out, dtype=torch.long)
+    return {
+        "quantized": _summarize(metrics["quantized"]),
+        "wrong_doc_quantized": _summarize(metrics["wrong_doc_quantized"]),
+        "random_ids": _summarize_nll(metrics["random_ids"]),
+    }
 
 
 def gate0_pass(native_gsm8k: dict, native_fresh: dict) -> bool:
@@ -490,6 +564,94 @@ def usage_diagnostics(usage: torch.Tensor) -> dict:
     }
 
 
+def usage_by_slot(fit_ids_cfg: torch.Tensor, K: int) -> list[dict]:
+    """usage_diagnostics per slot -- a per-slot dictionary has 8 independent
+    codebooks with 8 independent usage patterns (slot 0's entropy says
+    nothing about slot 5's); a whole dict just repeats one column 8x, which
+    collapses to identical entries."""
+    return [
+        usage_diagnostics(torch.bincount(fit_ids_cfg[:, s], minlength=K))
+        for s in range(fit_ids_cfg.shape[1])
+    ]
+
+
+def quantized_readouts(dict_: dict, ids: torch.Tensor) -> torch.Tensor:
+    """ids [N, k_slots] -> the centroid mean-readouts [N, k_slots, Dr]
+    float32 (what a guesser over IDs could reconstruct). kv/ro/whole store a
+    dense per-slot mu_readout [K, Dr]; kv_res stores it SPARSELY over the
+    occupied joint ids (mu_ids) -- an id never occupied in fit gets a zero
+    row, honestly reflecting that the dictionary carries no readout for it."""
+    kind = dict_["kind"]
+    n, k_slots = ids.shape
+    out = None
+    for s in range(k_slots):
+        slot = dict_["entry"]["slots"][s] if kind == "whole" else dict_["slots"][s]
+        if kind == "kv_res":
+            mu_ids, mu = slot["mu_ids"], slot["mu_readout"].float()
+            pos = torch.searchsorted(mu_ids, ids[:, s].clamp(max=int(mu_ids[-1])))
+            hit = mu_ids[pos] == ids[:, s]  # compared against the UNclamped id
+            rows = torch.zeros(n, mu.shape[1])
+            rows[hit] = mu[pos[hit]]
+        else:
+            rows = slot["mu_readout"].float()[ids[:, s]]
+        if out is None:
+            out = torch.zeros(n, k_slots, rows.shape[1])
+        out[:, s] = rows
+    return out
+
+
+def centroid_readout_op_probe(
+    q_fit: torch.Tensor,
+    fit_ops: list[str],
+    fit_doc_keys: list,
+    q_eval: torch.Tensor,
+    eval_ops: list[str],
+    seed: int = 0,
+    pca_dim: int = 128,
+) -> dict | None:
+    """Section E's 'op probe on centroid readouts, trained on quantized':
+    summaryprobe's exact recipe (per-slot normalize -> standardize ->
+    PCA -> linear probe, early-stopped on a doc-disjoint val carve-out),
+    trained on the QUANTIZED fit readouts, tested on the QUANTIZED eval
+    readouts. Reference: the continuous-readout probe scored 0.825. Returns
+    evaluate_probe's dict + majority, or None when the fit split is too
+    small to carve a val set from (tiny smoke sets)."""
+    from marker.summaryprobe import (  # noqa: PLC0415
+        OP_CLASSES,
+        doc_disjoint_split,
+        encode_labels,
+        evaluate_probe,
+        majority_rate,
+        normalize_flatten,
+        pca_apply,
+        pca_fit,
+        standardize_apply,
+        standardize_fit,
+        train_probe,
+    )
+
+    doc_to_int = {d: i for i, d in enumerate(dict.fromkeys(fit_doc_keys))}
+    doc_ints = [doc_to_int[d] for d in fit_doc_keys]
+    keep, hold = doc_disjoint_split(doc_ints, frac_holdout=0.15, seed=seed)
+    idx_tr = [i for i, d in enumerate(doc_ints) if d in keep]
+    idx_va = [i for i, d in enumerate(doc_ints) if d in hold]
+    if len(idx_tr) < 8 or len(idx_va) < 2 or len(eval_ops) == 0:
+        return None
+    y_fit = encode_labels(fit_ops)
+    y_eval = encode_labels(eval_ops)
+    x_all = normalize_flatten(q_fit)
+    mean, std = standardize_fit(x_all[idx_tr])
+    xt = standardize_apply(x_all[idx_tr], mean, std)
+    xv = standardize_apply(x_all[idx_va], mean, std)
+    pmean, comps = pca_fit(xt, pca_dim)
+    xt, xv = pca_apply(xt, pmean, comps), pca_apply(xv, pmean, comps)
+    model = train_probe(xt, y_fit[idx_tr], xv, y_fit[idx_va], n_classes=len(OP_CLASSES), seed=seed)
+    xe = pca_apply(standardize_apply(normalize_flatten(q_eval), mean, std), pmean, comps)
+    out = evaluate_probe(model, xe, y_eval)
+    out["majority"] = round(majority_rate(y_eval), 4)
+    return out
+
+
 def op_from_ids_nb(
     fit_ids: torch.Tensor, fit_ops: list[str], eval_ids: torch.Tensor, eval_ops: list[str]
 ):
@@ -519,25 +681,26 @@ def op_from_ids_nb(
     return {"acc": round(acc, 4), "majority": round(majority_rate(y_eval), 4), "per_slot": per_slot}
 
 
-def _slot_table(dict_: dict, s: int) -> torch.Tensor:
-    """The [K, D] table used to look up slot s's quantized KV, for kv/kv_res/
-    ro/whole dicts (kv_res needs c1+c2 recombined per stored id -- but its
-    ids are JOINT, so this returns a materialized [K1*K2, D] table once,
-    matching kv_res's tokenize/detokenize id convention id = id1*K2+id2)."""
+def _quantized_rows(dict_: dict, s: int, ids_col: torch.Tensor) -> torch.Tensor:
+    """The quantized [len(ids_col), D] KV rows for slot s, looked up straight
+    from the stored ids -- for kv_res via c1[id1] + c2[id2], NEVER by
+    materializing the joint [K1*K2, D] table (K1*K2 ~ 1e6 rows x 28,672
+    floats would be ~120 GB; the smoke's K1=4,K2=2 would happily hide that)."""
     slot = dict_["entry"]["slots"][s] if dict_["kind"] == "whole" else dict_["slots"][s]
     if dict_["kind"] == "kv_res":
-        c1, c2, k2 = slot["c1"].float(), slot["c2"].float(), slot["K2"]
-        return torch.stack([c1[i1] + c2[i2] for i1 in range(c1.shape[0]) for i2 in range(k2)])
-    return slot["centroids"].float()
+        k2 = slot["K2"]
+        return slot["c1"][ids_col // k2].float() + slot["c2"][ids_col % k2].float()
+    return slot["centroids"][ids_col].float()
 
 
 def reconstruction_cosines_from_shards(
-    shard_dir, dict_: dict, geometry: dict, ids: torch.Tensor
+    shard_dir, dict_: dict, geometry: dict, ids: torch.Tensor, chunk: int = 4096
 ) -> dict:  # noqa: ANN001
     """Per-slot AND per-layer mean cosine between the quantized (looked-up)
     KV and the ORIGINAL fit-set KV, straight off the on-disk shards -- pure
     CPU, no GPU or reader needed (section E). Loads one slot's shard at a
-    time (never all k_slots), matching the shard-I/O RAM contract."""
+    time (never all k_slots) and walks it in row chunks, so peak extra RAM is
+    ~2 x chunk x D floats, not two full [N, D] fp32 copies."""
     import torch.nn.functional as F  # noqa: N812, PLC0415
 
     k_slots = geometry["k_slots"]
@@ -549,17 +712,23 @@ def reconstruction_cosines_from_shards(
     per_layer = 2 * n_kv_heads * head_dim
     per_slot_cos, per_layer_cos = [], [[] for _ in range(n_layers)]
     for s in range(k_slots):
-        table = _slot_table(dict_, s)
-        orig = load_slot_shard(shard_dir, s).float()
-        q = table[ids[:, s]]
-        cos = F.cosine_similarity(q, orig, dim=1)
-        per_slot_cos.append(round(float(cos.mean()), 4))
+        orig16 = load_slot_shard(shard_dir, s)  # [N, D] fp16, kept half
+        n = orig16.shape[0]
+        slot_sum, layer_sums = 0.0, [0.0] * n_layers
+        for lo_row in range(0, n, chunk):
+            rows = slice(lo_row, min(lo_row + chunk, n))
+            q = _quantized_rows(dict_, s, ids[rows, s])
+            orig = orig16[rows].float()
+            slot_sum += float(F.cosine_similarity(q, orig, dim=1).sum())
+            for layer in range(n_layers):
+                lo, hi = layer * per_layer, (layer + 1) * per_layer
+                layer_sums[layer] += float(
+                    F.cosine_similarity(q[:, lo:hi], orig[:, lo:hi], dim=1).sum()
+                )
+        per_slot_cos.append(round(slot_sum / n, 4))
         for layer in range(n_layers):
-            lo, hi = layer * per_layer, (layer + 1) * per_layer
-            per_layer_cos[layer].append(
-                float(F.cosine_similarity(q[:, lo:hi], orig[:, lo:hi], dim=1).mean())
-            )
-        del orig
+            per_layer_cos[layer].append(layer_sums[layer] / n)
+        del orig16
     return {
         "per_slot": per_slot_cos,
         "per_layer": [round(sum(v) / len(v), 4) for v in per_layer_cos],
@@ -599,6 +768,16 @@ def main() -> None:  # noqa: PLR0915
     ap.add_argument("--whole-proj-dim", type=int, default=4096)
     ap.add_argument("--max-new", type=int, default=MAX_NEW)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--eval-configs",
+        default="auto",
+        help="comma-separated config names to run the GPU eval conditions on; "
+        "'auto' = every config except the smallest kv_K* and ro_K* (those two "
+        "still get every CPU diagnostic -- ids, op-from-IDs, cosines, AMI); "
+        "'all' = every config. The cut keeps the generation loop inside the "
+        "node's wall-clock budget.",
+    )
+    ap.add_argument("--probe-fit-cap", type=int, default=20000)
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--diagnose", action="store_true")
     ap.add_argument("--cache-dir", default="/tmp/gist_dict_cache")  # noqa: S108
@@ -612,6 +791,7 @@ def main() -> None:  # noqa: PLR0915
         args.res_k1, args.res_k2, args.ro_k, args.whole_k, args.whole_proj_dim = 4, 2, 8, 8, 6
         args.max_new = 12
         args.eval, args.diagnose = True, True
+        args.eval_configs = "all"  # smoke exercises every config's GPU path
 
     ks = [int(x) for x in args.ks.split(",") if x]
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -690,7 +870,7 @@ def main() -> None:  # noqa: PLR0915
     n_fit_actual = write_fit_shards(_fit_kv_readout_stream(), shard_dir, d, dr, k_slots)
     print(f"wrote {n_fit_actual} fit steps to {shard_dir}", flush=True)
 
-    # ── C. dictionaries ──────────────────────────────────────────────────────
+    # ── C. dictionaries (k-means on the GPU when there is one) ──────────────
     dicts, fit_ids = build_all_dicts(
         shard_dir,
         k_slots,
@@ -702,6 +882,7 @@ def main() -> None:  # noqa: PLR0915
         args.whole_k,
         args.whole_proj_dim,
         seed=args.seed,
+        device=device,
     )
     dict_out = Path(args.cache_dir) / "dicts"
     for dict_ in dicts.values():
@@ -711,16 +892,40 @@ def main() -> None:  # noqa: PLR0915
     shutil.copy(shard_dir / "readouts.safetensors", dict_out / "fit_readouts.safetensors")
     torch.save(fit_ids, dict_out / "fit_ids.pt")
 
-    # naive-Bayes fit pool: ONLY fit steps with an extractable relation (an
-    # unlabeled step has no honest class to assign it to -- dropping it is
-    # the fail-loud choice, never a placeholder label that would bias the
-    # fit). fit_ids[name] keeps its row order, so the SAME boolean mask
-    # selects the matching id rows for every config.
+    # EARLY push, BEFORE the eval loop (the render-run lesson: the encode +
+    # k-means above are the expensive irreplaceable part -- if the eval then
+    # hits the wall-clock cap, the dictionaries must already be off the node)
+    if not args.smoke and args.out_repo:
+        _push_with_retry(args.out_repo, str(dict_out), "gist_dict")
+        print(f"pushed dictionaries (early, pre-eval) to {args.out_repo}/gist_dict", flush=True)
+
+    # which configs get the GPU generation loop (all of them always get the
+    # CPU diagnostics -- ids, op-from-IDs, cosines, AMI, readout probe)
+    all_names = list(dicts)
+    if args.eval_configs == "all":
+        eval_names = set(all_names)
+    elif args.eval_configs == "auto":
+        drop = {f"ro_K{args.ro_k}"}
+        if len(ks) > 1:
+            drop.add(f"kv_K{min(ks)}")
+        eval_names = {n for n in all_names if n not in drop}
+    else:
+        eval_names = {x for x in args.eval_configs.split(",") if x}
+        unknown = eval_names - set(all_names)
+        assert not unknown, f"--eval-configs names not built: {sorted(unknown)} vs {all_names}"
+
+    # op labels: ONLY fit steps with an extractable relation (an unlabeled
+    # step has no honest class to assign it to -- dropping it is the
+    # fail-loud choice, never a placeholder label that would bias the fit).
+    # fit_ids[name] keeps its row order, so the SAME index list selects the
+    # matching id rows for every config.
     from marker.summaryprobe import op_label as _op_label  # noqa: PLC0415
 
-    fit_texts = [text for _doc_key, _ids, text in fit_items]
-    fit_label_mask = torch.tensor([_op_label(t) is not None for t in fit_texts])
-    fit_ops_valid = [_op_label(t) for t in fit_texts if _op_label(t) is not None]
+    fit_ops_all = [_op_label(text) for _doc_key, _ids, text in fit_items]
+    lab_idx = torch.tensor(
+        [i for i, o in enumerate(fit_ops_all) if o is not None], dtype=torch.long
+    )
+    fit_ops_valid = [fit_ops_all[i] for i in lab_idx.tolist()]
 
     manifest: dict = {
         "n_fit": n_fit_actual,
@@ -729,45 +934,120 @@ def main() -> None:  # noqa: PLR0915
         "n_eval_gsm8k": len(eval_gsm8k),
         "n_eval_fresh": len(eval_fresh),
         "geometry": geometry,
+        "eval_configs": sorted(eval_names),
         "configs": {},
     }
+
+    # ── eval-step canonical encodes + per-config ids (needed by BOTH the
+    # GPU eval and the CPU diagnostics) ─────────────────────────────────────
+    natives: dict[str, list] = {}
     eval_ids_cache: dict[str, dict[str, torch.Tensor]] = {}
+    if args.eval or args.diagnose:
+        pm.set_adapter("default")
+        natives["gsm8k"] = [
+            encode_canonical(pm, gist, s.ids, base=args.base, max_span=args.max_span)
+            for s in eval_gsm8k
+        ]
+        natives["fresh"] = [
+            encode_canonical(pm, gist, s.ids, base=args.base, max_span=args.max_span)
+            for s in eval_fresh
+        ]
+        for name, dict_ in dicts.items():
+            eval_ids_cache[name] = {
+                "gsm8k": tokenize_eval(natives["gsm8k"], dict_),
+                "fresh": tokenize_eval(natives["fresh"], dict_),
+            }
+        print("eval steps encoded + tokenized under every config", flush=True)
 
     gate0_ok = True
     if args.eval:
-        first_name = next(iter(dicts))
-        for name, dict_ in dicts.items():
-            cells_gsm8k, ids_gsm8k = eval_config(
-                pm, tok, gist, eval_gsm8k, dict_, geometry, seed=args.seed, max_new=args.max_new
-            )
-            cells_fresh, ids_fresh = eval_config(
-                pm, tok, gist, eval_fresh, dict_, geometry, seed=args.seed + 1, max_new=args.max_new
-            )
-            if name == first_name:  # gate 0 only needs checking once (native placement)
-                gate0_ok = gate0_pass(cells_gsm8k["native"], cells_fresh["native"])
-            r_gsm8k = compute_r(
-                cells_gsm8k["quantized"]["rel_exact"],
-                cells_gsm8k["wrong_doc_quantized"]["rel_exact"],
-                cells_gsm8k["native"]["rel_exact"],
-            )
-            r_fresh = compute_r(
-                cells_fresh["quantized"]["rel_exact"],
-                cells_fresh["wrong_doc_quantized"]["rel_exact"],
-                cells_fresh["native"]["rel_exact"],
-            )
-            manifest["configs"].setdefault(name, {})
-            manifest["configs"][name].update(
-                {
-                    "kind": "whole" if dict_["kind"] == "whole" else "per_slot",
-                    "conditions": cells_gsm8k,  # the smoke/reader's flat view (gsm8k)
-                    "conditions_gsm8k": cells_gsm8k,
-                    "conditions_fresh": cells_fresh,
-                    "R_gsm8k": round(r_gsm8k, 4),
-                    "R_fresh": round(r_fresh, 4),
-                }
-            )
-            eval_ids_cache[name] = {"gsm8k": ids_gsm8k, "fresh": ids_fresh}
+        # gate 0 / native: config-independent, computed ONCE
+        pm.set_adapter("render")
+        native_gsm8k = score_native(pm, tok, eval_gsm8k, natives["gsm8k"], max_new=args.max_new)
+        native_fresh = score_native(pm, tok, eval_fresh, natives["fresh"], max_new=args.max_new)
+        pm.set_adapter("default")
+        manifest["native_gsm8k"] = native_gsm8k
+        manifest["native_fresh"] = native_fresh
+        gate0_ok = gate0_pass(native_gsm8k, native_fresh)
         manifest["gate0_pass"] = gate0_ok
+        print(
+            f"gate0 native: gsm8k={native_gsm8k['rel_exact']} fresh={native_fresh['rel_exact']} "
+            f"pass={gate0_ok}",
+            flush=True,
+        )
+        if not gate0_ok:
+            # spec section D: nothing downstream is trustworthy -- don't
+            # spend hours of generation on it (verdict: INVALID_HARNESS).
+            # --smoke still walks the whole path (its untrained render
+            # adapter can't pass gate 0; the point is exercising the code).
+            print("[GISTDICT] GATE 0 FAILED -- skipping per-config GPU eval", flush=True)
+        if gate0_ok or args.smoke:
+            wrong_idx = {
+                "gsm8k": pick_wrong_doc_indices(
+                    len(eval_gsm8k), torch.Generator().manual_seed(args.seed)
+                ),
+                "fresh": pick_wrong_doc_indices(
+                    len(eval_fresh), torch.Generator().manual_seed(args.seed + 1)
+                ),
+            }
+            pm.set_adapter("render")
+            for name in all_names:
+                if name not in eval_names:
+                    continue
+                dict_ = dicts[name]
+                cells_gsm8k = eval_quantized_conditions(
+                    pm,
+                    tok,
+                    eval_gsm8k,
+                    natives["gsm8k"],
+                    wrong_idx["gsm8k"],
+                    eval_ids_cache[name]["gsm8k"],
+                    dict_,
+                    geometry,
+                    seed=args.seed,
+                    max_new=args.max_new,
+                )
+                cells_fresh = eval_quantized_conditions(
+                    pm,
+                    tok,
+                    eval_fresh,
+                    natives["fresh"],
+                    wrong_idx["fresh"],
+                    eval_ids_cache[name]["fresh"],
+                    dict_,
+                    geometry,
+                    seed=args.seed + 1,
+                    max_new=args.max_new,
+                )
+                cells_gsm8k["native"] = native_gsm8k
+                cells_fresh["native"] = native_fresh
+                r_gsm8k = compute_r(
+                    cells_gsm8k["quantized"]["rel_exact"],
+                    cells_gsm8k["wrong_doc_quantized"]["rel_exact"],
+                    native_gsm8k["rel_exact"],
+                )
+                r_fresh = compute_r(
+                    cells_fresh["quantized"]["rel_exact"],
+                    cells_fresh["wrong_doc_quantized"]["rel_exact"],
+                    native_fresh["rel_exact"],
+                )
+                manifest["configs"].setdefault(name, {})
+                manifest["configs"][name].update(
+                    {
+                        "kind": "whole" if dict_["kind"] == "whole" else "per_slot",
+                        "conditions": cells_gsm8k,  # the smoke/reader's flat view (gsm8k)
+                        "conditions_gsm8k": cells_gsm8k,
+                        "conditions_fresh": cells_fresh,
+                        "R_gsm8k": round(r_gsm8k, 4),
+                        "R_fresh": round(r_fresh, 4),
+                    }
+                )
+                print(f"eval {name}: R_gsm8k={r_gsm8k:.3f} R_fresh={r_fresh:.3f}", flush=True)
+            pm.set_adapter("default")
+        # partial manifest NOW: if the wall clock dies during the CPU
+        # diagnostics below, the GPU eval's numbers must already be in the
+        # log (same lesson as the early dictionary push)
+        print(f"[GISTDICT PARTIAL] {json.dumps(manifest, default=str)}", flush=True)
     else:
         manifest["gate0_pass"] = None
 
@@ -775,46 +1055,77 @@ def main() -> None:  # noqa: PLR0915
         eval_gsm8k_ops = [
             _op_label(s.text) for s in eval_gsm8k
         ]  # build_eval_set guarantees non-None
+        # readout-probe fit rows: labeled steps, capped (seeded subsample)
+        probe_idx = lab_idx
+        if probe_idx.numel() > args.probe_fit_cap:
+            g = torch.Generator().manual_seed(args.seed)
+            keep = torch.randperm(probe_idx.numel(), generator=g)[: args.probe_fit_cap]
+            probe_idx = probe_idx[keep.sort().values]
+        probe_ops = [fit_ops_all[i] for i in probe_idx.tolist()]
+        probe_docs = [fit_items[i][0] for i in probe_idx.tolist()]
+
         for name, dict_ in dicts.items():
             K = _dict_k(dict_)
+            cell = manifest["configs"].setdefault(name, {})
+            cell.setdefault("kind", "whole" if dict_["kind"] == "whole" else "per_slot")
             # usage from the FIT set's own assignments (a byproduct of
-            # k-means, uniform across kv/kv_res/ro/whole -- never a
-            # kind-specific stored field, so residual's JOINT usage is
-            # correct rather than approximated from one stage)
-            usage = torch.bincount(fit_ids[name][:, 0], minlength=K)
-            u = usage_diagnostics(usage)
-            manifest["configs"].setdefault(name, {})
-            manifest["configs"][name]["usage_entropy"] = u["entropy_norm"]
-            manifest["configs"][name]["dead_entries"] = u["dead_entries"]
+            # k-means, uniform across kv/kv_res/ro/whole), PER SLOT -- each
+            # slot is its own codebook with its own entropy/dead count
+            u = usage_by_slot(fit_ids[name], K)
+            cell["usage_entropy"] = round(sum(x["entropy_norm"] for x in u) / len(u), 4)
+            cell["usage_entropy_per_slot"] = [x["entropy_norm"] for x in u]
+            cell["dead_entries"] = [x["dead_entries"] for x in u]
 
-            fit_ids_valid = fit_ids[name][fit_label_mask]
+            fit_ids_valid = fit_ids[name][lab_idx]
             eval_ids_gsm8k = eval_ids_cache.get(name, {}).get("gsm8k")
             if eval_ids_gsm8k is not None and fit_ids_valid.shape[0] > 0:
                 nb = op_from_ids_nb(fit_ids_valid, fit_ops_valid, eval_ids_gsm8k, eval_gsm8k_ops)
-                manifest["configs"][name]["op_from_ids"] = nb["acc"]
-                manifest["configs"][name]["op_from_ids_majority"] = nb["majority"]
-                manifest["configs"][name]["op_from_ids_per_slot"] = nb["per_slot"]
-                manifest["configs"][name]["op"] = nb["acc"]
+                cell["op_from_ids"] = nb["acc"]
+                cell["op_from_ids_majority"] = nb["majority"]
+                cell["op_from_ids_per_slot"] = nb["per_slot"]
+                cell["op"] = nb["acc"]
             else:
-                manifest["configs"][name]["op_from_ids"] = None
-                manifest["configs"][name]["op"] = 0.0
+                cell["op_from_ids"] = None
+                cell["op"] = 0.0
 
             # per-slot/per-layer reconstruction cosine (quantized vs original
             # KV), CPU-only, straight off the fit shards -- no GPU needed
             cos = reconstruction_cosines_from_shards(shard_dir, dict_, geometry, fit_ids[name])
-            manifest["configs"][name]["reconstruction_cosine"] = cos
+            cell["reconstruction_cosine"] = cos
 
-        ro_name, kv_name = f"ro_K{args.ro_k}", f"kv_K{ks[0]}"
-        ro_ids = eval_ids_cache.get(ro_name, {}).get("gsm8k")
-        kv_ids = eval_ids_cache.get(kv_name, {}).get("gsm8k")
+            # op probe on the CENTROID readouts, trained on quantized
+            # (section E; continuous-readout reference 0.825)
+            probe = None
+            if eval_ids_gsm8k is not None and probe_idx.numel() > 0:
+                q_fit = quantized_readouts(dict_, fit_ids[name][probe_idx])
+                q_eval = quantized_readouts(dict_, eval_ids_gsm8k)
+                probe = centroid_readout_op_probe(
+                    q_fit, probe_ops, probe_docs, q_eval, eval_gsm8k_ops, seed=args.seed
+                )
+                del q_fit, q_eval
+            cell["op_probe_readout"] = probe
+            print(f"diagnose {name} done", flush=True)
+
+        # ro-vs-kv ID agreement (spec C: against kv_K1024 when built)
+        kv_ref = 1024 if 1024 in ks else ks[0]
+        ro_ids = eval_ids_cache.get(f"ro_K{args.ro_k}", {}).get("gsm8k")
+        kv_ids = eval_ids_cache.get(f"kv_K{kv_ref}", {}).get("gsm8k")
         if ro_ids is not None and kv_ids is not None:
-            manifest["ro_vs_kv_ami"] = round(
-                adjusted_mutual_info(ro_ids[:, 0].tolist(), kv_ids[:, 0].tolist()), 4
-            )
+            per_slot_ami = [
+                round(adjusted_mutual_info(ro_ids[:, s].tolist(), kv_ids[:, s].tolist()), 4)
+                for s in range(ro_ids.shape[1])
+            ]
+            manifest["ro_vs_kv_ami_per_slot"] = per_slot_ami
+            manifest["ro_vs_kv_ami"] = round(sum(per_slot_ami) / len(per_slot_ami), 4)
 
     if args.eval and args.diagnose:
+        # only configs that ran the GPU eval have R cells; gate0=False makes
+        # the verdict INVALID_HARNESS before configs are even consulted
+        verdict_cells = {
+            n: c for n, c in manifest["configs"].items() if "R_gsm8k" in c and "op" in c
+        }
         manifest["verdict"] = stage1_verdict(
-            {"gate0_pass": manifest["gate0_pass"], "configs": manifest["configs"]}
+            {"gate0_pass": manifest["gate0_pass"], "configs": verdict_cells}
         )
     else:
         manifest["verdict"] = None
@@ -822,11 +1133,11 @@ def main() -> None:  # noqa: PLR0915
     print(f"[GISTDICT MANIFEST] {json.dumps(manifest, default=str)}", flush=True)
 
     if not args.smoke and args.out_repo:
-        _push_with_retry(args.out_repo, str(dict_out), "gist_dict")
-        print(f"pushed dictionaries to {args.out_repo}/gist_dict", flush=True)
         manifest_dir = Path(args.cache_dir) / "manifest_out"
         manifest_dir.mkdir(parents=True, exist_ok=True)
         (manifest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+        if eval_ids_cache:
+            torch.save(eval_ids_cache, manifest_dir / "eval_ids.pt")
         _push_with_retry(args.out_repo, str(manifest_dir), "gist_dict")
         print(f"pushed manifest to {args.out_repo}/gist_dict", flush=True)
 

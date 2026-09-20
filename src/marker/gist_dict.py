@@ -69,15 +69,18 @@ def kmeans_pp_init(x: torch.Tensor, K: int, seed: int = 0) -> torch.Tensor:
     assert n >= K, f"K={K} > N={n} points to seed from"
     g = torch.Generator().manual_seed(seed)
     idx = [int(torch.randint(0, n, (1,), generator=g))]
-    d2 = torch.full((n,), float("inf"))
+    d2 = torch.full((n,), float("inf"), device=x.device)
     for _ in range(1, K):
         last = x[idx[-1]].unsqueeze(0)
         dist = torch.cdist(x, last).squeeze(1) ** 2
         d2 = torch.minimum(d2, dist)
         total = d2.sum()
         # every remaining point coinciding with a chosen centroid (total<=0)
-        # falls back to uniform so multinomial doesn't get an all-zero row
-        probs = torch.ones(n) / n if total <= 0 else d2 / total
+        # falls back to uniform so multinomial doesn't get an all-zero row.
+        # The multinomial draw happens on CPU regardless of x's device: the
+        # CPU generator `g` keeps the pick seed-deterministic, and a CUDA
+        # tensor + CPU generator would otherwise error.
+        probs = torch.ones(n) / n if total <= 0 else (d2 / total).cpu()
         idx.append(int(torch.multinomial(probs, 1, generator=g)))
     return torch.tensor(idx, dtype=torch.long)
 
@@ -103,10 +106,14 @@ def kmeans(x: torch.Tensor, K: int, iters: int = 20, seed: int = 0):
         assignments = new_assign
         if converged:
             break
-        for c in range(K):
-            mask = assignments == c
-            if mask.any():
-                centroids[c] = x[mask].mean(dim=0)
+        # vectorized centroid update (index_add scatter-mean): a python loop
+        # over K clusters is fine at test scale but is K x iters serialized
+        # gathers at K=4096 on the real run -- same semantics, one kernel
+        sums = torch.zeros_like(centroids)
+        sums.index_add_(0, assignments, x)
+        counts = torch.bincount(assignments, minlength=K)
+        nonempty = counts > 0
+        centroids[nonempty] = sums[nonempty] / counts[nonempty].unsqueeze(1).to(x.dtype)
     usage = torch.bincount(assignments, minlength=K)
     return centroids, assignments, usage
 
@@ -121,14 +128,16 @@ def build_dict_kv(slot_mats: torch.Tensor, slot_readouts: torch.Tensor, K: int, 
     per-slot config."""
     centroids, assign, usage = kmeans(slot_mats, K, iters, seed)
     mu = _cluster_means(slot_readouts, assign, K)
+    # entries live on CPU whatever device the k-means ran on: they get
+    # torch.save'd, and tokenize/detokenize pin their math to CPU
     entry = {
-        "centroids": centroids.half(),
-        "mu_readout": mu.half(),
-        "usage": usage,
+        "centroids": centroids.half().cpu(),
+        "mu_readout": mu.half().cpu(),
+        "usage": usage.cpu(),
         "K": K,
         "seed": seed,
     }
-    return entry, assign
+    return entry, assign.cpu()
 
 
 def build_dict_kv_residual(
@@ -137,24 +146,27 @@ def build_dict_kv_residual(
     """Second k-means stage on residuals of a K1-centroid fit -- the
     kv_res_KxK config. entry = c1 + c2 (see detokenize). Joint id space:
     id = id1 * K2 + id2 (kept as ONE int per slot so tokenize/detokenize's
-    `[8] ids` interface stays uniform across configs); mu_readout is the mean
-    readout of the members of the FINAL (id1, id2) joint bucket."""
+    `[8] ids` interface stays uniform across configs); the mean readout is
+    stored SPARSELY over the occupied joint buckets (mu_ids + mu_readout):
+    K1*K2 can be ~1e6, and a dense table would be tens of GB for buckets no
+    fit step ever landed in."""
     stage1, assign1, usage1 = kmeans(slot_mats, K1, iters, seed)
     resid = slot_mats - stage1[assign1]
     stage2, assign2, usage2 = kmeans(resid, K2, iters, seed + 1)
     joint = assign1 * K2 + assign2
-    mu = _cluster_means(slot_readouts, joint, K1 * K2)
+    mu_ids, mu = _cluster_means_sparse(slot_readouts, joint)
     entry = {
-        "c1": stage1.half(),
-        "c2": stage2.half(),
-        "mu_readout": mu.half(),
-        "usage1": usage1,
-        "usage2": usage2,
+        "c1": stage1.half().cpu(),
+        "c2": stage2.half().cpu(),
+        "mu_ids": mu_ids.cpu(),
+        "mu_readout": mu.half().cpu(),
+        "usage1": usage1.cpu(),
+        "usage2": usage2.cpu(),
         "K1": K1,
         "K2": K2,
         "seed": seed,
     }
-    return entry, assign1, assign2
+    return entry, assign1.cpu(), assign2.cpu()
 
 
 def build_dict_ro(slot_readouts: torch.Tensor, slot_mats: torch.Tensor, K: int, iters=20, seed=0):
@@ -166,14 +178,14 @@ def build_dict_ro(slot_readouts: torch.Tensor, slot_mats: torch.Tensor, K: int, 
     mean_kv = _cluster_means(slot_mats, assign, K)
     mu = _cluster_means(slot_readouts, assign, K)
     entry = {
-        "centroids": mean_kv.half(),
-        "centroids_ro": centroids_ro.half(),
-        "mu_readout": mu.half(),
-        "usage": usage,
+        "centroids": mean_kv.half().cpu(),
+        "centroids_ro": centroids_ro.half().cpu(),
+        "mu_readout": mu.half().cpu(),
+        "usage": usage.cpu(),
         "K": K,
         "seed": seed,
     }
-    return entry, assign
+    return entry, assign.cpu()
 
 
 def build_dict_whole(
@@ -217,9 +229,14 @@ def build_dict_whole(
         proj_blocks = []
         for s in range(k_slots):
             mat = slot_loader(s).float()
+            # generated on CPU (seeded CPU generator), stored HALF -- and the
+            # build itself uses the half-rounded values, so tokenize (which
+            # reads the stored half blocks back) computes distances in the
+            # SAME projection, never a slightly different fp32 one
             block = torch.randn(mat.shape[1], proj_dim, generator=g) / math.sqrt(proj_dim)
+            block = block.half()
             proj_blocks.append(block)
-            contrib = mat @ block
+            contrib = mat @ block.float().to(mat.device)
             x_for_dist = contrib if x_for_dist is None else x_for_dist + contrib
             del mat
     else:
@@ -229,32 +246,46 @@ def build_dict_whole(
         x_for_dist = torch.cat(chunks, dim=1)
         del chunks
     _, assign, usage = kmeans(x_for_dist, K, iters, seed)
+    del x_for_dist
     slots = []
     for s in range(k_slots):
         mat = slot_loader(s).float()
-        slots.append({"centroids": _cluster_means(mat, assign, K).half()})
+        slots.append({"centroids": _cluster_means(mat, assign.to(mat.device), K).half().cpu()})
         del mat
     entry = {
         "slots": slots,
-        "usage": usage,
+        "usage": usage.cpu(),
         "K": K,
         "seed": seed,
         "proj_blocks": proj_blocks,
         "proj_dim": proj_dim,
         "proj_seed": proj_seed,
     }
-    return entry, assign
+    return entry, assign.cpu()
 
 
 def _cluster_means(x: torch.Tensor, assign: torch.Tensor, K: int) -> torch.Tensor:
     """Mean of x's rows per assignment bucket 0..K-1; an empty bucket gets an
-    all-zero row (never a NaN from dividing by zero members)."""
-    out = torch.zeros(K, x.shape[1], dtype=torch.float32)
-    for c in range(K):
-        mask = assign == c
-        if mask.any():
-            out[c] = x[mask].float().mean(dim=0)
-    return out
+    all-zero row (never a NaN from dividing by zero members). Runs on x's
+    device (vectorized index_add scatter-mean, not a python loop over K)."""
+    out = torch.zeros(K, x.shape[1], dtype=torch.float32, device=x.device)
+    out.index_add_(0, assign, x.float())
+    counts = torch.bincount(assign, minlength=K).clamp_min(1)
+    return out / counts.unsqueeze(1).float()
+
+
+def _cluster_means_sparse(
+    x: torch.Tensor, assign: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like _cluster_means but only for the OCCUPIED bucket ids -- returns
+    (uniq_ids [M] long sorted, means [M, D] float32). Exists for kv_res's
+    JOINT id space (K1*K2 can be ~1e6: a dense [K1*K2, Dr] mean-readout table
+    would be tens of GB, while at most N of those ids are ever occupied)."""
+    uniq, inv = torch.unique(assign, return_inverse=True)
+    means = torch.zeros(uniq.numel(), x.shape[1], dtype=torch.float32, device=x.device)
+    means.index_add_(0, inv, x.float())
+    counts = torch.bincount(inv, minlength=uniq.numel()).clamp_min(1)
+    return uniq, means / counts.unsqueeze(1).float()
 
 
 # ── tokenize / detokenize ────────────────────────────────────────────────────
@@ -267,13 +298,16 @@ def tokenize(kv, dict_: dict, readout: torch.Tensor | None = None) -> list[int]:
     kind = dict_["kind"]
     if kind == "whole":
         entry = dict_["entry"]
-        mat = kv_slot_matrix(kv).float()  # [k_slots, D]
+        # .cpu(): eval-time KV comes straight off a CUDA encode while every
+        # dictionary entry is CPU by builder contract -- assign on CPU
+        mat = kv_slot_matrix(kv).float().cpu()  # [k_slots, D]
         proj_blocks = entry.get("proj_blocks")
         slots_c = entry["slots"]
         if proj_blocks is not None:
-            x = sum(mat[s : s + 1] @ proj_blocks[s] for s in range(mat.shape[0]))
+            x = sum(mat[s : s + 1] @ proj_blocks[s].float() for s in range(mat.shape[0]))
             cproj = sum(
-                slots_c[s]["centroids"].float() @ proj_blocks[s] for s in range(len(slots_c))
+                slots_c[s]["centroids"].float() @ proj_blocks[s].float()
+                for s in range(len(slots_c))
             )
         else:
             x = mat.reshape(1, -1)
@@ -281,7 +315,7 @@ def tokenize(kv, dict_: dict, readout: torch.Tensor | None = None) -> list[int]:
         idx = int(torch.cdist(x, cproj).argmin())
         return [idx] * len(slots_c)
 
-    mat = kv_slot_matrix(kv).float()  # [k_slots, D]
+    mat = kv_slot_matrix(kv).float().cpu()  # [k_slots, D] (see whole branch)
     k_slots = mat.shape[0]
     ids = []
     for s in range(k_slots):
@@ -297,7 +331,7 @@ def tokenize(kv, dict_: dict, readout: torch.Tensor | None = None) -> list[int]:
         elif kind == "ro":
             assert readout is not None, "ro dictionary requires the step's readout, not just its KV"
             idx = int(
-                torch.cdist(readout[s : s + 1].float(), slot["centroids_ro"].float()).argmin()
+                torch.cdist(readout[s : s + 1].float().cpu(), slot["centroids_ro"].float()).argmin()
             )
         else:
             raise ValueError(f"unknown dict kind {kind!r}")
