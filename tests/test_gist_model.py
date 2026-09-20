@@ -240,6 +240,62 @@ def test_gist_kv_extracts_per_layer_kv_at_gist_positions():
 
 
 @pytest.mark.slow
+def test_gist_kv_default_path_bitwise_unchanged_with_hidden_flag_off():
+    # gist_dict's canonical encode needs the final-layer readout ALONGSIDE the
+    # per-layer KV from one forward (never a second encode -- see
+    # gist_dict_stage1_spec.md section A) so gist_kv grew an optional
+    # `return_hidden` flag. Pinned invariant: the DEFAULT path (flag omitted,
+    # i.e. False) must be bitwise identical to before this flag existed --
+    # same 3-tuple, same values, to the last bit.
+    from marker.gist_model import gist_kv
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    span = [1, 2, 3]
+
+    torch.manual_seed(0)
+    kv_a, cs_a, fl_a = gist_kv(pm, gist, span)
+    torch.manual_seed(0)
+    out_b = gist_kv(pm, gist, span, return_hidden=False)
+    assert len(out_b) == 3, "return_hidden=False must return the original 3-tuple, not a 4-tuple"
+    kv_b, cs_b, fl_b = out_b
+    assert cs_a == cs_b
+    assert torch.equal(fl_a, fl_b)
+    for a, b in zip(kv_a.keys, kv_b.keys, strict=True):
+        assert torch.equal(a, b)
+    for a, b in zip(kv_a.values, kv_b.values, strict=True):
+        assert torch.equal(a, b)
+
+
+@pytest.mark.slow
+def test_gist_kv_return_hidden_matches_encode_gist_readout():
+    # return_hidden=True must add a 4th return value (the k gist positions'
+    # final-layer hidden states) WITHOUT changing the first three -- and that
+    # readout must agree with encode_gist's (a self-contained [span|gist]
+    # forward's hidden states are shift-invariant under a constant position
+    # offset: RoPE attention scores depend only on relative position, so
+    # gist_start just relabels the block's own coordinate frame).
+    from marker.gist_model import encode_gist, gist_kv
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    span = [1, 2, 3]
+
+    kv, cont_start, first_logits, readout = gist_kv(
+        pm, gist, span, gist_start=64, return_hidden=True
+    )
+    assert readout.shape == (4, base.config.hidden_size)  # [k, hidden]
+    kv2, cont_start2, first_logits2 = gist_kv(pm, gist, span, gist_start=64)
+    assert cont_start == cont_start2
+    assert torch.equal(first_logits, first_logits2)
+    for a, b in zip(kv.keys, kv2.keys, strict=True):
+        assert torch.equal(a, b)
+
+    want = encode_gist(pm, gist, [span])[0]  # [k, hidden], gist_start=None (offset 0)
+    assert torch.allclose(readout, want, atol=1e-4)
+
+
+@pytest.mark.slow
 def test_cache_decode_is_logit_parity_with_training_forward():
     # THE Stage-3 injection gold test (Fable review): decoding from the
     # injected gist KV must reproduce — to float tolerance — the logits of a
@@ -335,7 +391,10 @@ def test_gist_start_offset_preserves_decode_geometry():
     kvS, csS, flS = gist_kv(pm, gist, span, gist_start=40)  # shifted
     assert cs0 == len(span) + 4 and csS == 40 + 4
     assert torch.allclose(fl0, flS, atol=1e-4)  # first-token logits invariant to the shift
-    assert abs(nll_under_gist_kv(pm, kv0, cs0, fl0, cont) - nll_under_gist_kv(pm, kvS, csS, flS, cont)) < 1e-4
+    assert (
+        abs(nll_under_gist_kv(pm, kv0, cs0, fl0, cont) - nll_under_gist_kv(pm, kvS, csS, flS, cont))
+        < 1e-4
+    )
 
 
 @pytest.mark.slow
@@ -350,7 +409,10 @@ def test_chain_gist_kv_single_step_matches_gist_kv():
     kvg, csg, flg = gist_kv(pm, gist, span, gist_start=64)
     assert csc == csg == 64 + 4
     assert torch.allclose(flc, flg, atol=1e-4)
-    assert abs(nll_under_gist_kv(pm, kvc, csc, flc, cont) - nll_under_gist_kv(pm, kvg, csg, flg, cont)) < 1e-4
+    assert (
+        abs(nll_under_gist_kv(pm, kvc, csc, flc, cont) - nll_under_gist_kv(pm, kvg, csg, flg, cont))
+        < 1e-4
+    )
 
 
 @pytest.mark.slow
@@ -437,9 +499,7 @@ def test_decode_from_gist_kv_respects_stop_ids():
     pm, gist = attach_gist(base, gist_k=4, r=4)
     kv, cont_start, first_logits = gist_kv(pm, gist, [1, 2, 3])
     full = decode_from_gist_kv(pm, kv, cont_start, first_logits, max_new=6)
-    stopped = decode_from_gist_kv(
-        pm, kv, cont_start, first_logits, max_new=6, stop_ids={full[0]}
-    )
+    stopped = decode_from_gist_kv(pm, kv, cont_start, first_logits, max_new=6, stop_ids={full[0]})
     assert stopped == [full[0]]  # halts on the stop token (inclusive)
 
 

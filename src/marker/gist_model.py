@@ -217,6 +217,7 @@ def gist_kv(
     span: list[int],
     pad_id: int = 0,
     gist_start: int | None = None,
+    return_hidden: bool = False,
 ):
     """The Stage-3 decode substrate: the FULL per-layer K/V at the k gist
     positions — what the continuation actually attends to during training.
@@ -245,7 +246,15 @@ def gist_kv(
     thoughts stack at contiguous canonical slots into one accumulated memory
     (chain_gist_kv) without re-rotating stored keys. Require gist_start >=
     len(span) so span positions stay non-negative. Default (None) = span_len,
-    the single-thought behaviour."""
+    the single-thought behaviour.
+
+    return_hidden (gist_dict_stage1_spec.md section A): also return the
+    final-layer hidden states at the k gist positions -- the same "readout"
+    encode_gist() computes -- from this SAME forward, so canonical encode is
+    one forward, not two. Default False keeps the call (and the return
+    value: the original 3-tuple) BITWISE IDENTICAL to before this flag
+    existed -- pinned by
+    test_gist_kv_default_path_bitwise_unchanged_with_hidden_flag_off."""
     from marker.run_axiom_mlp_demo import AxiomKV  # noqa: PLC0415
 
     device = next(peft_model.parameters()).device
@@ -259,7 +268,11 @@ def gist_kv(
     offset = 0 if gist_start is None else (gist_start - max_s)
     pos = (torch.arange(inputs_embeds.shape[1], device=device) + offset).unsqueeze(0)
     out = peft_model(
-        inputs_embeds=inputs_embeds, attention_mask=mask, position_ids=pos, use_cache=True
+        inputs_embeds=inputs_embeds,
+        attention_mask=mask,
+        position_ids=pos,
+        use_cache=True,
+        output_hidden_states=return_hidden,
     )
     cache = out.past_key_values
     legacy = cache.to_legacy_cache() if hasattr(cache, "to_legacy_cache") else cache
@@ -267,7 +280,11 @@ def gist_kv(
     keys = [layer_kv[0][:, :, max_s : max_s + k, :].detach() for layer_kv in legacy]
     values = [layer_kv[1][:, :, max_s : max_s + k, :].detach() for layer_kv in legacy]
     kv = AxiomKV(n_layers=len(keys), keys=keys, values=values)
-    return kv, max_s + k + offset, out.logits[0, -1].detach()  # cont_start tracks the offset
+    cont_start = max_s + k + offset  # cont_start tracks the offset
+    if not return_hidden:
+        return kv, cont_start, out.logits[0, -1].detach()
+    readout = out.hidden_states[-1][0, max_s : max_s + k, :].detach()
+    return kv, cont_start, out.logits[0, -1].detach(), readout
 
 
 @torch.no_grad()
@@ -301,7 +318,11 @@ def chain_gist_kv(
             keys = [torch.cat([a, b], dim=2) for a, b in zip(keys, kv_i.keys, strict=True)]
             values = [torch.cat([a, b], dim=2) for a, b in zip(values, kv_i.values, strict=True)]
         first_logits = fl_i
-    return AxiomKV(n_layers=len(keys), keys=keys, values=values), base + len(spans) * k, first_logits
+    return (
+        AxiomKV(n_layers=len(keys), keys=keys, values=values),
+        base + len(spans) * k,
+        first_logits,
+    )
 
 
 @torch.no_grad()
