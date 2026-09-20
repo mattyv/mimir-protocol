@@ -404,3 +404,27 @@ def test_centroid_readout_op_probe_returns_none_when_fit_too_small():
     q = torch.randn(3, 2, 4)
     out = centroid_readout_op_probe(q, ["+", "-", "+"], [0, 1, 2], q, ["+", "-", "+"])
     assert out is None
+
+
+def test_load_dicts_from_hf_round_trips_and_falls_back_when_missing(tmp_path):
+    from marker.run_gist_dict import _expected_dict_names, _load_dicts_from_hf
+
+    names = _expected_dict_names([4], 2, 2, 4, 4)
+    assert names == ["kv_K4", "kv_res_2x2", "ro_K4", "whole_K4"]
+    for n in names:
+        torch.save({"cfg": n, "kind": "kv"}, tmp_path / f"dict_{n}.pt")
+    torch.save({n: torch.zeros(3, 2, dtype=torch.long) for n in names}, tmp_path / "fit_ids.pt")
+
+    def dl(repo, filename):  # noqa: ANN001
+        p = tmp_path / Path(filename).name
+        if not p.exists():
+            raise FileNotFoundError(filename)
+        return str(p)
+
+    loaded = _load_dicts_from_hf("repo", names, downloader=dl)
+    assert loaded is not None
+    dicts, fit_ids = loaded
+    assert set(dicts) == set(names) and dicts["kv_K4"]["cfg"] == "kv_K4"
+    assert fit_ids["ro_K4"].shape == (3, 2)
+    (tmp_path / "dict_ro_K4.pt").unlink()
+    assert _load_dicts_from_hf("repo", names, downloader=dl) is None

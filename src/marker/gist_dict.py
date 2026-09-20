@@ -405,10 +405,14 @@ def tokenize(kv, dict_: dict, readout: torch.Tensor | None = None) -> list[int]:
     return ids
 
 
-def detokenize(ids: list[int], dict_: dict, geometry: dict):
+def detokenize(ids: list[int], dict_: dict, geometry: dict, dtype: torch.dtype | None = None):
     """[8] ids -> AxiomKV at canonical positions (the caller supplies
     cont_start = base + k_slots; this function only rebuilds the KV values,
-    it has no notion of position)."""
+    it has no notion of position). `dtype`: cast keys/values to the reader's
+    attention dtype -- dictionary entries are stored fp32, the 4-bit 7B
+    attends in fp16, and SDPA hard-fails on a query/key dtype mismatch (node
+    51738897 died there, after gate 0 passed; the fp32 CPU smoke cannot see
+    it). None keeps fp32 (tests / CPU)."""
     kind = dict_["kind"]
     if kind == "whole":
         slots = dict_["entry"]["slots"]
@@ -424,9 +428,10 @@ def detokenize(ids: list[int], dict_: dict, geometry: dict):
     else:  # kv, ro
         rows = [dict_["slots"][s]["centroids"][idx].float() for s, idx in enumerate(ids)]
         mat = torch.stack(rows)
-    return slot_matrix_to_kv(
-        mat, geometry["n_layers"], geometry["n_kv_heads"], geometry["head_dim"]
-    )
+    kv = slot_matrix_to_kv(mat, geometry["n_layers"], geometry["n_kv_heads"], geometry["head_dim"])
+    if dtype is not None:
+        kv = type(kv)(kv.n_layers, [k.to(dtype) for k in kv.keys], [v.to(dtype) for v in kv.values])
+    return kv
 
 
 # ── naive Bayes over discrete slot IDs (op-from-IDs diagnostic) ─────────────

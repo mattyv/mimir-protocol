@@ -402,3 +402,18 @@ def test_verdict_kill_when_everything_is_at_the_floor():
         },
     }
     assert stage1_verdict(cells) == "KILL"
+
+
+def test_detokenize_casts_to_requested_dtype_and_keeps_fp32_by_default():
+    # the reader attends in fp16 on the 4-bit 7B; fp32 dictionary entries
+    # crashed SDPA on node 51738897 after gate 0 passed. Cast at detokenize.
+    geometry = {"n_layers": 2, "n_kv_heads": 1, "head_dim": 4, "k_slots": 2}
+    d = 2 * 2 * 1 * 4
+    slots = [{"centroids": torch.randn(3, d)} for _ in range(2)]
+    dict_ = {"cfg": "kv_K3", "kind": "kv", "geometry": geometry, "slots": slots}
+    kv32 = detokenize([0, 2], dict_, geometry)
+    assert all(k.dtype == torch.float32 for k in kv32.keys)
+    kv16 = detokenize([0, 2], dict_, geometry, dtype=torch.float16)
+    assert all(k.dtype == torch.float16 for k in kv16.keys)
+    assert all(v.dtype == torch.float16 for v in kv16.values)
+    assert torch.allclose(kv16.keys[0].float(), kv32.keys[0], atol=1e-2)

@@ -30,8 +30,10 @@ TIMEOUT="${TIMEOUT:-330m}"
 # LOAD_SHARDS=1 resumes from the pushed fit-shard cache on ${REPO} (skips the
 # encode; requires a previous run to have gotten past the shard push).
 LOAD_SHARDS="${LOAD_SHARDS:-}"
+LOAD_DICTS="${LOAD_DICTS:-}"      # LOAD_DICTS=1 also skips k-means (dicts pushed per-config)
 RESUME_FLAG=""
 [ -n "$LOAD_SHARDS" ] && RESUME_FLAG="--load-shards"
+[ -n "$LOAD_DICTS" ] && RESUME_FLAG="${RESUME_FLAG} --load-dicts"
 
 # cpu_ram is in GB in the vast search API (CLAUDE.md's own "cpu_ram>=<GB*1024>"
 # guidance predates the fix in commit "vast_render: cpu_ram search clause is

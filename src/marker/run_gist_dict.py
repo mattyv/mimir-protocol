@@ -412,6 +412,44 @@ def build_all_dicts(
     return dicts, fit_ids
 
 
+def _expected_dict_names(ks, res_k1, res_k2, ro_k, whole_k) -> list[str]:  # noqa: ANN001
+    """The config names build_all_dicts registers, in build order."""
+    return [f"kv_K{K}" for K in ks] + [
+        f"kv_res_{res_k1}x{res_k2}",
+        f"ro_K{ro_k}",
+        f"whole_K{whole_k}",
+    ]
+
+
+def _load_dicts_from_hf(out_repo: str, names: list[str], downloader=None):  # noqa: ANN001
+    """--load-dicts: (dicts, fit_ids) from the per-config pushes of an earlier
+    run, or None if anything is missing (the caller then builds). `downloader`
+    is hf_hub_download's signature (repo_id, filename) -> local path; tests
+    inject a local stand-in."""
+    if downloader is None:
+        from huggingface_hub import hf_hub_download  # noqa: PLC0415
+
+        downloader = hf_hub_download
+    dicts: dict = {}
+    try:
+        for name in names:
+            dicts[name] = torch.load(
+                downloader(out_repo, f"gist_dict/dict_{name}.pt"), map_location="cpu"
+            )
+        fit_ids = torch.load(downloader(out_repo, "gist_dict/fit_ids.pt"), map_location="cpu")
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[GISTDICT] --load-dicts: could not load ({type(e).__name__}: {e}); building instead",
+            flush=True,
+        )
+        return None
+    missing = [n for n in names if n not in fit_ids]
+    if missing:
+        print(f"[GISTDICT] --load-dicts: fit_ids lacks {missing}; building instead", flush=True)
+        return None
+    return dicts, fit_ids
+
+
 def save_dict(dict_: dict, out_dir) -> None:  # noqa: ANN001
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -610,6 +648,7 @@ def eval_quantized_conditions(
     for this config; the wrong step's ids are looked up from the same tensor
     (its KV was already tokenized as its OWN row)."""
     k_slots = geometry["k_slots"]
+    kv_dtype = natives[0][0].keys[0].dtype  # the reader attends in THIS dtype
     rand_gen = torch.Generator().manual_seed(seed + 1)
     nl = _nl_id(tok)
     metrics = {"quantized": [], "wrong_doc_quantized": [], "random_ids": []}
@@ -617,7 +656,13 @@ def eval_quantized_conditions(
         cs = natives[i][2]
         metrics["quantized"].append(
             _condition_metrics(
-                pm, tok, gold, detokenize(ids[i].tolist(), dict_, geometry), cs, nl, max_new
+                pm,
+                tok,
+                gold,
+                detokenize(ids[i].tolist(), dict_, geometry, dtype=kv_dtype),
+                cs,
+                nl,
+                max_new,
             )
         )
         metrics["wrong_doc_quantized"].append(
@@ -625,7 +670,7 @@ def eval_quantized_conditions(
                 pm,
                 tok,
                 gold,
-                detokenize(ids[wrong_idx[i]].tolist(), dict_, geometry),
+                detokenize(ids[wrong_idx[i]].tolist(), dict_, geometry, dtype=kv_dtype),
                 cs,
                 nl,
                 max_new,
@@ -634,7 +679,14 @@ def eval_quantized_conditions(
         rids = random_ids(_dict_k(dict_), k_slots, rand_gen)
         metrics["random_ids"].append(
             _condition_metrics(
-                pm, tok, gold, detokenize(rids, dict_, geometry), cs, nl, max_new, nll_only=True
+                pm,
+                tok,
+                gold,
+                detokenize(rids, dict_, geometry, dtype=kv_dtype),
+                cs,
+                nl,
+                max_new,
+                nll_only=True,
             )
         )
     return {
@@ -912,6 +964,13 @@ def main() -> None:  # noqa: PLR0915
         help="download gist_dict/fit_shards from --out-repo and SKIP the fit "
         "encode (same model/geometry required; verified against a probe encode)",
     )
+    ap.add_argument(
+        "--load-dicts",
+        action="store_true",
+        help="download every configured dictionary (gist_dict/dict_<cfg>.pt) and "
+        "gist_dict/fit_ids.pt from --out-repo and SKIP k-means; falls back to "
+        "building if any file is missing",
+    )
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--diagnose", action="store_true")
     ap.add_argument("--cache-dir", default="/tmp/gist_dict_cache")  # noqa: S108
@@ -1100,20 +1159,32 @@ def main() -> None:  # noqa: PLR0915
     # in the manifest and the rest still build. ──────────────────────────────
     dict_out = Path(args.cache_dir) / "dicts"
     build_errors: dict[str, str] = {}
-    dicts, fit_ids = build_all_dicts(
-        shard_dir,
-        k_slots,
-        geometry,
-        ks,
-        args.res_k1,
-        args.res_k2,
-        args.ro_k,
-        args.whole_k,
-        args.whole_proj_dim,
-        seed=args.seed,
-        device=device,
-        on_built=_per_config_saver(dict_out, args.out_repo, args.smoke),
-        errors=build_errors,
+    loaded = None
+    if args.load_dicts and args.out_repo and not args.smoke:
+        loaded = _load_dicts_from_hf(
+            args.out_repo,
+            _expected_dict_names(ks, args.res_k1, args.res_k2, args.ro_k, args.whole_k),
+        )
+        if loaded is not None:
+            print("[GISTDICT] loaded dictionaries + fit ids from HF; skipping k-means", flush=True)
+    dicts, fit_ids = (
+        loaded
+        if loaded is not None
+        else build_all_dicts(
+            shard_dir,
+            k_slots,
+            geometry,
+            ks,
+            args.res_k1,
+            args.res_k2,
+            args.ro_k,
+            args.whole_k,
+            args.whole_proj_dim,
+            seed=args.seed,
+            device=device,
+            on_built=_per_config_saver(dict_out, args.out_repo, args.smoke),
+            errors=build_errors,
+        )
     )
     for name, msg in build_errors.items():
         manifest["configs"].setdefault(name, {})["error"] = msg
