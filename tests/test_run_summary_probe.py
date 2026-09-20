@@ -23,13 +23,19 @@ from marker.run_summary_probe import (
     _fit_and_score_shallow,
     _items_from_docs,
     _mean_cos,
+    _mean_pairwise_cos,
     _prepare,
+    _question_condition_features,
     _run_probes,
+    _run_question_probes,
     _shallow_features,
+    _smoke_questions,
     _smoke_varied_cot_texts,
     _split_indices,
     _transform,
+    _truncate_question_ids,
     _write_cache_shards,
+    _write_question_cache,
 )
 from marker.summaryprobe import encode_labels
 
@@ -164,6 +170,184 @@ def test_condition_features_pred_matches_predict_step_directly():
 def test_mean_cos_identical_batches_is_one():
     x = torch.randn(4, 2, 6)
     assert _mean_cos(x, x) == 1.0
+
+
+# ── _mean_pairwise_cos: seeded random-pair diagnostic ───────────────────────
+
+
+def test_mean_pairwise_cos_identical_rows_is_one():
+    x = torch.randn(1, 2, 6).expand(10, 2, 6)
+    assert _mean_pairwise_cos(x, n_pairs=50, seed=0) == 1.0
+
+
+def test_mean_pairwise_cos_deterministic_on_seed():
+    torch.manual_seed(0)
+    x = torch.randn(20, 2, 6)
+    a = _mean_pairwise_cos(x, n_pairs=100, seed=3)
+    b = _mean_pairwise_cos(x, n_pairs=100, seed=3)
+    assert a == b
+
+
+def test_mean_pairwise_cos_orthogonal_rows_is_near_zero():
+    x = torch.eye(4).reshape(4, 1, 4)  # 4 mutually orthogonal unit rows
+    assert abs(_mean_pairwise_cos(x, n_pairs=100, seed=0)) < 1e-6
+
+
+# ── _truncate_question_ids: cap at max_span, keep the LAST tokens ──────────
+
+
+def test_truncate_question_ids_no_truncation_when_short():
+    ids, n_trunc = _truncate_question_ids([1, 2, 3], max_span=5)
+    assert ids == [1, 2, 3]
+    assert n_trunc == 0
+
+
+def test_truncate_question_ids_keeps_last_tokens_and_counts():
+    ids, n_trunc = _truncate_question_ids(list(range(10)), max_span=4)
+    assert ids == [6, 7, 8, 9]  # LAST 4 tokens -- the ask is usually at the end
+    assert n_trunc == 6  # 10 - 4 dropped from the front
+
+
+def test_truncate_question_ids_exact_length_is_not_truncated():
+    ids, n_trunc = _truncate_question_ids([1, 2, 3, 4], max_span=4)
+    assert ids == [1, 2, 3, 4]
+    assert n_trunc == 0
+
+
+# ── _smoke_questions: one synthetic question per doc ────────────────────────
+
+
+def test_smoke_questions_returns_one_per_doc():
+    qs = _smoke_questions(5)
+    assert len(qs) == 5
+    assert all(isinstance(q, str) and q for q in qs)
+
+
+# ── _question_condition_features: q/q_hist/q_pred/fullhist, paired by item ──
+
+
+def test_question_condition_features_q_is_the_docs_question_gist_for_every_item():
+    torch.manual_seed(0)
+    k, d = 2, 6
+    summs = [torch.randn(5, k, d)]
+    q_summs = torch.randn(1, k, d)
+    items = [
+        {"doc": 0, "n": 1, "op": "+", "n_tokens": 3},
+        {"doc": 0, "n": 3, "op": "-", "n_tokens": 3},
+    ]
+    pred_feat = torch.randn(len(items), k, d)
+    feats = _question_condition_features(items, summs, q_summs, pred_feat, window=8)
+    assert torch.equal(feats["q"][0], q_summs[0])
+    assert torch.equal(feats["q"][1], q_summs[0])  # same doc -> same question gist
+
+
+def test_question_condition_features_q_hist_concats_question_and_summ_n_minus_1():
+    torch.manual_seed(0)
+    k, d = 2, 6
+    summs = [torch.randn(5, k, d)]
+    q_summs = torch.randn(1, k, d)
+    items = [{"doc": 0, "n": 3, "op": "-", "n_tokens": 3}]
+    pred_feat = torch.randn(1, k, d)
+    feats = _question_condition_features(items, summs, q_summs, pred_feat, window=8)
+    assert feats["q_hist"].shape == (1, 2 * k, d)
+    expected = torch.cat([q_summs[0], summs[0][2]], dim=0)
+    assert torch.equal(feats["q_hist"][0], expected)
+
+
+def test_question_condition_features_q_pred_uses_the_same_pred_tensor_as_pred_condition():
+    torch.manual_seed(0)
+    k, d = 2, 6
+    summs = [torch.randn(5, k, d)]
+    q_summs = torch.randn(1, k, d)
+    items = [
+        {"doc": 0, "n": 1, "op": "+", "n_tokens": 3},
+        {"doc": 0, "n": 3, "op": "-", "n_tokens": 3},
+    ]
+    pred_feat = torch.randn(len(items), k, d)  # the harness's already-computed "pred" condition
+    feats = _question_condition_features(items, summs, q_summs, pred_feat, window=8)
+    for i in range(len(items)):
+        assert torch.equal(feats["q_pred"][i, k:], pred_feat[i])  # same tensor, no recompute
+        assert torch.equal(feats["q_pred"][i, :k], q_summs[items[i]["doc"]])
+
+
+def test_question_condition_features_fullhist_is_window_history_mean_not_summ_n():
+    torch.manual_seed(0)
+    k, d = 1, 3
+    # distinctive rows so the mean is easy to hand-check
+    summs = [torch.arange(6 * k * d, dtype=torch.float32).reshape(6, k, d)]
+    q_summs = torch.zeros(1, k, d)
+    items = [{"doc": 0, "n": 5, "op": "+", "n_tokens": 3}]
+    pred_feat = torch.zeros(1, k, d)
+    window = 3
+    feats = _question_condition_features(items, summs, q_summs, pred_feat, window=window)
+    # n=5, window=3 -> a = max(0, 5-3+1) = 3 -> history rows 3, 4 (n-1=4 inclusive)
+    expected = summs[0][3:5].mean(dim=0)
+    assert torch.equal(feats["fullhist"][0], expected)
+    assert not torch.equal(feats["fullhist"][0], summs[0][5])  # never summ[n] itself
+
+
+def test_question_condition_features_fullhist_clips_at_zero_near_doc_start():
+    torch.manual_seed(0)
+    k, d = 1, 3
+    summs = [torch.arange(6 * k * d, dtype=torch.float32).reshape(6, k, d)]
+    q_summs = torch.zeros(1, k, d)
+    items = [{"doc": 0, "n": 1, "op": "+", "n_tokens": 3}]
+    pred_feat = torch.zeros(1, k, d)
+    feats = _question_condition_features(items, summs, q_summs, pred_feat, window=8)
+    # n=1, window=8 -> a = max(0, 1-8+1) = 0 -> history rows [0:1] -> just row 0
+    assert torch.equal(feats["fullhist"][0], summs[0][0])
+
+
+# ── _run_question_probes: cells + details for the four question probes ─────
+
+
+def test_run_question_probes_returns_all_four_cells_and_details():
+    torch.manual_seed(0)
+    n_docs, steps_per_doc, k, d = 40, 4, 2, 12
+    items = _synthetic_items(n_docs, steps_per_doc)
+    y = encode_labels([it["op"] for it in items])
+    centers = torch.randn(4, k, d, generator=torch.manual_seed(1)) * 6.0
+    clean = torch.stack([centers[int(c)] + torch.randn(k, d) * 0.2 for c in y])
+    feat_all = {
+        "q": clean.clone(),
+        "q_hist": torch.cat([clean, clean], dim=1),
+        "q_pred": torch.cat([clean, clean], dim=1),
+        "fullhist": clean.clone(),
+    }
+    idx_fit, idx_val, idx_test, *_ = _split_indices(items, seed=0)
+    cells, details = _run_question_probes(
+        items, y, feat_all, idx_fit, idx_val, idx_test, n_components=8, max_steps=200, patience=40
+    )
+    for key in ("q", "q_hist", "q_pred", "fullhist"):
+        assert key in cells, cells
+        assert 0.0 <= cells[key] <= 1.0
+    for key in ("P_q", "P_q_hist", "P_q_pred", "P_fullhist"):
+        assert key in details, details
+        assert details[key]["n"] == len(idx_test)
+    # separable synthetic signal -> should clear chance comfortably
+    assert cells["q_hist"] > 0.4
+
+
+def test_run_question_probes_scores_each_condition_on_its_own_split_transform():
+    # q and fullhist are IDENTICAL tensors here -- their scores must match
+    # exactly, since each condition fits+transforms independently on the
+    # same split.
+    torch.manual_seed(0)
+    items = _synthetic_items(n_docs=30, steps_per_doc=4)
+    y = encode_labels([it["op"] for it in items])
+    n, k, d = len(items), 2, 6
+    x = torch.randn(n, k, d)
+    feat_all = {
+        "q": x.clone(),
+        "q_hist": torch.cat([x, x], dim=1),
+        "q_pred": torch.cat([x, x], dim=1),
+        "fullhist": x.clone(),
+    }
+    idx_fit, idx_val, idx_test, *_ = _split_indices(items, seed=0)
+    cells, _details = _run_question_probes(
+        items, y, feat_all, idx_fit, idx_val, idx_test, n_components=4, max_steps=50, patience=20
+    )
+    assert cells["q"] == cells["fullhist"]
 
 
 # ── _split_indices: doc-disjoint, every item lands in exactly one split ─────
@@ -344,6 +528,23 @@ def test_write_cache_shards_index_covers_every_step(tmp_path):
         assert t.dtype == torch.float16
 
 
+# ── _write_question_cache: one question gist per doc, fp16 ──────────────────
+
+
+def test_write_question_cache_index_covers_every_doc(tmp_path):
+    from safetensors.torch import load_file
+
+    questions = ["how many apples?", "what is the total?", "how much money left?"]
+    q_summs = torch.randn(3, 2, 6)
+    out = _write_question_cache(questions, q_summs, tmp_path / "cache")
+    index = json.loads((out / "questions_index.json").read_text())
+    assert [row["doc"] for row in index] == [0, 1, 2]
+    assert [row["text"] for row in index] == questions
+    t = load_file(str(out / "questions.safetensors"))["q"]
+    assert t.dtype == torch.float16
+    assert t.shape == (3, 2, 6)
+
+
 # ── _assert_window_matches ───────────────────────────────────────────────────
 
 
@@ -405,6 +606,19 @@ def test_smoke_manifest_has_all_cells_and_a_verdict():
         "hist",
     ):
         assert key in manifest["cells"], f"missing cell {key!r}"
+    # --with-question OFF (default): manifest cells and top-level keys must
+    # be EXACTLY today's -- bitwise-unchanged behaviour, not just a superset.
+    assert set(manifest["cells"]) == {
+        "majority",
+        "shallow",
+        "shuffled",
+        "clean",
+        "pred_from_clean",
+        "pred_from_pred",
+        "hist",
+    }
+    assert "question_verdict" not in manifest
+    assert "P_q_hist" not in manifest
     assert manifest["verdict"] in {
         "INVALID",
         "ENCODER_DROPPED",
@@ -422,3 +636,51 @@ def test_smoke_manifest_has_all_cells_and_a_verdict():
     for key in ("pred_vs_clean", "pred_vs_hist", "noised_05_vs_clean", "noised_10_vs_clean"):
         assert key in manifest["cosines"]
     assert "train_docs" in manifest["split"] and "test_docs" in manifest["split"]
+
+
+@pytest.mark.slow
+def test_smoke_with_question_manifest_has_new_cells_and_both_verdicts():
+    repo_root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, "-m", "marker.run_summary_probe", "--smoke", "--with-question"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        env={**os.environ, "PYTHONPATH": "src" + os.pathsep + os.environ.get("PYTHONPATH", "")},
+    )
+    assert proc.returncode == 0, proc.stdout[-4000:] + "\n" + proc.stderr[-4000:]
+    (line,) = (
+        line_ for line_ in proc.stdout.splitlines() if line_.startswith("[SUMPROBE MANIFEST]")
+    )
+    manifest = json.loads(line[len("[SUMPROBE MANIFEST] ") :])
+
+    # today's cells are still all present...
+    for key in (
+        "majority",
+        "shallow",
+        "shuffled",
+        "clean",
+        "pred_from_clean",
+        "pred_from_pred",
+        "hist",
+    ):
+        assert key in manifest["cells"], f"missing cell {key!r}"
+    # ...plus the four new question-conditioned cells
+    for key in ("q", "q_hist", "q_pred", "fullhist"):
+        assert key in manifest["cells"], f"missing question cell {key!r}"
+        assert 0.0 <= manifest["cells"][key] <= 1.0
+    for key in ("P_q", "P_q_hist", "P_q_pred", "P_fullhist"):
+        assert key in manifest, f"missing detail {key!r}"
+    # both verdicts present, the original untouched
+    assert manifest["verdict"] in {
+        "INVALID",
+        "ENCODER_DROPPED",
+        "GREEN",
+        "PASS_THROUGH",
+        "RED",
+        "YELLOW",
+    }
+    assert manifest["question_verdict"] in {"GO_V2", "STOP", "YELLOW"}
+    for key in ("clean_n_vs_clean_prev", "pairwise_pred", "pairwise_clean"):
+        assert key in manifest["cosines"], f"missing cosine {key!r}"

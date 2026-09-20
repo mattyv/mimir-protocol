@@ -49,6 +49,7 @@ from marker.summaryprobe import (
     op_label,
     pca_apply,
     pca_fit,
+    question_verdict,
     shuffle_labels_train,
     standardize_apply,
     standardize_fit,
@@ -88,6 +89,14 @@ def _smoke_varied_cot_texts(n: int) -> list[str]:
         lines.append(f"#### {c}")
         out.append("\n".join(lines))
     return out
+
+
+def _smoke_questions(n: int) -> list[str]:
+    """n synthetic question texts for `--smoke --with-question`, one per doc,
+    paired 1:1 by index with `_smoke_varied_cot_texts`'s docs (the question
+    condition needs SOME text per doc; its content doesn't matter mechanically
+    -- only that it tokenizes to a real span)."""
+    return [f"After all the steps, what is doc {i}'s final total?" for i in range(n)]
 
 
 def _items_from_docs(docs: list[list[tuple[str, list[int]]]]) -> tuple[list[dict], int]:
@@ -160,11 +169,79 @@ def _condition_features(items, summs, predictor, window, noise_gen05, noise_gen1
     }
 
 
+def _question_condition_features(items, summs, q_summs, pred_feat, window):  # noqa: ANN001
+    """The four `--with-question` paired conditions, built from the SAME
+    `items` loop/order as `_condition_features` -- so they stay paired to
+    every other condition on (doc, n) by construction, same as the five
+    original conditions:
+
+        q         the doc's question gist                    -- label op_n
+        q_hist    concat [question gist ; summ[n-1]]          -- label op_n
+        q_pred    concat [question gist ; pred[n]]            -- label op_n
+        fullhist  mean of summ[max(0,n-w+1) .. n-1]           -- label op_n
+
+    `q_pred` reuses `pred_feat` (the harness's already-computed "pred"
+    condition, item-for-item) rather than calling predict_step again --
+    same guess, no duplicate predictor forward pass. `summs`/`q_summs` are
+    upcast to float32 per doc, same reasoning as `_condition_features` (fp16
+    storage vs. fp32 downstream arithmetic)."""
+    q, q_hist, q_pred, fullhist = [], [], [], []
+    for i, it in enumerate(items):
+        summ, n = summs[it["doc"]].float(), it["n"]
+        qg = q_summs[it["doc"]].float()
+        q.append(qg)
+        q_hist.append(torch.cat([qg, summ[n - 1]], dim=0))
+        q_pred.append(torch.cat([qg, pred_feat[i]], dim=0))
+        a = max(0, n - window + 1)
+        fullhist.append(summ[a:n].mean(dim=0))
+    return {
+        "q": torch.stack(q),
+        "q_hist": torch.stack(q_hist),
+        "q_pred": torch.stack(q_pred),
+        "fullhist": torch.stack(fullhist),
+    }
+
+
 def _mean_cos(a: torch.Tensor, b: torch.Tensor) -> float:
     """Mean whole-summary cosine similarity between two [N, k, d] batches (the
     k*d gist flattened per item, not per-slot)."""
     af, bf = a.reshape(a.shape[0], -1), b.reshape(b.shape[0], -1)
     return round(float(F.cosine_similarity(af, bf, dim=-1).mean()), 4)
+
+
+def _mean_pairwise_cos(x: torch.Tensor, n_pairs: int = 2000, seed: int = 0) -> float:
+    """Mean cosine similarity over `n_pairs` random (i, j) item pairs (i != j)
+    within ONE [N, k, d] batch, sampled with a seeded generator -- the
+    `pairwise_pred` / `pairwise_clean` manifest diagnostic. Settles whether a
+    batch's vectors all collapse toward a similar direction regardless of
+    which item they're for (e.g. the predictor copying/blending history
+    rather than tracking the actual step) -- unlike `_mean_cos`, which compares
+    two batches item-for-item, this compares a batch against ITSELF, item i vs
+    a different item j."""
+    n = x.shape[0]
+    if n < 2:
+        return 0.0
+    xf = x.reshape(n, -1)
+    g = torch.Generator().manual_seed(seed)
+    i = torch.randint(0, n, (n_pairs,), generator=g)
+    j = torch.randint(0, n, (n_pairs,), generator=g)
+    keep = i != j
+    i, j = i[keep], j[keep]
+    if i.numel() == 0:
+        return 0.0
+    return round(float(F.cosine_similarity(xf[i], xf[j], dim=-1).mean()), 4)
+
+
+def _truncate_question_ids(ids: list[int], max_span: int) -> tuple[list[int], int]:
+    """Cap a question's token ids at `max_span`, same as every step -- but
+    keeping the LAST max_span tokens rather than the first: GSM8K questions
+    put the actual ask ("how many X does he have now?") at the end, so
+    front-truncating would cut it off. Returns (kept_ids, n_truncated) --
+    n_truncated is how many leading tokens were dropped, 0 when the question
+    already fit."""
+    if len(ids) <= max_span:
+        return ids, 0
+    return ids[-max_span:], len(ids) - max_span
 
 
 def _cos_by_n(
@@ -361,6 +438,36 @@ def _run_probes(items, y, feat_all, n_components=128, max_steps=2000, patience=2
     return cells, details
 
 
+def _run_question_probes(  # noqa: PLR0913
+    items, y, feat_all, idx_fit, idx_val, idx_test, n_components=128, max_steps=2000, patience=200, seed=0
+):  # noqa: ANN001
+    """The four `--with-question` probes (P_q, P_q_hist, P_q_pred,
+    P_fullhist) -- each trained + scored on its OWN condition (same
+    normalize -> standardize(train) -> PCA(train) -> fit -> test-transform
+    pipeline as P_pred/P_hist in `_run_probes`), over the SAME doc-disjoint
+    split (idx_fit/idx_val/idx_test) every other probe in this run uses --
+    passed in, never refit here, so these cells stay comparable to
+    P_clean/P_pred/P_hist on the identical held-out (doc, n) pairs."""
+    conds = {"q": "P_q", "q_hist": "P_q_hist", "q_pred": "P_q_pred", "fullhist": "P_fullhist"}
+    cells, details = {}, {}
+    for cond, detail_key in conds.items():
+        xtr, xv, params = _prepare(feat_all, cond, idx_fit, idx_val, n_components)
+        model = train_probe(
+            xtr,
+            y[idx_fit],
+            xv,
+            y[idx_val],
+            len(OP_CLASSES),
+            max_steps=max_steps,
+            patience=patience,
+            seed=seed,
+        )
+        score = evaluate_probe(model, _transform(feat_all, cond, idx_test, params), y[idx_test])
+        cells[cond] = score["acc"]
+        details[detail_key] = score
+    return cells, details
+
+
 def _assert_window_matches(window: int, remote_manifest: dict) -> str:
     """Fail loud if --window doesn't match the predictor's OWN training
     window (stage2_cot_openr1/manifest.json) -- predict_step's windowing only
@@ -413,6 +520,22 @@ def _write_cache_shards(docs, summs, out_dir, shard_size=100):  # noqa: ANN001
         cat = torch.cat(chunk_summs, dim=0).half().contiguous()
         save_file({"summ": cat}, str(out / shard_name))
     (out / "index.json").write_text(json.dumps(index))
+    return out
+
+
+def _write_question_cache(questions: list[str], q_summs: torch.Tensor, out_dir) -> Path:  # noqa: ANN001
+    """questions (one text per doc, in doc order) + q_summs [n_docs, k, d] (as
+    `_encode_single_span` returns) -> `questions.safetensors` (fp16) +
+    `questions_index.json` ({doc, text} rows), written into the SAME cache
+    dir `_write_cache_shards` uses so one push carries both. `.half()` is
+    idempotent, so this also accepts fp32 input safely."""
+    from safetensors.torch import save_file  # noqa: PLC0415
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    save_file({"q": q_summs.half().contiguous()}, str(out / "questions.safetensors"))
+    index = [{"doc": i, "text": t} for i, t in enumerate(questions)]
+    (out / "questions_index.json").write_text(json.dumps(index))
     return out
 
 
@@ -479,6 +602,13 @@ def main() -> None:  # noqa: PLR0915
     ap.add_argument("--pca-components", type=int, default=128)
     ap.add_argument("--cache-shard-size", type=int, default=100)
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument(
+        "--with-question",
+        action="store_true",
+        help="also encode each doc's GSM8K question and score the q/q_hist/q_pred/"
+        "fullhist probes (Fable's pre-registered question-gist check). Default off "
+        "leaves today's manifest bitwise unchanged.",
+    )
     args = ap.parse_args()
 
     if args.smoke:
@@ -515,16 +645,24 @@ def main() -> None:  # noqa: PLR0915
     predictor = predictor.to(device).eval()
 
     # ── data: GSM8K test, streaming; keep ALL docs with >=3 steps ────────────
+    # `questions_src` rides alongside `texts` (same order, same length) so
+    # each kept doc's question survives the filtering loop below paired to
+    # it -- collected unconditionally (cheap, no model call) so --with-question
+    # ON/OFF never changes which docs/steps are kept.
     if args.smoke:
         texts = _smoke_varied_cot_texts(20)
+        questions_src = _smoke_questions(20)
     else:
         from datasets import load_dataset  # noqa: PLC0415
 
         ds = load_dataset(args.dataset, "main", split="test", streaming=True)
-        texts = [row["answer"] for row in ds]
+        texts, questions_src = [], []
+        for row in ds:
+            texts.append(row["answer"])
+            questions_src.append(row.get("question", ""))
 
-    docs = []
-    for t in texts:
+    docs, questions = [], []
+    for t, q_text in zip(texts, questions_src, strict=True):
         steps = split_solution_steps(t)
         if len(steps) < 3:
             continue
@@ -535,6 +673,7 @@ def main() -> None:  # noqa: PLR0915
                 doc.append((s, ids))
         if len(doc) >= 3:
             docs.append(doc)
+            questions.append(q_text)
     print(f"kept {len(docs)} docs (>=3 steps) of {len(texts)} texts", flush=True)
 
     # ── encode: single-span per step, fp16 on CPU per doc ────────────────────
@@ -555,6 +694,18 @@ def main() -> None:  # noqa: PLR0915
             flush=True,
         )
 
+    # ── --with-question: one question gist per doc, single-span like a step ──
+    q_summs, n_questions_truncated = None, 0
+    if args.with_question:
+        q_ids_list = []
+        for q_text in questions:
+            raw_ids = tok(q_text, add_special_tokens=False).input_ids
+            q_ids, n_trunc = _truncate_question_ids(raw_ids, args.max_span)
+            assert len(q_ids) >= 1, f"empty question ids for {q_text!r}"
+            q_ids_list.append(q_ids)
+            n_questions_truncated += int(n_trunc > 0)
+        q_summs = _encode_single_span(pm, gist, q_ids_list)  # [n_docs, k, d] fp16 CPU
+
     # ── labels + the shared (doc, n) item list ───────────────────────────────
     items, n_dropped_no_relation = _items_from_docs(docs)
     y = encode_labels([it["op"] for it in items])
@@ -571,12 +722,41 @@ def main() -> None:  # noqa: PLR0915
         "noised_10_vs_clean": _mean_cos(feat_all["noised_10"], feat_all["clean"]),
     }
 
+    # ── --with-question: the four extra paired conditions + diagnostics ─────
+    if args.with_question:
+        feat_all = {
+            **feat_all,
+            **_question_condition_features(items, summs, q_summs, feat_all["pred"], args.window),
+        }
+        cosines["clean_n_vs_clean_prev"] = _mean_cos(feat_all["clean"], feat_all["hist"])
+        cosines["pairwise_pred"] = _mean_pairwise_cos(feat_all["pred"], n_pairs=2000, seed=0)
+        cosines["pairwise_clean"] = _mean_pairwise_cos(feat_all["clean"], n_pairs=2000, seed=0)
+
     max_steps = 300 if args.smoke else 2000
     patience = 60 if args.smoke else 200
     cells, details = _run_probes(
         items, y, feat_all, n_components=args.pca_components, max_steps=max_steps, patience=patience
     )
-    verdict = summary_verdict(cells)
+    verdict = summary_verdict(cells)  # unaffected by --with-question: reads only the original cells
+
+    if args.with_question:
+        # SAME doc-disjoint split every other probe above used (same seed=0
+        # default _run_probes used internally) -- P_q_hist stays comparable to
+        # P_clean/P_pred/P_hist on the identical held-out (doc, n) pairs.
+        idx_fit, idx_val, idx_test, *_ = _split_indices(items, seed=0)
+        q_cells, q_details = _run_question_probes(
+            items,
+            y,
+            feat_all,
+            idx_fit,
+            idx_val,
+            idx_test,
+            n_components=args.pca_components,
+            max_steps=max_steps,
+            patience=patience,
+        )
+        cells.update(q_cells)
+        details.update(q_details)
 
     manifest = {
         "n_docs": len(docs),
@@ -590,6 +770,9 @@ def main() -> None:  # noqa: PLR0915
         **details,
         "verdict": verdict,
     }
+    if args.with_question:
+        manifest["question_verdict"] = question_verdict(cells)
+        manifest["n_questions_truncated"] = n_questions_truncated
     print(f"[SUMPROBE MANIFEST] {json.dumps(manifest)}", flush=True)  # single-line, survives tail
 
     if not args.smoke and args.out_repo:
@@ -597,14 +780,20 @@ def main() -> None:  # noqa: PLR0915
 
         cache_dir = Path("/tmp/summary_cache_out")  # noqa: S108
         _write_cache_shards(docs, summs, cache_dir, shard_size=args.cache_shard_size)
+        if args.with_question:
+            _write_question_cache(questions, q_summs, cache_dir)
         _push_with_retry(args.out_repo, str(cache_dir), "summary_cache_gsm8k_test")
         print(f"pushed summary cache to {args.out_repo}/summary_cache_gsm8k_test", flush=True)
 
+        # --with-question pushes to a SEPARATE subdir -- summary_probe/ (the
+        # no-question manifest) is never overwritten by a run that scored
+        # different (extra) cells.
+        manifest_subdir = "summary_probe_q" if args.with_question else "summary_probe"
         d = Path("/tmp/summary_probe_out")  # noqa: S108
         d.mkdir(parents=True, exist_ok=True)
         (d / "manifest.json").write_text(json.dumps(manifest, indent=2))
-        _push_with_retry(args.out_repo, str(d), "summary_probe")
-        print(f"pushed summary probe manifest to {args.out_repo}/summary_probe", flush=True)
+        _push_with_retry(args.out_repo, str(d), manifest_subdir)
+        print(f"pushed summary probe manifest to {args.out_repo}/{manifest_subdir}", flush=True)
 
 
 if __name__ == "__main__":

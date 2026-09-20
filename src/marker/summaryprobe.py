@@ -259,3 +259,18 @@ def summary_verdict(cells: dict) -> str:
     if pred_best <= red_line:
         return "RED"
     return "YELLOW"
+
+
+def question_verdict(cells: dict) -> str:
+    """The pre-registered gate on P_q_hist (Fable's question-gist check): does
+    [the QUESTION's gist ; the previous step's gist] linearly carry the NEXT
+    step's operator? GO_V2 (P_q_hist >= 0.63): a question-conditioned guesser
+    has the information available. STOP (< 0.50): it doesn't -- don't build
+    the guesser. Otherwise YELLOW (ambiguous). A CONVENIENCE field only, like
+    `summary_verdict` -- the human + Fable read the manifest's actual number."""
+    p_q_hist = cells["q_hist"]
+    if p_q_hist >= 0.63:
+        return "GO_V2"
+    if p_q_hist < 0.50:
+        return "STOP"
+    return "YELLOW"

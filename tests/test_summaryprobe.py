@@ -18,6 +18,7 @@ from marker.summaryprobe import (
     op_label,
     pca_apply,
     pca_fit,
+    question_verdict,
     shuffle_labels_train,
     standardize_apply,
     standardize_fit,
@@ -244,3 +245,21 @@ def test_verdict_yellow_between_red_and_green_lines():
     # red_line=0.38, green_line=0.54 -> 0.45 is strictly between
     cells = _cells(clean=0.7, pred_from_clean=0.45, pred_from_pred=0.3, hist=0.9)
     assert summary_verdict(cells) == "YELLOW"
+
+
+# ── question_verdict: the pre-registered P_q_hist gate (Fable's question) ───
+
+
+def test_question_verdict_go_v2_at_or_above_0_63():
+    assert question_verdict({"q_hist": 0.63}) == "GO_V2"
+    assert question_verdict({"q_hist": 0.9}) == "GO_V2"
+
+
+def test_question_verdict_stop_below_0_50():
+    assert question_verdict({"q_hist": 0.49}) == "STOP"
+    assert question_verdict({"q_hist": 0.0}) == "STOP"
+
+
+def test_question_verdict_yellow_strictly_between():
+    assert question_verdict({"q_hist": 0.5}) == "YELLOW"
+    assert question_verdict({"q_hist": 0.62}) == "YELLOW"
