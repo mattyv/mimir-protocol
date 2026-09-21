@@ -406,6 +406,347 @@ def test_centroid_readout_op_probe_returns_none_when_fit_too_small():
     assert out is None
 
 
+# ── reader-on-snapped-KV (Stage 1b, GIST_LM_PLAN.md STAGE 1 RESULT) ─────────
+
+
+def test_pick_train_pair_indices_deterministic_and_clamped():
+    from marker.run_gist_dict import pick_train_pair_indices
+
+    a = pick_train_pair_indices(100, 10, seed=1)
+    b = pick_train_pair_indices(100, 10, seed=1)
+    assert a == b
+    assert len(a) == 10
+    assert len(set(a)) == 10  # distinct indices
+    assert all(0 <= i < 100 for i in a)
+
+    c = pick_train_pair_indices(5, 10, seed=1)  # n_pairs > n_fit -> clamp
+    assert len(c) == 5
+
+    d = pick_train_pair_indices(100, 10, seed=2)
+    assert d != a  # different seed -> different draw
+
+
+def test_read_fit_kv_row_matches_full_load(tmp_path):
+    from marker.run_gist_dict import load_slot_shard, read_fit_kv_row, write_fit_shards
+
+    geo = {"n_layers": 1, "n_kv_heads": 1, "head_dim": 3}
+    d = geo["n_layers"] * 2 * geo["n_kv_heads"] * geo["head_dim"]
+    k_slots, n, dr = 3, 8, 2
+    kvs = [_fake_kv(k_slots, geo=geo, seed=i) for i in range(n)]
+    ros = [
+        torch.randn(k_slots, dr, generator=torch.Generator().manual_seed(300 + i)) for i in range(n)
+    ]
+    write_fit_shards(zip(kvs, ros, strict=True), tmp_path, d, dr, k_slots)
+
+    full = [load_slot_shard(tmp_path, s) for s in range(k_slots)]  # each [n, d], full load
+    for i in [0, 3, 7]:
+        row = read_fit_kv_row(tmp_path, i, k_slots)  # mmap slice, one row per slot
+        want = torch.stack([full[s][i] for s in range(k_slots)])
+        assert torch.equal(row, want)
+
+
+def test_build_reader_pairs_native_and_snapped_share_text_ids_and_cs(tmp_path):
+    from marker.gist_dict import detokenize, kv_slot_matrix, tokenize
+    from marker.run_gist_dict import build_all_dicts, build_reader_pairs
+
+    geo, _d, _dr = _write_tiny_shards(tmp_path, n=10, k_slots=2, dr=3)
+    geometry = {**geo, "k_slots": 2}
+    dicts, fit_ids = build_all_dicts(
+        tmp_path,
+        2,
+        geometry,
+        ks=[4],
+        res_k1=2,
+        res_k2=2,
+        ro_k=2,
+        whole_k=2,
+        whole_proj_dim=None,
+        seed=0,
+        device="cpu",
+    )
+    dict_ = dicts["kv_K4"]
+    fit_ids_col = fit_ids["kv_K4"]
+    fit_items = [((f"doc{i}",), [i, i + 1], f"text {i}") for i in range(10)]
+
+    pairs = build_reader_pairs(
+        fit_items,
+        tmp_path,
+        dict_,
+        fit_ids_col,
+        geometry,
+        base=64,
+        kv_dtype=torch.float32,
+        indices=[0, 3, 7],
+    )
+    assert len(pairs) == 3
+    for pair, i in zip(pairs, [0, 3, 7], strict=True):
+        assert pair.ids == fit_items[i][1]
+        assert pair.text == fit_items[i][2]
+        assert pair.cs == 64 + 2  # base + k_slots
+        assert pair.native_kv.keys[0].dtype == torch.float32
+        assert pair.snapped_kv.keys[0].dtype == torch.float32
+        # snapped == detokenize(tokenize(native)) -- fit_ids_col[i] IS the
+        # k-means assignment computed from THIS exact row, so it must match
+        # what tokenize() would compute fresh from the native KV
+        ids = tokenize(pair.native_kv, dict_)
+        assert ids == fit_ids_col[i].tolist()
+        want = detokenize(ids, dict_, geometry, dtype=torch.float32)
+        assert torch.equal(kv_slot_matrix(pair.snapped_kv), kv_slot_matrix(want))
+
+
+def test_reader_sampler_yields_both_dialects_same_target_deterministic():
+    from marker.run_gist_dict import ReaderPair
+    from marker.run_render import training_items
+
+    pairs = [
+        ReaderPair(ids=[1, 2, 3], text="t0", native_kv="n0", snapped_kv="s0", cs=72),
+        ReaderPair(ids=[4, 5], text="t1", native_kv="n1", snapped_kv="s1", cs=72),
+    ]
+    items = training_items(pairs, "mixed")
+    assert len(items) == 4  # 2 pairs x 2 dialects
+    tags = {tag for _p, tag in items}
+    assert tags == {"gist", "bridge"}  # native / snapped, mixed-mode convention
+    for pair, _tag in items:
+        # same underlying pair regardless of dialect -> same target (ids)
+        assert pair in pairs
+
+    g1 = torch.randperm(len(items), generator=torch.Generator().manual_seed(0))
+    g2 = torch.randperm(len(items), generator=torch.Generator().manual_seed(0))
+    assert torch.equal(g1, g2)
+
+
+def test_load_reader_render_adapter_warm_starts_not_attach(monkeypatch, tmp_path):
+    import marker.run_gist_dict as rgd
+    from marker.gist_model import attach_gist
+    from marker.render import attach_render
+    from tests.test_gist_model import _tiny_base
+
+    base = _tiny_base()
+    pm, _gist = attach_gist(base, gist_k=4, r=4)
+    attach_render(pm, r=4)
+    pm.set_adapter("render")
+    sub = "render_adapter_oneform"
+    pm.save_pretrained(str(tmp_path / sub), selected_adapters=["render"])
+
+    monkeypatch.setattr(
+        rgd,
+        "attach_render",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("attach_render must not be called")),
+    )
+    warm_calls = []
+    real_warm_start = rgd.warm_start_render
+
+    def _spy(pm_, loc, sub_):
+        warm_calls.append((loc, sub_))
+        return real_warm_start(pm_, loc, sub_)
+
+    monkeypatch.setattr(rgd, "warm_start_render", _spy)
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download", lambda repo, allow_patterns=None: str(tmp_path)
+    )
+
+    base2 = _tiny_base()
+    pm2, _gist2 = attach_gist(base2, gist_k=4, r=4)
+    render_params = rgd.load_reader_render_adapter(pm2, "dummy/repo", sub, smoke=False)
+    assert warm_calls == [(str(tmp_path), sub)]
+    assert render_params  # nonempty, trainable
+    assert all(p.requires_grad for _n, p in render_params)
+
+
+def test_load_reader_render_adapter_smoke_uses_attach_render(monkeypatch):
+    import marker.run_gist_dict as rgd
+    from marker.gist_model import attach_gist
+    from tests.test_gist_model import _tiny_base
+
+    def _boom(*_a, **_k):
+        raise AssertionError("warm_start_render must not be called under --smoke")
+
+    monkeypatch.setattr(rgd, "warm_start_render", _boom)
+    base = _tiny_base()
+    pm, _gist = attach_gist(base, gist_k=4, r=4)
+    render_params = rgd.load_reader_render_adapter(pm, None, "render_adapter_oneform", smoke=True)
+    assert render_params
+
+
+@pytest.mark.slow
+def test_train_reader_grad_reaches_render_params():
+    from marker.gist_model import attach_gist, gist_kv
+    from marker.render import attach_render
+    from marker.run_gist_dict import ReaderPair, train_reader
+    from tests.test_gist_model import _tiny_base
+
+    base = _tiny_base()
+    pm, gist = attach_gist(base, gist_k=4, r=4)
+    pm.set_adapter("default")
+    ids1 = [1, 2, 3, 4, 5]
+    ids2 = [6, 7, 8, 9, 10]
+    kv1, cs1, _ = gist_kv(pm, gist, ids1, gist_start=8)
+    kv2, cs2, _ = gist_kv(pm, gist, ids2, gist_start=8)
+    assert cs1 == cs2
+
+    render_params = attach_render(pm, r=4)
+    pm.set_adapter("render")
+    pairs = [ReaderPair(ids=ids1, text="1 + 2 = 3.", native_kv=kv1, snapped_kv=kv2, cs=cs1)]
+
+    class _FakeTok:
+        def __call__(self, text, add_special_tokens=False):
+            class _Out:
+                input_ids = [0]
+
+            return _Out()
+
+    train_reader(pm, _FakeTok(), pairs, render_params, steps=2, lr=1e-3, seed=0, log_every=1)
+    grads = [p.grad.abs().sum() for _n, p in render_params if p.grad is not None]
+    assert grads and any(g > 0 for g in grads), "no gradient reached the render LoRA"
+
+
+def test_check_reader_out_subdir_raises_on_forbidden_names():
+    from marker.run_gist_dict import check_reader_out_subdir
+
+    for forbidden in (
+        "render_adapter",
+        "render_adapter_ledger",
+        "render_adapter_oneform",
+        "my_warm_start",
+    ):
+        with pytest.raises(AssertionError, match="clobber"):
+            check_reader_out_subdir(forbidden, warm_start_subdir="my_warm_start")
+    check_reader_out_subdir("render_adapter_snapped", warm_start_subdir="render_adapter_oneform")
+
+
+def test_save_and_push_reader_pushes_before_eval(tmp_path, monkeypatch):
+    import marker.run_gist_dict as rgd
+
+    pushes = []
+    monkeypatch.setattr(
+        rgd, "_push_with_retry", lambda repo, folder, sub: pushes.append((repo, folder, sub))
+    )
+
+    class _FakePM:
+        def save_pretrained(self, path, selected_adapters=None):
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "marker.txt").write_text("saved")
+
+    d = rgd.save_and_push_reader(
+        _FakePM(), str(tmp_path), "render_adapter_snapped", "user/repo", smoke=False
+    )
+    assert (Path(d) / "marker.txt").exists()
+    assert pushes == [("user/repo", d, "render_adapter_snapped")]
+
+    pushes.clear()
+    rgd.save_and_push_reader(
+        _FakePM(), str(tmp_path), "render_adapter_snapped2", "user/repo", smoke=True
+    )
+    assert pushes == []
+
+
+def test_reader_verdict_boundaries():
+    from marker.run_gist_dict import reader_verdict
+
+    assert reader_verdict({"R_gsm8k": 0.8, "op_from_ids": 0.75}) == "PASS"
+    assert reader_verdict({"R_gsm8k": 0.79, "op_from_ids": 0.75}) == "FAIL"
+    assert reader_verdict({"R_gsm8k": 0.8, "op_from_ids": 0.7499}) == "FAIL"
+    assert reader_verdict(None) == "FAIL"
+    assert reader_verdict({}) == "FAIL"
+
+
+def test_fresh_v2_docs_has_four_shapes_and_all_four_ops_per_shape():
+    import re
+
+    from marker.run_gist_dict import _fresh_v2_docs
+    from marker.summaryprobe import op_label
+
+    seen: dict[str, set] = {}
+    for _doc_key, step_texts in _fresh_v2_docs(16):
+        text = step_texts[0]
+        sig = re.sub(r"\d+", "#", text)
+        sig = re.sub(r"[+\-*/]", "OP", sig)
+        op = op_label(text)
+        assert op is not None
+        seen.setdefault(sig, set()).add(op)
+    assert len(seen) >= 4
+    assert all(ops == {"+", "-", "*", "/"} for ops in seen.values())
+
+
+def test_mu_separability_detects_near_duplicate_and_orthogonal_entries():
+    from marker.run_gist_dict import mu_separability
+
+    mu = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.0, 0.001],  # near-duplicate of row0 (cosine ~0.9999995)
+            [0.0, 1.0],
+            [-1.0, 0.0],  # opposite of row0
+        ]
+    )
+    dict_ = {"kind": "kv", "slots": [{"mu_readout": mu.half()}]}
+    out = mu_separability(dict_)
+    assert len(out) == 1
+    cell = out[0]
+    assert set(cell) == {"median", "p90", "frac_gt_0_98"}
+    assert cell["frac_gt_0_98"] == 0.5  # rows 0,1 pair with each other; 2,3 don't
+    assert 0.0 <= cell["median"] <= 1.0
+    assert cell["p90"] > 0.99
+
+
+def test_load_check_mu_dict_prefers_local_then_falls_back_to_hf(tmp_path, monkeypatch):
+    from marker.run_gist_dict import load_check_mu_dict
+
+    d = tmp_path / "dicts"
+    d.mkdir()
+    torch.save({"cfg": "kv_K8", "kind": "kv"}, d / "dict_kv_K8.pt")
+    got = load_check_mu_dict(str(tmp_path), out_repo=None, name="kv_K8")
+    assert got["cfg"] == "kv_K8"
+
+    def fake_download(repo, filename):
+        assert filename == "gist_dict/dict_kv_K4096.pt"
+        p = tmp_path / "hf_dict.pt"
+        torch.save({"cfg": "kv_K4096", "kind": "kv"}, p)
+        return str(p)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
+    got2 = load_check_mu_dict(str(tmp_path), out_repo="user/repo", name="kv_K4096")
+    assert got2["cfg"] == "kv_K4096"
+
+    with pytest.raises(AssertionError):
+        load_check_mu_dict(str(tmp_path), out_repo=None, name="kv_K4096")
+
+
+@pytest.mark.slow
+def test_smoke_train_reader_check_mu_end_to_end():
+    repo_root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "marker.run_gist_dict",
+            "--smoke",
+            "--train-reader",
+            "--check-mu",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        env={**os.environ, "PYTHONPATH": "src" + os.pathsep + os.environ.get("PYTHONPATH", "")},
+    )
+    assert proc.returncode == 0, proc.stdout[-6000:] + "\n" + proc.stderr[-6000:]
+    (line,) = (
+        line_ for line_ in proc.stdout.splitlines() if line_.startswith("[GISTDICT MANIFEST]")
+    )
+    manifest = json.loads(line[len("[GISTDICT MANIFEST] ") :])
+
+    assert manifest["reader_verdict"] in {"PASS", "FAIL"}
+    assert manifest["reader_subdir"] == "render_adapter_snapped"
+    assert manifest["reader_trained_steps"] == 20
+    assert len(manifest["mu_separability"]) == manifest["geometry"]["k_slots"]
+    for cell in manifest["mu_separability"]:
+        assert set(cell) == {"median", "p90", "frac_gt_0_98"}
+    reader_cell = manifest["configs"]["kv_K8"]
+    assert "R_fresh_v2" in reader_cell
+    assert "conditions_fresh_v2" in reader_cell
+
+
 def test_load_dicts_from_hf_round_trips_and_falls_back_when_missing(tmp_path):
     from marker.run_gist_dict import _expected_dict_names, _load_dicts_from_hf
 

@@ -8,6 +8,12 @@
 #
 #   HF_TOKEN=... ./scripts/vast_gist_dict.sh
 #   GPU=RTX_4090 NFIT=20000 NEVAL=150 HF_TOKEN=... ./scripts/vast_gist_dict.sh
+#
+# STAGE 1b (GIST_LM_PLAN.md STAGE 1 RESULT -- CONDITIONAL GO): teach the
+# reader the snapped kv_K4096 dialect on top of an already-pushed shard +
+# dict cache, then re-measure with the SAME bar:
+#   LOAD_SHARDS=1 LOAD_DICTS=1 TRAIN_READER=1 EVAL_CONFIGS=kv_K4096 \
+#     HF_TOKEN=... ./scripts/vast_gist_dict.sh
 set -euo pipefail
 
 IMAGE="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
@@ -26,7 +32,10 @@ GPU="${GPU:-RTX_3090}"
 # conditions (~1.5-2h) + CPU diagnostics (~30m) ≈ 3.5-4.5h. Each dictionary
 # is pushed the moment it is built and the shards right after the encode, so
 # a timeout or OOM can only cost work not yet done -- never the encode.
-TIMEOUT="${TIMEOUT:-330m}"
+# STAGE 1b (TRAIN_READER=1, on top of LOAD_SHARDS=1 LOAD_DICTS=1 -- no encode,
+# no k-means): setup + 18GB shard download ~25m, reader training 3000 steps
+# ~70m, eval (native + 1 config) ~40m, --check-mu diagnostics ~10m -> ~2.5h.
+TIMEOUT="${TIMEOUT:-$([ -n "${TRAIN_READER:-}" ] && echo 240m || echo 330m)}"
 # LOAD_SHARDS=1 resumes from the pushed fit-shard cache on ${REPO} (skips the
 # encode; requires a previous run to have gotten past the shard push).
 LOAD_SHARDS="${LOAD_SHARDS:-}"
@@ -34,6 +43,28 @@ LOAD_DICTS="${LOAD_DICTS:-}"      # LOAD_DICTS=1 also skips k-means (dicts pushe
 RESUME_FLAG=""
 [ -n "$LOAD_SHARDS" ] && RESUME_FLAG="--load-shards"
 [ -n "$LOAD_DICTS" ] && RESUME_FLAG="${RESUME_FLAG} --load-dicts"
+
+# STAGE 1b reader training (GIST_LM_PLAN.md STAGE 1 RESULT): TRAIN_READER=1
+# -> --train-reader --check-mu (the $0 CPU diagnostic runs in this launch
+# too, per the plan); READER_STEPS/NPAIRS pass through to --reader-steps/
+# --n-train-pairs. EVAL_CONFIGS -> --eval-configs (kv_K4096 for the real
+# stage-1b re-measurement -- the default 'auto' would also spend GPU time on
+# whole_K4096/kv_res, which this phase doesn't need).
+TRAIN_READER="${TRAIN_READER:-}"
+READER_STEPS="${READER_STEPS:-}"
+NPAIRS="${NPAIRS:-}"
+EVAL_CONFIGS="${EVAL_CONFIGS:-}"
+READER_FLAG=""
+if [ -n "$TRAIN_READER" ]; then
+  READER_FLAG="--train-reader --check-mu"
+  [ -n "$READER_STEPS" ] && READER_FLAG="${READER_FLAG} --reader-steps ${READER_STEPS}"
+  [ -n "$NPAIRS" ] && READER_FLAG="${READER_FLAG} --n-train-pairs ${NPAIRS}"
+fi
+EVAL_CONFIGS_FLAG=""
+[ -n "$EVAL_CONFIGS" ] && EVAL_CONFIGS_FLAG="--eval-configs ${EVAL_CONFIGS}"
+# poller cap must exceed TIMEOUT + setup (~20m); stage 1b's shorter TIMEOUT
+# gets a shorter cap too (spec: 240m/300 vs the base run's 330m/380).
+POLLER_CAP=$([ -n "$TRAIN_READER" ] && echo 300 || echo 380)
 
 # cpu_ram is in GB in the vast search API (CLAUDE.md's own "cpu_ram>=<GB*1024>"
 # guidance predates the fix in commit "vast_render: cpu_ram search clause is
@@ -88,11 +119,11 @@ python -c "from huggingface_hub import whoami; print('HF auth ok:', whoami().get
 echo "=== download ${MODEL} (authenticated, 20min cap) ==="
 timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}'); print('MODEL CACHED')" 2>&1 | tail -2 \
   || { kill \$HB; echo "SETUPFAIL (download too slow)"; echo "ALLDONE"; exit 1; }
-echo "=== GIST DICTIONARY FIDELITY (dataset=${DATASET} n-fit=${NFIT} n-eval=${NEVAL} ks=${KS}) ==="
+echo "=== GIST DICTIONARY FIDELITY (dataset=${DATASET} n-fit=${NFIT} n-eval=${NEVAL} ks=${KS} train_reader=${TRAIN_READER:-0}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_dict \
   --model-name "${MODEL}" --repo "${REPO}" --out-repo "${REPO}" \
   --dataset "${DATASET}" --n-fit "${NFIT}" --n-eval "${NEVAL}" --ks "${KS}" \
-  --push-shards ${RESUME_FLAG} \
+  --push-shards ${RESUME_FLAG} ${READER_FLAG} ${EVAL_CONFIGS_FLAG} \
   --eval --diagnose 2>&1 | tee /root/gist_dict.log
 echo "GIST_DICT_RC=\${PIPESTATUS[0]}" | tee -a /root/gist_dict.log
 kill \$HB 2>/dev/null
@@ -107,6 +138,6 @@ INSTANCE_ID=$(vastai create instance "$OFFER_ID" \
   --image "$IMAGE" --disk "$DISK_GB" --onstart-cmd "$ONSTART" --env "$ENV_ARG" --raw 2>/dev/null | \
   python3 -c "import sys,json; print(json.load(sys.stdin)['new_contract'])")
 echo "INSTANCE $INSTANCE_ID"
-# poller hard cap MUST exceed TIMEOUT (330m) + setup (~20m), or the poller
-# kills the node while the run is still inside its own budget
-echo "→ arm the poller:  bash scripts/vast_poll_destroy.sh $INSTANCE_ID 380"
+# poller hard cap MUST exceed TIMEOUT + setup (~20m), or the poller kills the
+# node while the run is still inside its own budget
+echo "→ arm the poller:  bash scripts/vast_poll_destroy.sh $INSTANCE_ID ${POLLER_CAP}"

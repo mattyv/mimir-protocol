@@ -60,13 +60,15 @@ from marker.gist_dict import (
     fit_categorical_nb,
     kv_slot_matrix,
     predict_categorical_nb,
+    slot_matrix_to_kv,
     stage1_verdict,
     tokenize,
 )
 from marker.gist_model import gist_kv
 from marker.gistprobe import per_token_ce
 from marker.predprobe import pick_cross_doc_step
-from marker.run_render import _score_record
+from marker.render import attach_render, ledger_render_nll
+from marker.run_render import _ledger_ids, _score_record, training_items, warm_start_render
 
 BASE = 64  # canonical gist_start (GIST_LM_PLAN.md "Tokenizer")
 MAX_SPAN = 64
@@ -152,6 +154,266 @@ def _fresh_docs(n: int):
 
     for i, text in enumerate(_smoke_varied_cot_texts(n)):
         yield ("fresh", i), split_solution_steps(text)
+
+
+_FRESH_V2_SHAPES = [
+    "Then compute {a} {op} {b} = {c}.",
+    "So the total is {a} {op} {b} = {c} dollars.",
+    "That gives {a} {op} {b} = {c} items in all.",
+    "Next, {a} {op} {b} = {c}.",
+]
+
+
+def _fresh_v2_docs(n: int):
+    """Yields (doc_key, [step_text]) for the STAGE 1b fresh_v2 set (spec item
+    5; G7's 'varied fresh set for the OOD cell'): 4 SENTENCE SHAPES x 4 ops,
+    numbers permuted per doc so op is never a pure function of doc index (the
+    fresh set is otherwise ONE fixed template -- see _fresh_docs's docstring
+    for why that matters). Report only, alongside `fresh`: NEITHER is
+    load-bearing for reader_verdict. Shape and op indices are independent
+    (shape=i%4, op=(i//4)%4) so n>=16 covers every (shape, op) combination at
+    least once, not just 4 of the 16."""
+    ops = ("+", "-", "*", "/")
+    for i in range(n):
+        shape = _FRESH_V2_SHAPES[i % len(_FRESH_V2_SHAPES)]
+        op = ops[(i // len(_FRESH_V2_SHAPES)) % len(ops)]
+        a, b = 3 + (i % 11), 2 + ((2 * i) % 7)
+        if op == "+":
+            c = a + b
+        elif op == "-":
+            a, c = a + b, a  # a - b = c, always positive by construction
+        elif op == "*":
+            c = a * b
+        else:  # "/"
+            a, c = a * b, a  # a / b = c, exact integer division
+        text = shape.format(a=a, op=op, b=b, c=c)
+        yield (f"fresh_v2_{i}", i), [text]
+
+
+class ReaderPair(NamedTuple):
+    """One reader-training pair (Stage 1b, GIST_LM_PLAN.md STAGE 1 RESULT):
+    a fit step's text/ids at BOTH dialects, same canonical placement
+    `cs` = base + k_slots -- native_kv is the step's own shard rows, snapped
+    is detokenize(the step's own --reader-dict ids). Consumed by
+    run_render.training_items(pairs, "mixed"), whose 'gist'/'bridge' tags
+    this module reads as native/snapped (see train_reader)."""
+
+    ids: list[int]
+    text: str
+    native_kv: object
+    snapped_kv: object
+    cs: int
+
+
+def pick_train_pair_indices(n_fit: int, n_pairs: int, seed: int) -> list[int]:
+    """n_pairs DISTINCT fit-step indices into [0, n_fit), seeded -- the
+    reader's training pool (spec item 1: 'pick --n-train-pairs fit steps at
+    random'). Clamped to n_fit (a tiny --smoke fit set never needs to error
+    just because n_pairs is the real run's default)."""
+    n = min(n_pairs, n_fit)
+    g = torch.Generator().manual_seed(seed)
+    return torch.randperm(n_fit, generator=g)[:n].tolist()
+
+
+def read_fit_kv_row(shard_dir, i: int, k_slots: int) -> torch.Tensor:  # noqa: ANN001
+    """One fit step's full [k_slots, D] KV row (kv_slot_matrix layout), read
+    via safetensors' MEMORY-MAPPED safe_open/get_slice -- one row per slot
+    file, never a whole slot's [N, D] shard loaded into RAM (unlike
+    load_slot_shard, the full-shard reader build_all_dicts uses). The
+    reader-training pairs' random row access."""
+    from safetensors import safe_open  # noqa: PLC0415
+
+    rows = []
+    for s in range(k_slots):
+        with safe_open(str(Path(shard_dir) / f"slot_{s}.safetensors"), framework="pt") as f:
+            rows.append(f.get_slice("kv")[i])
+    return torch.stack(rows)
+
+
+def build_reader_pairs(
+    fit_items,
+    shard_dir,
+    dict_: dict,
+    fit_ids_col: torch.Tensor,
+    geometry: dict,
+    base: int,
+    kv_dtype,
+    indices,  # noqa: ANN001
+) -> list[ReaderPair]:
+    """The selected fit-step indices -> ReaderPairs. NATIVE = the step's own
+    canonical shard rows (mmap random access, spec item 1); SNAPPED =
+    detokenize(fit_ids_col[i]) -- the step's OWN --reader-dict ids, a free
+    byproduct of build_all_dicts' k-means assignment (never re-tokenized).
+    Both dialects share ids/text/cs by construction: cs = base + k_slots,
+    the SAME canonical placement every fit/eval step was encoded at."""
+    k_slots = geometry["k_slots"]
+    cs = base + k_slots
+    pairs = []
+    for i in indices:
+        _doc_key, ids, text = fit_items[i]
+        mat = read_fit_kv_row(shard_dir, i, k_slots).to(kv_dtype)  # [k_slots, D]
+        native_kv = slot_matrix_to_kv(
+            mat, geometry["n_layers"], geometry["n_kv_heads"], geometry["head_dim"]
+        )
+        snapped_kv = detokenize(fit_ids_col[i].tolist(), dict_, geometry, dtype=kv_dtype)
+        pairs.append(
+            ReaderPair(ids=ids, text=text, native_kv=native_kv, snapped_kv=snapped_kv, cs=cs)
+        )
+    return pairs
+
+
+_READER_FORBIDDEN_OUT_SUBDIRS = {
+    "render_adapter",
+    "render_adapter_ledger",
+    "render_adapter_oneform",
+}
+
+
+def check_reader_out_subdir(out_subdir: str, warm_start_subdir: str) -> None:
+    """Clobber guard (spec item 3): the reader's --reader-out-subdir must
+    differ from its own warm-start source and must not be one of the
+    earlier-stage render checkpoints -- the whole point of a NEW subdir name
+    (render_adapter_snapped) is that nothing upstream gets overwritten."""
+    forbidden = _READER_FORBIDDEN_OUT_SUBDIRS | {warm_start_subdir}
+    assert out_subdir not in forbidden, (
+        f"--reader-out-subdir={out_subdir!r} would clobber one of {forbidden} -- "
+        "the reader run must write to a NEW subdir"
+    )
+
+
+def load_reader_render_adapter(pm, repo, warm_start_subdir, smoke: bool):  # noqa: ANN001
+    """Load the render adapter TRAINABLE for --train-reader, via
+    run_render.warm_start_render -- NEVER attach_render's fresh init;
+    warm-starting from the existing (encoder-only-trained) reader is the
+    whole point of this phase (spec item 2). --smoke has no pretrained
+    checkpoint to download, so it substitutes attach_render's fresh init --
+    the SAME substitution this file's eval-only render load already makes
+    under --smoke."""
+    if smoke:
+        return attach_render(pm, r=4)
+    from huggingface_hub import snapshot_download  # noqa: PLC0415
+
+    loc = snapshot_download(repo, allow_patterns=[f"{warm_start_subdir}/render/*"])
+    return warm_start_render(pm, loc, warm_start_subdir)
+
+
+def train_reader(
+    pm,
+    tok,
+    pairs: list[ReaderPair],
+    render_params,
+    steps: int,
+    lr: float = 1e-4,
+    seed: int = 0,
+    log_every: int = 100,
+):  # noqa: ANN001
+    """Fine-tune the ALREADY-ACTIVE 'render' adapter (warm-started by the
+    caller) to read BOTH dialects -- native (canonical) and snapped (through
+    --reader-dict) gist-KV -- 50/50 per step via run_render's mixed sampler
+    (training_items: tag 'gist'=native, 'bridge'=snapped). Same target for
+    both dialects (ids + newline); loss is ledger_render_nll (ledger ON,
+    matches the bar -- spec item 2). Logs a per-dialect RUNNING MEAN loss
+    every `log_every` steps, reset after each log (never a single-record
+    print -- meaningless noise at this scale)."""
+    nl = tok("\n", add_special_tokens=False).input_ids
+    opt = torch.optim.AdamW([p for _, p in render_params], lr=lr, weight_decay=0.01)
+    items = training_items(pairs, "mixed")
+    torch.manual_seed(seed)
+
+    running = {"gist": [0.0, 0], "bridge": [0.0, 0]}  # [loss sum, count]
+    step = 0
+    while step < steps:
+        for idx in torch.randperm(len(items)):
+            pair, dialect = items[int(idx)]
+            kv = pair.native_kv if dialect == "gist" else pair.snapped_kv
+            tgt = list(pair.ids) + list(nl)
+            ledger = _ledger_ids(tok, pair.text)
+            loss = ledger_render_nll(pm, kv, pair.cs, ledger, tgt)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([p for _, p in render_params], 1.0)
+            opt.step()
+            running[dialect][0] += float(loss.item())
+            running[dialect][1] += 1
+            step += 1
+            if step % log_every == 0 or step >= steps:
+                means = {
+                    ("native" if d == "gist" else "snapped"): round(s / n, 4)
+                    for d, (s, n) in running.items()
+                    if n > 0
+                }
+                print(f"[READER step {step}] running mean loss {means}", flush=True)
+                running = {"gist": [0.0, 0], "bridge": [0.0, 0]}
+            if step >= steps:
+                break
+    return render_params
+
+
+def save_and_push_reader(pm, cache_dir, out_subdir, out_repo, smoke: bool) -> str:  # noqa: ANN001
+    """Save the trained render adapter to <cache>/<out_subdir>/render/* and
+    push it to HF BEFORE the (long) eval -- 'weights first, durably', the
+    same lesson run_render's own early weights push exists for (spec item 3:
+    a wall-clock death during eval must not cost the trained reader)."""
+    d = Path(cache_dir) / out_subdir
+    d.mkdir(parents=True, exist_ok=True)
+    pm.save_pretrained(str(d), selected_adapters=["render"])
+    if not smoke and out_repo:
+        _push_with_retry(out_repo, str(d), out_subdir)
+        print(f"[READER WEIGHTS PUSHED EARLY] {out_repo}/{out_subdir}", flush=True)
+    return str(d)
+
+
+def reader_verdict(cell: dict | None) -> str:
+    """PASS if the reader-dict config's R_gsm8k >= 0.8 AND op_from_ids >=
+    0.75 (spec item 4 -- op already clears 0.75 per STAGE 1 RESULT, R is the
+    bar this whole phase exists to move); FAIL otherwise, including when the
+    cell or either field is missing (e.g. --eval or --diagnose wasn't run)."""
+    if not cell:
+        return "FAIL"
+    r, op = cell.get("R_gsm8k"), cell.get("op_from_ids")
+    if r is None or op is None:
+        return "FAIL"
+    return "PASS" if r >= 0.8 and op >= 0.75 else "FAIL"
+
+
+def mu_separability(dict_: dict) -> list[dict]:
+    """Per-slot nearest-neighbour cosine among a dictionary's entries' MEAN
+    READOUTS (mu_readout) -- G7's $0 CPU risk check (STAGE 1 RESULT: 'NEW
+    RISK: readout-vs-KV cluster agreement is 0.09 -- mu may be blurry').
+    Returns [{"median", "p90", "frac_gt_0_98"}, ...] per slot: high values
+    mean two KV-space clusters the codebook told apart share almost the same
+    mean readout, so the reader would read them as the same step anyway."""
+    import torch.nn.functional as F  # noqa: N812, PLC0415
+
+    slots = dict_["entry"]["slots"] if dict_["kind"] == "whole" else dict_["slots"]
+    out = []
+    for slot in slots:
+        mu = F.normalize(slot["mu_readout"].float(), dim=1)
+        sim = mu @ mu.t()
+        sim.fill_diagonal_(-2.0)  # exclude the self-pair
+        nn_cos, _ = sim.max(dim=1)
+        vals, _ = nn_cos.sort()
+        n = vals.numel()
+        median = float(vals[n // 2]) if n % 2 else float((vals[n // 2 - 1] + vals[n // 2]) / 2)
+        p90 = float(vals[min(n - 1, round(0.9 * (n - 1)))])
+        frac = float((nn_cos > 0.98).float().mean())
+        out.append(
+            {"median": round(median, 4), "p90": round(p90, 4), "frac_gt_0_98": round(frac, 4)}
+        )
+    return out
+
+
+def load_check_mu_dict(cache_dir, out_repo, name: str) -> dict:  # noqa: ANN001
+    """dict_<name>.pt from <cache_dir>/dicts, or --out-repo's HF copy if not
+    found locally (spec item 6: '--check-mu ... no model'). Fails loud if
+    neither source has it -- never a silent skip of the diagnostic."""
+    local = Path(cache_dir) / "dicts" / f"dict_{name}.pt"
+    if local.exists():
+        return torch.load(local, map_location="cpu")
+    assert out_repo, f"--check-mu: {local} not found and no --out-repo to fetch dict_{name}.pt from"
+    from huggingface_hub import hf_hub_download  # noqa: PLC0415
+
+    return torch.load(hf_hub_download(out_repo, f"gist_dict/dict_{name}.pt"), map_location="cpu")
 
 
 def build_eval_set(doc_iter, tok, max_span: int, n_eval: int):  # noqa: ANN001
@@ -975,7 +1237,37 @@ def main() -> None:  # noqa: PLR0915
     ap.add_argument("--diagnose", action="store_true")
     ap.add_argument("--cache-dir", default="/tmp/gist_dict_cache")  # noqa: S108
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument(
+        "--train-reader",
+        action="store_true",
+        help="Stage 1b (GIST_LM_PLAN.md STAGE 1 RESULT): fine-tune the render "
+        "reader on snapped --reader-dict KV (warm-started from "
+        "--reader-warm-start), pushed to --reader-out-subdir, BEFORE --eval "
+        "runs with the new reader active",
+    )
+    ap.add_argument("--n-train-pairs", type=int, default=8000)
+    ap.add_argument(
+        "--reader-dict",
+        default="kv_K4096",
+        help="the config the reader is taught (--train-reader) and/or "
+        "diagnosed against (--check-mu)",
+    )
+    ap.add_argument("--reader-warm-start", default="render_adapter_oneform")
+    ap.add_argument("--reader-out-subdir", default="render_adapter_snapped")
+    ap.add_argument("--reader-steps", type=int, default=3000)
+    ap.add_argument("--reader-lr", type=float, default=1e-4)
+    ap.add_argument(
+        "--check-mu",
+        action="store_true",
+        help="CPU-only, no model: per-slot nearest-neighbour cosine among "
+        "--reader-dict's entries' mean readouts (G7's readout-blur risk check)",
+    )
     args = ap.parse_args()
+
+    if args.train_reader:
+        # fail BEFORE touching the network/model (run_render's own
+        # clobber-guard convention)
+        check_reader_out_subdir(args.reader_out_subdir, args.reader_warm_start)
 
     if args.smoke:
         args.model_name, args.repo = "Qwen/Qwen2.5-0.5B", None
@@ -985,6 +1277,8 @@ def main() -> None:  # noqa: PLR0915
         args.max_new = 12
         args.eval, args.diagnose = True, True
         args.eval_configs = "all"  # smoke exercises every config's GPU path
+        args.reader_dict = "kv_K8"  # the only per-slot config --ks=8 builds
+        args.reader_steps, args.n_train_pairs = 20, 20
 
     ks = [int(x) for x in args.ks.split(",") if x]
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -997,9 +1291,12 @@ def main() -> None:  # noqa: PLR0915
     k_slots = gist.shape[0]
     pm.set_adapter("default")
 
-    if args.smoke:
-        from marker.render import attach_render  # noqa: PLC0415
-
+    render_params = None
+    if args.train_reader:
+        render_params = load_reader_render_adapter(
+            pm, args.repo, args.reader_warm_start, args.smoke
+        )
+    elif args.smoke:
         attach_render(pm, r=4)
     else:
         from huggingface_hub import snapshot_download  # noqa: PLC0415
@@ -1018,7 +1315,17 @@ def main() -> None:  # noqa: PLR0915
     eval_fresh, eval_fresh_docs = build_eval_set(
         _fresh_docs(args.n_fresh * 2), tok, args.max_span, args.n_fresh
     )
-    print(f"eval sets: {len(eval_gsm8k)} gsm8k, {len(eval_fresh)} fresh", flush=True)
+    eval_fresh_v2, eval_fresh_v2_docs = ([], set())
+    if args.train_reader:
+        # spec item 5: report alongside `fresh`, never load-bearing
+        eval_fresh_v2, eval_fresh_v2_docs = build_eval_set(
+            _fresh_v2_docs(args.n_fresh * 2), tok, args.max_span, args.n_fresh
+        )
+    print(
+        f"eval sets: {len(eval_gsm8k)} gsm8k, {len(eval_fresh)} fresh, "
+        f"{len(eval_fresh_v2)} fresh_v2",
+        flush=True,
+    )
 
     counters = {"too_long": 0}
     shard_dir = Path(args.cache_dir) / "fit_shards"
@@ -1049,7 +1356,7 @@ def main() -> None:  # noqa: PLR0915
             tok,
             args.max_span,
             args.n_fit,
-            eval_gsm8k_docs | eval_fresh_docs,
+            eval_gsm8k_docs | eval_fresh_docs | eval_fresh_v2_docs,
             counters,
         )
         print(
@@ -1208,6 +1515,43 @@ def main() -> None:  # noqa: PLR0915
         _emit_manifest()
         raise SystemExit(f"every dictionary build failed: {build_errors}")
 
+    # ── Stage 1b: teach the reader the snapped dialect, BEFORE --eval runs
+    # with it active (GIST_LM_PLAN.md STAGE 1 RESULT; spec items 1-3) ───────
+    if args.train_reader:
+        assert args.reader_dict in dicts, (
+            f"--reader-dict={args.reader_dict!r} not among built/loaded configs "
+            f"{sorted(dicts)} -- pick a config that actually built"
+        )
+        assert render_params, "--train-reader needs a trainable render adapter"
+        kv_dtype = probe_kv.keys[0].dtype  # the reader attends in THIS dtype
+        pair_idx = pick_train_pair_indices(len(fit_items), args.n_train_pairs, args.seed)
+        pairs = build_reader_pairs(
+            fit_items,
+            shard_dir,
+            dicts[args.reader_dict],
+            fit_ids[args.reader_dict],
+            geometry,
+            args.base,
+            kv_dtype,
+            pair_idx,
+        )
+        print(
+            f"[GISTDICT] reader training pairs: {len(pairs)} fit steps "
+            f"(--reader-dict={args.reader_dict})",
+            flush=True,
+        )
+        pm.set_adapter("render")
+        train_reader(
+            pm, tok, pairs, render_params, args.reader_steps, lr=args.reader_lr, seed=args.seed
+        )
+        pm.set_adapter("default")
+        save_and_push_reader(pm, args.cache_dir, args.reader_out_subdir, args.out_repo, args.smoke)
+        manifest["reader_subdir"] = args.reader_out_subdir
+        manifest["reader_trained_steps"] = args.reader_steps
+        print(
+            f"[GISTDICT PARTIAL] {json.dumps(manifest, default=str)}", flush=True
+        )  # reader trained
+
     # which configs get the GPU generation loop (all of them always get the
     # CPU diagnostics -- ids, op-from-IDs, cosines, AMI, readout probe)
     all_names = list(dicts)
@@ -1241,11 +1585,18 @@ def main() -> None:  # noqa: PLR0915
             encode_canonical(pm, gist, s.ids, base=args.base, max_span=args.max_span)
             for s in eval_fresh
         ]
+        if eval_fresh_v2:
+            natives["fresh_v2"] = [
+                encode_canonical(pm, gist, s.ids, base=args.base, max_span=args.max_span)
+                for s in eval_fresh_v2
+            ]
         for name, dict_ in dicts.items():
             eval_ids_cache[name] = {
                 "gsm8k": tokenize_eval(natives["gsm8k"], dict_),
                 "fresh": tokenize_eval(natives["fresh"], dict_),
             }
+            if eval_fresh_v2:
+                eval_ids_cache[name]["fresh_v2"] = tokenize_eval(natives["fresh_v2"], dict_)
         print("eval steps encoded + tokenized under every config", flush=True)
 
     gate0_ok = True
@@ -1254,9 +1605,16 @@ def main() -> None:  # noqa: PLR0915
         pm.set_adapter("render")
         native_gsm8k = score_native(pm, tok, eval_gsm8k, natives["gsm8k"], max_new=args.max_new)
         native_fresh = score_native(pm, tok, eval_fresh, natives["fresh"], max_new=args.max_new)
+        native_fresh_v2 = (
+            score_native(pm, tok, eval_fresh_v2, natives["fresh_v2"], max_new=args.max_new)
+            if eval_fresh_v2
+            else None
+        )
         pm.set_adapter("default")
         manifest["native_gsm8k"] = native_gsm8k
         manifest["native_fresh"] = native_fresh
+        if native_fresh_v2 is not None:
+            manifest["native_fresh_v2"] = native_fresh_v2
         gate0_ok = gate0_pass(native_gsm8k, native_fresh)
         manifest["gate0_pass"] = gate0_ok
         print(
@@ -1279,6 +1637,10 @@ def main() -> None:  # noqa: PLR0915
                     len(eval_fresh), torch.Generator().manual_seed(args.seed + 1)
                 ),
             }
+            if native_fresh_v2 is not None:
+                wrong_idx["fresh_v2"] = pick_wrong_doc_indices(
+                    len(eval_fresh_v2), torch.Generator().manual_seed(args.seed + 2)
+                )
             pm.set_adapter("render")
             for name in all_names:
                 if name not in eval_names:
@@ -1320,6 +1682,31 @@ def main() -> None:  # noqa: PLR0915
                     cells_fresh["wrong_doc_quantized"]["rel_exact"],
                     native_fresh["rel_exact"],
                 )
+                fresh_v2_fields = {}
+                if native_fresh_v2 is not None:
+                    # spec item 5: report alongside `fresh`, never load-bearing
+                    cells_fresh_v2 = eval_quantized_conditions(
+                        pm,
+                        tok,
+                        eval_fresh_v2,
+                        natives["fresh_v2"],
+                        wrong_idx["fresh_v2"],
+                        eval_ids_cache[name]["fresh_v2"],
+                        dict_,
+                        geometry,
+                        seed=args.seed + 2,
+                        max_new=args.max_new,
+                    )
+                    cells_fresh_v2["native"] = native_fresh_v2
+                    r_fresh_v2 = compute_r(
+                        cells_fresh_v2["quantized"]["rel_exact"],
+                        cells_fresh_v2["wrong_doc_quantized"]["rel_exact"],
+                        native_fresh_v2["rel_exact"],
+                    )
+                    fresh_v2_fields = {
+                        "conditions_fresh_v2": cells_fresh_v2,
+                        "R_fresh_v2": round(r_fresh_v2, 4),
+                    }
                 manifest["configs"].setdefault(name, {})
                 manifest["configs"][name].update(
                     {
@@ -1329,6 +1716,7 @@ def main() -> None:  # noqa: PLR0915
                         "conditions_fresh": cells_fresh,
                         "R_gsm8k": round(r_gsm8k, 4),
                         "R_fresh": round(r_fresh, 4),
+                        **fresh_v2_fields,
                     }
                 )
                 print(f"eval {name}: R_gsm8k={r_gsm8k:.3f} R_fresh={r_fresh:.3f}", flush=True)
@@ -1418,6 +1806,16 @@ def main() -> None:  # noqa: PLR0915
         )
     else:
         manifest["verdict"] = None
+
+    if args.train_reader:
+        manifest["reader_verdict"] = reader_verdict(manifest["configs"].get(args.reader_dict))
+
+    if args.check_mu:
+        mu_source = dicts.get(args.reader_dict) or load_check_mu_dict(
+            args.cache_dir, args.out_repo, args.reader_dict
+        )
+        manifest["mu_separability"] = mu_separability(mu_source)
+        print(f"[GISTDICT] mu_separability computed for {args.reader_dict}", flush=True)
 
     _emit_manifest()
 
