@@ -122,6 +122,28 @@ def test_split_long_step_hard_splits_when_no_punctuation():
     assert _norm(" ".join(pieces)) == _norm(text)
 
 
+def test_split_long_step_hard_split_pieces_stay_within_max_span_when_decode_inflates():
+    """Byte-level BPE regression: decoding a mid-cluster token cut can
+    RE-tokenize LONGER than the cut -- encode_canonical hard-asserts on an
+    over-length piece, which would kill a GPU run mid-corpus. _hard_split
+    must shrink each chunk until its decoded text re-tokenizes within
+    max_span."""
+    from marker.gist_tokenizer import split_long_step
+
+    class _InflatingTok(_FakeTok):
+        def decode(self, ids, skip_special_tokens=True):  # noqa: ANN001, ARG002
+            # "xy" decodes to "x y": the decoded chunk re-encodes to MORE
+            # tokens than were cut
+            return " ".join("x y" if self.vocab[i] == "xy" else self.vocab[i] for i in ids)
+
+    tok = _InflatingTok()
+    text = " ".join(["xy"] * 10)  # no punctuation at all -> hard split path
+    pieces = split_long_step(text, tok, max_span=3)
+    assert pieces
+    for p in pieces:
+        assert len(tok(p, add_special_tokens=False).input_ids) <= 3
+
+
 # ── GistTokenizer.encode_step / decode_ids ──────────────────────────────────
 
 

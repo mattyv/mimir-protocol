@@ -5,16 +5,20 @@ question as plain text and THINKS by emitting gist tokens, see gist_vocab.py)
 to predict, autoregressively, each step's 8-per-slot dictionary ids, then
 render the committed step's text.
 
-Pipeline: load corpus (JSONL shards, schema owned by run_tokenize_corpus.py)
--> per epoch, two training sequences per solution (g7.sample_m) -> pack by
-length, batch, two-gather loss (g7.two_gather_loss, never a full
-base_vocab+8K+2-wide softmax) -> log running gist_ce/text_ce every 50 steps
--> checkpoint + push every N steps and at the end -> eval block 1
-(teacher-forced next-id accuracy/exact-8 + majority/bigram/copy baselines)
--> eval block 2 (op-from-predicted-IDs via greedy history decode + the
-stage-1 categorical NB, k_sizes=[K]*8 EXPLICIT -- never derived from the max
-id seen in a possibly-small fit set) -> manifest ([G7 MANIFEST] {json}) ->
-(non-smoke) push.
+Pipeline: load corpus (shard_*.jsonl ONLY -- eval_gsm8k_test.jsonl sits in
+the same dir and must never be trained on; schema owned by
+run_tokenize_corpus.py) -> resume from the latest g7_v0/step-* on --out-repo
+if one exists -> per epoch, two training sequences per solution (g7.sample_m)
+-> pack by length, batch, two-gather loss (g7.two_gather_loss, never a full
+base_vocab+8K+2-wide softmax), gradient checkpointing on cuda -> log running
+gist_ce/text_ce every 50 steps -> checkpoint + push every N steps and at the
+end -> eval on eval_gsm8k_test.jsonl: block 1 (teacher-forced next-id
+accuracy/exact-8 + majority/bigram/copy baselines + slot-7 confusion split)
+and block 2 (op-from-predicted-IDs via greedy history decode, KV-cached, +
+the stage-1 categorical NB, k_sizes=[K]*8 EXPLICIT -- never derived from the
+max id seen in a possibly-small fit set) -> smoke_verdict whenever both
+blocks ran (the ~$1 GPU rehearsal is SMOKE_RUN=1, not --smoke) -> manifest
+([G7 MANIFEST] {json}) -> (non-smoke) push.
 
 Smoke (offline, tiny UNTIED model, synthetic corpus, no network):
     PYTHONPATH=src python -m marker.run_g7 --smoke
@@ -24,7 +28,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import re
 import time
 from pathlib import Path
 
@@ -143,12 +149,19 @@ def _load_base_clean(model_name: str, device: str, quantize: bool):
 
 
 def load_mu_from_dict(path: str, K: int) -> torch.Tensor:
-    """dict_kv_K4096.pt is a list of N_SLOTS per-slot dictionary entries
-    (gist_dict.build_dict_kv's output), each carrying `mu_readout` fp16
-    [K, d]. Stacks them into [8, K, d] fp32, NATURAL slot order (list index
-    == slot index, matching how the dictionary was built one slot at a
-    time)."""
-    entries = torch.load(path, map_location="cpu")
+    """dict_kv_K4096.pt (run_gist_dict.save_dict's output) is {"cfg":
+    "kv_K4096", "kind": "kv", "geometry": ..., "slots": [entry per slot]},
+    each entry carrying `mu_readout` fp16 [K, d]
+    (gist_dict.build_dict_kv). Stacks them into [8, K, d] fp32, NATURAL slot
+    order (list index == slot index, matching how the dictionary was built
+    one slot at a time). A bare list of entries is accepted too (tests)."""
+    loaded = torch.load(path, map_location="cpu")
+    if isinstance(loaded, dict):
+        if loaded.get("kind") != "kv":
+            raise ValueError(f"expected a 'kv' dictionary, got kind={loaded.get('kind')!r}")
+        entries = loaded["slots"]
+    else:
+        entries = loaded
     if len(entries) != N_SLOTS:
         raise ValueError(f"dictionary must have {N_SLOTS} per-slot entries, got {len(entries)}")
     mus = []
@@ -335,10 +348,13 @@ def teacher_forced_eval(pm, head, eval_seqs: list[dict], base_vocab: int, K: int
     TARGET's own slot block at every gist position, regrouped into 8-wide
     NATURAL-order predictions (undoing SLOT_ORDER layout, like
     g7.parse_sequence) for the exact-group comparison. Returns
-    (preds, targets), both list[list[int]] of NATURAL-order groups."""
+    (preds, targets, has_prev): preds/targets are list[list[int]] of
+    NATURAL-order groups; has_prev[i] is True iff group i had a predecessor
+    group in its sequence (the support the bigram/copy baselines predict
+    on -- first groups have no bigram counterpart)."""
     device = next(pm.parameters()).device
     rows, bias = head.vocab.output_rows_all()
-    preds, targets = [], []
+    preds, targets, has_prev = [], [], []
     for seq in eval_seqs:
         ids = torch.tensor([seq["input_ids"]], device=device)
         hidden = pm.get_decoder()(input_ids=ids, use_cache=False).last_hidden_state[0]
@@ -355,7 +371,35 @@ def teacher_forced_eval(pm, head, eval_seqs: list[dict], base_vocab: int, K: int
                 tgt_natural[s] = seq["input_ids"][i + 1] - base_vocab - s * K
             preds.append(pred_natural)
             targets.append(tgt_natural)
-    return preds, targets
+            has_prev.append(g0 > 0)
+    return preds, targets, has_prev
+
+
+def slot7_confusion_split(
+    preds: list[list[int]], targets: list[list[int]], mu: torch.Tensor, thresh: float = 0.98
+) -> dict:
+    """Slot-7 next-id accuracy split by whether the TRUE id's nearest
+    neighbour among slot-7's mu vectors is within `thresh` cosine ("STAGE 1b
+    RESULT": 65-70% of slot-7 entries have a >=0.98 neighbour). Separates
+    "embedding blur" (errors concentrated in the crowded bucket) from "can't
+    predict the op" (errors everywhere). mu is the full [8, K, d] buffer."""
+    m = torch.nn.functional.normalize(mu[7].detach().float().cpu(), dim=1)
+    sim = m @ m.T
+    sim.fill_diagonal_(-2.0)
+    nn_cos = sim.max(dim=1).values
+    cells = {True: [0, 0], False: [0, 0]}  # bucket -> [hits, n]
+    for p, t in zip(preds, targets, strict=True):
+        bucket = bool(nn_cos[t[7]] >= thresh)
+        cells[bucket][1] += 1
+        cells[bucket][0] += int(p[7] == t[7])
+
+    def _cell(hits, n):
+        return {"acc": round(hits / n, 4) if n else None, "n": n}
+
+    return {
+        "within_098": _cell(*cells[True]),
+        "outside_098": _cell(*cells[False]),
+    }
 
 
 @torch.no_grad()
@@ -371,22 +415,68 @@ def greedy_predict_group(pm, head, prompt_ids: list[int], base_vocab: int, K: in
     carries prior groups (multi-step history). Simpler and correct: greedily
     decode one token at a time, masked to slot_for_position(t)'s own K-wide
     block via the same gather two_gather_loss uses -- no processor, no
-    cumulative-history counting."""
+    cumulative-history counting.
+
+    KV cache: the prompt is encoded ONCE (use_cache=True), then each of the
+    8 gist tokens is a single-token forward against the cache -- without it,
+    eval block 2 re-runs a ~300-token prefix 8 times per group (~6k full
+    forwards over the 4-bit 7B, tens of minutes for nothing).
+    test_greedy_predict_group_cached_matches_uncached pins cache/no-cache
+    parity on the tiny model."""
     device = next(pm.parameters()).device
     vocab = head.vocab
     rows, bias = vocab.output_rows_all()
-    ids = list(prompt_ids)
+    decoder = pm.get_decoder()
+    out = decoder(input_ids=torch.tensor([prompt_ids], device=device), use_cache=True)
     natural = [0] * N_SLOTS
     for t in range(N_SLOTS):
         s = SLOT_ORDER[t]
-        inp = torch.tensor([ids], device=device)
-        hidden = pm.get_decoder()(input_ids=inp, use_cache=False).last_hidden_state[0, -1]
+        hidden = out.last_hidden_state[0, -1]
         block_rows = rows[s * K : (s + 1) * K].to(hidden.dtype)
         block_bias = bias[s * K : (s + 1) * K].to(hidden.dtype)
         j = int((hidden @ block_rows.T + block_bias).argmax())
         natural[s] = j
-        ids.append(vocab.flat_id(s, j))
+        if t < N_SLOTS - 1:
+            out = decoder(
+                input_ids=torch.tensor([[vocab.flat_id(s, j)]], device=device),
+                past_key_values=out.past_key_values,
+                use_cache=True,
+            )
     return natural
+
+
+def predict_history_rows(
+    pm,  # noqa: ANN001
+    head,  # noqa: ANN001
+    records: list[dict],
+    tok,  # noqa: ANN001
+    base_vocab: int,
+    K: int,
+) -> tuple[list[list[int]], list[str]]:
+    """One greedy-predicted 8-id group per OP-LABELLED step: the step's FIRST
+    group, predicted with the TRUE ids of every earlier group in the prompt
+    (the build order's "greedy-predict each group of the true history").
+    Returns (rows, ops) STRICTLY ALIGNED: rows[i] is the prediction for the
+    step whose label is ops[i]. Alignment is the whole point -- predicting
+    every group of every step and then truncating to the number of labelled
+    steps (the obvious shortcut) silently pairs predictions with the wrong
+    op label as soon as a step has no parseable op or more than one group,
+    which is most of the real corpus."""
+    vocab = head.vocab
+    rows_out, ops_out = [], []
+    for r in records:
+        ops = op_labels_for_steps(r["steps"])
+        q_ids = list(tok(r["question"], add_special_tokens=False).input_ids)
+        prompt = q_ids + [vocab.think_id]
+        for step_groups, op in zip(r["ids"], ops, strict=True):
+            if op is not None:
+                rows_out.append(greedy_predict_group(pm, head, prompt, base_vocab, K))
+                ops_out.append(op)
+            # history extends with the TRUE ids of ALL the step's groups,
+            # whether or not the step was scored.
+            for g in step_groups:
+                prompt = prompt + [vocab.flat_id(s, g[s]) for s in SLOT_ORDER]
+    return rows_out, ops_out
 
 
 def decode_text_step(logits_row: torch.Tensor, base_vocab: int) -> int:
@@ -398,6 +488,27 @@ def decode_text_step(logits_row: torch.Tensor, base_vocab: int) -> int:
 
 
 # ── smoke verdict ────────────────────────────────────────────────────────
+
+
+def verdict_cells(train_gist_ce: float, manifest: dict) -> dict | None:
+    """The four smoke-gate cells, pulled from a finished manifest -- or None
+    when either eval block is missing (the verdict then cannot be computed;
+    never fabricate a FAIL from absent cells). This runs on EVERY run that
+    produced both eval blocks: the ~$1 GPU rehearsal is `SMOKE_RUN=1`
+    (real 7B, 2k solutions), NOT `--smoke` (the offline tiny model) -- the
+    verdict must not be gated on the latter flag."""
+    b1 = manifest.get("eval_block_1")
+    b2 = manifest.get("eval_block_2", {}).get("op_from_predicted")
+    if not b1 or not b2:
+        return None
+    return {
+        "train_gist_ce": train_gist_ce,
+        "bigram_ce": b1["bigram_ce"],
+        "next_id_acc": b1["next_id_acc"],
+        "bigram_acc": b1["bigram_acc"],
+        "op_from_predicted": b2["acc"],
+        "majority_op": b2["majority"],
+    }
 
 
 def smoke_verdict(cells: dict) -> dict:
@@ -438,11 +549,76 @@ def _save_checkpoint(dir_path: Path, pm, vocab, meta: dict) -> None:  # noqa: AN
     d = Path(dir_path)
     d.mkdir(parents=True, exist_ok=True)
     pm.save_pretrained(str(d))
+    # `mu` is a frozen buffer rebuilt from dict_kv_K4096.pt at startup --
+    # saving it would add ~470MB fp32 to EVERY checkpoint push for data that
+    # is already on the hub.
     save_file(
-        {k: v.detach().cpu().contiguous() for k, v in vocab.state_dict().items()},
+        {k: v.detach().cpu().contiguous() for k, v in vocab.state_dict().items() if k != "mu"},
         str(d / "gistvocab.safetensors"),
     )
     write_manifest(d, meta)
+
+
+def load_g7_checkpoint(pm, vocab, ckpt_dir) -> None:  # noqa: ANN001
+    """Load a _save_checkpoint dir back into an attach_g7-built (pm, vocab):
+    the `g7` LoRA adapter state + every GistVocab parameter (`mu` stays the
+    freshly-loaded dictionary buffer)."""
+    from peft import set_peft_model_state_dict  # noqa: PLC0415
+    from safetensors.torch import load_file  # noqa: PLC0415
+
+    ckpt = Path(ckpt_dir)
+    adapter = next(iter(sorted(ckpt.rglob("adapter_model.safetensors"))), None)
+    if adapter is None:
+        raise ValueError(f"no adapter_model.safetensors under {ckpt}")
+    set_peft_model_state_dict(pm, load_file(str(adapter)), adapter_name="g7")
+    sd = load_file(str(ckpt / "gistvocab.safetensors"))
+    missing, unexpected = vocab.load_state_dict(sd, strict=False)
+    if unexpected or missing != ["mu"]:
+        raise ValueError(f"gistvocab state mismatch: missing={missing} unexpected={unexpected}")
+
+
+_G7_STEP_RE = re.compile(r"g7_v0/step-(\d+)/")
+
+
+def resume_from_repo(pm, vocab, out_repo: str, cache_dir: str, lister=None, fetcher=None) -> int:  # noqa: ANN001
+    """Find the latest `g7_v0/step-*` checkpoint on `out_repo`, load it, and
+    return its step (0 = fresh run; any listing error = fresh run, a missing
+    repo is not fatal). Optimizer state is NOT checkpointed -- a resume
+    restarts AdamW moments, which is the accepted cost of a dead node.
+    `lister`/`fetcher` are injectable for tests (hf_push's pattern)."""
+    if lister is None:
+
+        def lister(repo):  # noqa: ANN001
+            from huggingface_hub import list_repo_files  # noqa: PLC0415
+
+            return list_repo_files(repo_id=repo, token=os.environ.get("HF_TOKEN"))
+
+    try:
+        files = lister(out_repo)
+    except Exception as e:  # noqa: BLE001
+        print(f"[G7 RESUME] listing failed ({type(e).__name__}: {e}); fresh run", flush=True)
+        return 0
+    steps = [int(m.group(1)) for p in files if (m := _G7_STEP_RE.search(p))]
+    if not steps:
+        return 0
+    step = max(steps)
+    if fetcher is None:
+
+        def fetcher(repo, subdir, dest):  # noqa: ANN001
+            from huggingface_hub import snapshot_download  # noqa: PLC0415
+
+            local = snapshot_download(
+                repo_id=repo,
+                allow_patterns=f"{subdir}/*",
+                local_dir=str(dest),
+                token=os.environ.get("HF_TOKEN"),
+            )
+            return Path(local) / subdir
+
+    ckpt = fetcher(out_repo, f"g7_v0/step-{step:07d}", Path(cache_dir) / "resume")
+    load_g7_checkpoint(pm, vocab, ckpt)
+    print(f"[G7 RESUME] resumed from step {step}", flush=True)
+    return step
 
 
 def main() -> None:  # noqa: PLR0915
@@ -497,19 +673,43 @@ def main() -> None:  # noqa: PLR0915
         pm, vocab = attach_g7(base, mu, r_lora=args.r_lora)
         if not args.corpus_dir:
             raise ValueError("--corpus-dir is required outside --smoke")
-        all_records = [
+        # TRAIN = the stage-2 shards ONLY. eval_gsm8k_test.jsonl lives in the
+        # SAME corpus dir (run_tokenize_corpus writes both), so a bare
+        # *.jsonl glob would silently TRAIN ON THE EVAL SET.
+        fit_records = [
             json.loads(line)
-            for p in sorted(Path(args.corpus_dir).glob("*.jsonl"))
+            for p in sorted(Path(args.corpus_dir).glob("shard_*.jsonl"))
             for line in p.read_text().splitlines()
         ]
-        if not all_records:
-            raise ValueError(f"no records found under {args.corpus_dir}")
+        if not fit_records:
+            raise ValueError(f"no shard_*.jsonl records found under {args.corpus_dir}")
         if args.n_solutions is not None:
-            all_records = all_records[: args.n_solutions]
-        split = max(1, int(len(all_records) * 0.9))
-        fit_records, eval_records = all_records[:split], all_records[split:]
+            fit_records = fit_records[: args.n_solutions]
+        eval_path = Path(args.eval_path)
+        if not eval_path.exists():
+            eval_path = Path(args.corpus_dir) / Path(args.eval_path).name
+        if not eval_path.exists():
+            raise ValueError(
+                f"eval file not found: {args.eval_path} (also tried {eval_path}) -- "
+                "the registered eval set, never a train-corpus split"
+            )
+        eval_records = [json.loads(line) for line in eval_path.read_text().splitlines()]
+        if not eval_records:
+            raise ValueError(f"eval file {eval_path} is empty")
 
     head = pm.get_output_embeddings()
+    if device == "cuda":
+        # batch 8 x seq 512 without activation checkpointing does not fit a
+        # 24GB card next to the 4-bit weights (the MLP intermediates alone
+        # are ~13GB at bf16); with it, peak is ~10GB. Non-reentrant variant:
+        # no input-require-grads hook needed. train() matters: Qwen2Model
+        # only checkpoints when self.training (dropout is 0 everywhere, so
+        # train mode changes nothing else).
+        pm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    pm.train()
+    start_step = 0
+    if not args.smoke and args.out_repo:
+        start_step = resume_from_repo(pm, vocab, args.out_repo, args.cache_dir)
     opt = torch.optim.AdamW(
         [
             {
@@ -532,7 +732,7 @@ def main() -> None:  # noqa: PLR0915
 
     n_steps = n_train_steps or len(batches)
     running_gist, running_text, last_loss = [], [], (0.0, 0.0, 0.0)
-    for step in range(n_steps):
+    for step in range(start_step, n_steps):
         batch = batches[step % len(batches)]
         last_loss = train_step(pm, head, batch, opt)
         running_gist.append(last_loss[1])
@@ -548,8 +748,10 @@ def main() -> None:  # noqa: PLR0915
             _save_checkpoint(ckpt_dir, pm, vocab, {"step": step + 1})
             _push_with_retry(args.out_repo, str(ckpt_dir), f"g7_v0/step-{step + 1:07d}")
 
-    train_gist_ce = sum(running_gist) / len(running_gist)
-    train_text_ce = sum(running_text) / len(running_text)
+    # a resume that lands past n_steps trains zero fresh steps: nan, not a crash
+    train_gist_ce = sum(running_gist) / len(running_gist) if running_gist else float("nan")
+    train_text_ce = sum(running_text) / len(running_text) if running_text else float("nan")
+    pm.eval()  # evals: no checkpointing overhead, and generate-style caching
     manifest: dict = {
         "smoke": args.smoke,
         "base_vocab": base_vocab,
@@ -561,9 +763,9 @@ def main() -> None:  # noqa: PLR0915
         "wall_s": round(time.time() - t0, 1),
     }
 
-    doc_groups = _doc_groups(fit_records)
-    eval_doc_groups = _doc_groups(eval_records) if eval_records else doc_groups
-    eval_seqs = build_epoch_sequences(eval_records or fit_records, tok, base_vocab, K_run, rng)
+    doc_groups = _doc_groups(fit_records)  # baselines FIT on the train corpus only
+    eval_doc_groups = _doc_groups(eval_records)
+    eval_seqs = build_epoch_sequences(eval_records, tok, base_vocab, K_run, rng)
 
     if 1 in eval_blocks:
         majority = majority_id_per_slot(doc_groups, K_run)
@@ -574,9 +776,19 @@ def main() -> None:  # noqa: PLR0915
                 preds_bigram.append(bigram_predict(bigram_probs, a))
                 preds_copy.append(list(a))
                 targets.append(b)
-        model_preds, model_targets = teacher_forced_eval(pm, head, eval_seqs, base_vocab, K_run)
+        model_preds, model_targets, has_prev = teacher_forced_eval(
+            pm, head, eval_seqs, base_vocab, K_run
+        )
+        # matched-support accuracy: only groups that HAVE a predecessor (the
+        # support bigram/copy predict on); the headline next_id_acc keeps the
+        # registered definition (all groups, first ones included).
+        cond_preds = [p for p, h in zip(model_preds, has_prev, strict=True) if h]
+        cond_targets = [t for t, h in zip(model_targets, has_prev, strict=True) if h]
         cell1 = {
             "next_id_acc": next_id_accuracy(model_preds, model_targets) if model_preds else 0.0,
+            "next_id_acc_with_prev": next_id_accuracy(cond_preds, cond_targets)
+            if cond_preds
+            else 0.0,
             "exact_group_rate": exact_group_rate(model_preds, model_targets)
             if model_preds
             else 0.0,
@@ -584,6 +796,9 @@ def main() -> None:  # noqa: PLR0915
             "bigram_acc": next_id_accuracy(preds_bigram, targets) if targets else 0.0,
             "copy_acc": next_id_accuracy(preds_copy, targets) if targets else 0.0,
             "majority_id_per_slot": majority,
+            "slot7_confusion": slot7_confusion_split(model_preds, model_targets, vocab.mu)
+            if model_preds
+            else None,
         }
         manifest["eval_block_1"] = cell1
 
@@ -596,7 +811,7 @@ def main() -> None:  # noqa: PLR0915
                     fit_ids_rows.append(step_groups[0])
                     fit_ops.append(op)
         eval_ids_rows, eval_ops = [], []
-        for r in eval_records or fit_records:
+        for r in eval_records:
             ops = op_labels_for_steps(r["steps"])
             for step_groups, op in zip(r["ids"], ops, strict=True):
                 if op is not None:
@@ -609,36 +824,23 @@ def main() -> None:  # noqa: PLR0915
             nb_true = op_from_ids_nb(fit_ids_t, fit_ops, eval_ids_t, eval_ops, K_run)
             cell2["op_from_true_ids"] = nb_true
 
-            predicted_rows = []
-            for r in eval_records or fit_records:
-                q_ids = list(tok(r["question"], add_special_tokens=False).input_ids)
-                prompt = q_ids + [vocab.think_id]
-                for step_groups in r["ids"]:
-                    predicted_rows.append(greedy_predict_group(pm, head, prompt, base_vocab, K_run))
-                    # teacher-forced history: extend with the TRUE ids, not the
-                    # model's own prediction, per the build order's "greedy-predict
-                    # each group of the true history".
-                    prompt = prompt + [vocab.flat_id(s, step_groups[0][s]) for s in SLOT_ORDER]
-            predicted_ids_t = torch.tensor(predicted_rows[: len(eval_ops)], dtype=torch.long)
+            # one predicted row per OP-LABELLED step, aligned by construction
+            # (see predict_history_rows -- predict-everything-then-truncate
+            # mispairs rows and labels on multi-group / unlabelled steps).
+            predicted_rows, predicted_ops = predict_history_rows(
+                pm, head, eval_records, tok, base_vocab, K_run
+            )
+            assert predicted_ops == eval_ops, "predicted rows misaligned with eval op labels"
+            predicted_ids_t = torch.tensor(predicted_rows, dtype=torch.long)
             nb_pred = op_from_ids_nb(fit_ids_t, fit_ops, predicted_ids_t, eval_ops, K_run)
             cell2["op_from_predicted"] = nb_pred
         manifest["eval_block_2"] = cell2
 
-    if args.smoke:
-        cells = {
-            "train_gist_ce": train_gist_ce,
-            "bigram_ce": manifest.get("eval_block_1", {}).get("bigram_ce", float("inf")),
-            "next_id_acc": manifest.get("eval_block_1", {}).get("next_id_acc", 0.0),
-            "bigram_acc": manifest.get("eval_block_1", {}).get("bigram_acc", 0.0),
-            "op_from_predicted": manifest.get("eval_block_2", {})
-            .get("op_from_predicted", {})
-            .get("acc", 0.0),
-            "majority_op": manifest.get("eval_block_2", {})
-            .get("op_from_predicted", {})
-            .get("majority", 0.0),
-        }
+    cells = verdict_cells(train_gist_ce, manifest)
+    if cells is not None:
         manifest["smoke_verdict"] = smoke_verdict(cells)
 
+    manifest["wall_s"] = round(time.time() - t0, 1)  # now includes the eval blocks
     print(f"[G7 MANIFEST] {json.dumps(manifest, default=str)}", flush=True)
 
     if not args.smoke and args.out_repo:

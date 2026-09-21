@@ -21,7 +21,9 @@ DISK_GB=100
 MODEL="${MODEL:-Qwen/Qwen2.5-7B}"
 REPO="${REPO:-mattyvee/mimir-artifacts}"       # holds dict_kv_K4096.pt (stage-1) + the corpus (stage-2)
 OUT_REPO="${OUT_REPO:-mattyvee/mimir-artifacts}"
-CORPUS_SUBDIR="${CORPUS_SUBDIR:-gist_corpus_v0}"
+# must match run_tokenize_corpus's --out-subdir (vast_tokenize_corpus.sh
+# OUTSUB default) -- the subdir holds shard_*.jsonl AND eval_gsm8k_test.jsonl
+CORPUS_SUBDIR="${CORPUS_SUBDIR:-gist_corpus_K4096}"
 DICT_PATH="${DICT_PATH:-gist_dict/dict_kv_K4096.pt}"
 GPU="${GPU:-RTX_4090}"
 SMOKE_RUN="${SMOKE_RUN:-}"

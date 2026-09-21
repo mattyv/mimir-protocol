@@ -11,19 +11,23 @@ import pytest
 import torch
 
 from marker.g7 import build_sequence
-from marker.gist_vocab import N_SLOTS
+from marker.gist_vocab import N_SLOTS, SLOT_ORDER
 from marker.run_g7 import (
     bigram_ce,
     bigram_predict,
     decode_text_step,
     exact_group_rate,
     fit_bigram,
+    load_mu_from_dict,
     majority_id_per_slot,
     next_id_accuracy,
     op_from_ids_nb,
     pack_batches,
+    predict_history_rows,
+    slot7_confusion_split,
     smoke_records,
     smoke_verdict,
+    verdict_cells,
 )
 
 K = 5
@@ -204,6 +208,121 @@ def test_smoke_records_shape_and_op_labels_parseable():
         assert all(op_label(s) is not None for s in r["steps"])
 
 
+# ── load_mu_from_dict: the REAL artifact structure ────────────────────────
+
+
+def test_load_mu_from_dict_accepts_the_saved_dict_structure(tmp_path):
+    """dict_kv_K4096.pt on the hub is run_gist_dict.save_dict's output:
+    {"cfg", "kind", "geometry", "slots": [entry per slot]} -- NOT a bare
+    list. Loading must unwrap "slots" (a bare list is also accepted)."""
+    K_d, d = 4, 6
+    entries = [{"mu_readout": torch.randn(K_d, d).half(), "K": K_d} for _ in range(N_SLOTS)]
+    saved = {"cfg": f"kv_K{K_d}", "kind": "kv", "geometry": {}, "slots": entries}
+    p = tmp_path / "dict_kv.pt"
+    torch.save(saved, p)
+    mu = load_mu_from_dict(str(p), K_d)
+    assert mu.shape == (N_SLOTS, K_d, d)
+    assert mu.dtype == torch.float32
+
+    torch.save(entries, p)  # bare list still works (tests/synthetic fixtures)
+    assert load_mu_from_dict(str(p), K_d).shape == (N_SLOTS, K_d, d)
+
+
+def test_load_mu_from_dict_rejects_wrong_kind(tmp_path):
+    p = tmp_path / "dict_ro.pt"
+    torch.save({"cfg": "ro_K4", "kind": "ro", "slots": []}, p)
+    with pytest.raises(ValueError, match="kind"):
+        load_mu_from_dict(str(p), 4)
+
+
+# ── verdict_cells: the GPU rehearsal is SMOKE_RUN, not --smoke ────────────
+
+
+def test_verdict_cells_built_from_any_manifest_with_both_blocks():
+    manifest = {
+        "eval_block_1": {"bigram_ce": 2.0, "next_id_acc": 0.5, "bigram_acc": 0.1},
+        "eval_block_2": {"op_from_predicted": {"acc": 0.6, "majority": 0.25}},
+    }
+    cells = verdict_cells(1.0, manifest)
+    assert cells is not None
+    assert smoke_verdict(cells)["verdict"] == "PASS"
+
+
+def test_verdict_cells_none_when_a_block_is_missing():
+    assert verdict_cells(1.0, {"eval_block_1": {"bigram_ce": 2.0}}) is None
+    assert verdict_cells(1.0, {}) is None
+
+
+# ── slot-7 confusion split ────────────────────────────────────────────────
+
+
+def test_slot7_confusion_split_buckets_by_mu_neighbourhood():
+    # slot 7: ids 0 and 1 nearly identical (within 0.98 cosine), id 2 orthogonal
+    d = 8
+    mu = torch.zeros(N_SLOTS, 3, d)
+    mu[7, 0, 0] = 1.0
+    mu[7, 1, 0] = 1.0
+    mu[7, 1, 1] = 0.01  # cos(mu[7,0], mu[7,1]) ~ 0.99995
+    mu[7, 2, 2] = 1.0  # orthogonal to both
+    # target id 0 (crowded, predicted wrong), target id 2 (isolated, right)
+    preds = [[0] * 7 + [1], [0] * 7 + [2]]
+    targets = [[0] * 8, [0] * 7 + [2]]
+    out = slot7_confusion_split(preds, targets, mu, thresh=0.98)
+    assert out["within_098"] == {"acc": 0.0, "n": 1}
+    assert out["outside_098"] == {"acc": 1.0, "n": 1}
+
+
+# ── predict_history_rows: alignment with op labels ────────────────────────
+
+
+def test_predict_history_rows_aligns_with_op_labels(monkeypatch):
+    """A record whose middle step has NO parseable op and whose steps carry
+    MULTIPLE groups: exactly one prediction per op-labelled step, prompts
+    grow by 8 x n_groups per step (true ids, whether or not the step was
+    scored) -- the truncation shortcut this replaces mispaired every row
+    after the first unlabelled or multi-group step."""
+    import marker.run_g7 as rg
+
+    prompts_seen = []
+
+    def fake_greedy(pm, head, prompt_ids, base_vocab, K):  # noqa: ANN001, ARG001
+        prompts_seen.append(list(prompt_ids))
+        return [len(prompt_ids)] * N_SLOTS  # deterministic marker row
+
+    monkeypatch.setattr(rg, "greedy_predict_group", fake_greedy)
+
+    class _Vocab:
+        think_id = 100 + N_SLOTS * 5
+
+        def flat_id(self, s, j):
+            return 100 + s * 5 + j
+
+    class _Head:
+        vocab = _Vocab()
+
+    rec = {
+        "question": "q one",
+        "steps": ["1 + 2 = 3", "no operation here", "4 * 5 = 20"],
+        "ids": [
+            [[0] * N_SLOTS, [1] * N_SLOTS],  # step 1: TWO groups, op "+"
+            [[2] * N_SLOTS],  # step 2: one group, NO op
+            [[3] * N_SLOTS],  # step 3: one group, op "*"
+        ],
+    }
+    tok = _FakeTok()
+    rows, ops = predict_history_rows(None, _Head(), [rec], tok, 100, 5)
+    assert ops == ["+", "*"]
+    assert len(rows) == 2
+    q_len = len(tok(rec["question"]).input_ids)
+    # first prediction: question + <think> only
+    assert len(prompts_seen[0]) == q_len + 1
+    # second prediction: history holds ALL 3 prior groups (2 + 1), true ids
+    assert len(prompts_seen[1]) == q_len + 1 + 3 * N_SLOTS
+    # history groups are laid out in SLOT_ORDER with natural-slot flat ids
+    first_group = prompts_seen[1][q_len + 1 : q_len + 1 + N_SLOTS]
+    assert first_group == [100 + s * 5 + 0 for s in SLOT_ORDER]
+
+
 # ── end-to-end smoke (real subprocess, no network, no push) ───────────────
 
 
@@ -235,3 +354,142 @@ def test_smoke_end_to_end_prints_manifest_with_verdict():
     assert manifest["smoke"] is True
     assert "smoke_verdict" in manifest
     assert manifest["smoke_verdict"]["verdict"] in ("PASS", "FAIL")
+
+
+# ── slow: real attach path (tiny UNTIED model, no network) ────────────────
+
+
+def _tiny_attach(base_vocab=100, K_run=6):
+    from marker.run_g7 import _load_smoke_model
+
+    return _load_smoke_model(base_vocab, K_run)
+
+
+@pytest.mark.slow
+def test_train_step_through_get_decoder_reaches_lora_and_vocab():
+    """train_step reads hidden states off pm.get_decoder() -- this pins that
+    the decoder it returns IS the LoRA-injected one (grads reach lora_*) and
+    that the GistVocab masters actually move under the optimizer. If
+    get_decoder ever bypassed PEFT, the LoRA would silently never train."""
+    import torch as t
+
+    from marker.g7 import build_sequence, sample_m
+    from marker.run_g7 import pack_batches, smoke_records, train_step
+
+    pm, vocab, tok = _tiny_attach()
+    import random as _random
+
+    rng = _random.Random(0)
+    recs = smoke_records(n=4, K=6, seed=0)
+    seqs = [
+        build_sequence(r, m, tok, vocab.base_vocab, vocab.K)
+        for r in recs
+        for m in sample_m(len(r["steps"]), rng)
+    ]
+    batches, _ = pack_batches(seqs, batch_size=4, seq_cap=512)
+    lora_named = [(n, p) for n, p in pm.named_parameters() if "lora_" in n and p.requires_grad]
+    assert lora_named, "no trainable lora parameters found"
+    head = pm.get_output_embeddings()
+    opt = t.optim.AdamW(
+        [
+            {"params": [p for _, p in lora_named], "lr": 1e-2},
+            {"params": list(vocab.parameters()), "lr": 1e-2},
+        ]
+    )
+    a_before = vocab.A.detach().clone()
+    lora_before = {n: p.detach().clone() for n, p in lora_named}
+    loss, gist_ce, text_ce = train_step(pm, head, batches[0], opt)
+    assert loss == loss and gist_ce == gist_ce and text_ce == text_ce  # finite
+    assert not t.allclose(vocab.A, a_before), "GistVocab.A did not move"
+    assert any(not t.allclose(p, lora_before[n]) for n, p in lora_named), (
+        "no LoRA parameter moved -- get_decoder() bypassed the adapter"
+    )
+
+
+@pytest.mark.slow
+def test_greedy_predict_group_cached_matches_uncached():
+    """KV-cached greedy decode must produce the exact ids the uncached
+    (full-prefix-per-token) reference does on the tiny fp32 model."""
+    import torch as t
+
+    from marker.gist_vocab import SLOT_ORDER as ORDER
+    from marker.run_g7 import greedy_predict_group
+
+    pm, vocab, tok = _tiny_attach()
+    head = pm.get_output_embeddings()
+    prompt = [5, 6, 7, vocab.think_id] + [vocab.flat_id(s, 1) for s in ORDER]
+
+    with t.no_grad():
+        cached = greedy_predict_group(pm, head, prompt, vocab.base_vocab, vocab.K)
+
+        # uncached reference: recompute the whole prefix for every token
+        rows, bias = vocab.output_rows_all()
+        ids = list(prompt)
+        ref = [0] * N_SLOTS
+        for ti in range(N_SLOTS):
+            s = ORDER[ti]
+            hidden = pm.get_decoder()(input_ids=t.tensor([ids]), use_cache=False).last_hidden_state[
+                0, -1
+            ]
+            block_rows = rows[s * vocab.K : (s + 1) * vocab.K].to(hidden.dtype)
+            block_bias = bias[s * vocab.K : (s + 1) * vocab.K].to(hidden.dtype)
+            j = int((hidden @ block_rows.T + block_bias).argmax())
+            ref[s] = j
+            ids.append(vocab.flat_id(s, j))
+    assert cached == ref
+
+
+@pytest.mark.slow
+def test_checkpoint_roundtrip_and_resume(tmp_path):
+    """_save_checkpoint -> load_g7_checkpoint restores the LoRA adapter and
+    every GistVocab parameter into a FRESH attach (mu itself is never saved
+    -- it is rebuilt from the dictionary); resume_from_repo picks the
+    highest step via injected lister/fetcher."""
+    import torch as t
+
+    from marker.run_g7 import _save_checkpoint, resume_from_repo
+
+    pm1, vocab1, _ = _tiny_attach()
+    with t.no_grad():  # make the state distinguishable from a fresh init
+        vocab1.A.add_(0.123)
+        vocab1.c_in.add_(0.05)
+        for n, p in pm1.named_parameters():
+            if "lora_A" in n:
+                p.add_(0.07)
+    ck = tmp_path / "step-0000002"
+    _save_checkpoint(ck, pm1, vocab1, {"step": 2})
+    assert not (ck / "gistvocab.safetensors").stat().st_size > 10_000_000  # mu excluded
+
+    pm2, vocab2, _ = _tiny_attach()
+    assert not t.allclose(vocab2.A, vocab1.A)
+    step = resume_from_repo(
+        pm2,
+        vocab2,
+        "fake/repo",
+        str(tmp_path),
+        lister=lambda repo: [
+            "g7_v0/step-0000001/gistvocab.safetensors",
+            "g7_v0/step-0000002/gistvocab.safetensors",
+            "unrelated.txt",
+        ],
+        fetcher=lambda repo, subdir, dest: ck,
+    )
+    assert step == 2
+    assert t.allclose(vocab2.A, vocab1.A)
+    assert t.allclose(vocab2.c_in, vocab1.c_in)
+    l1 = {n: p for n, p in pm1.named_parameters() if "lora_A" in n}
+    l2 = {n: p for n, p in pm2.named_parameters() if "lora_A" in n}
+    assert l1.keys() == l2.keys() and all(t.allclose(l2[n], l1[n]) for n in l1)
+
+
+@pytest.mark.slow
+def test_resume_from_repo_fresh_when_listing_fails_or_empty():
+    from marker.run_g7 import resume_from_repo
+
+    pm, vocab, _ = _tiny_attach()
+
+    def boom(repo):  # noqa: ANN001, ARG001
+        raise OSError("no network")
+
+    assert resume_from_repo(pm, vocab, "r", "/tmp/x", lister=boom) == 0
+    assert resume_from_repo(pm, vocab, "r", "/tmp/x", lister=lambda r: ["a.txt"]) == 0

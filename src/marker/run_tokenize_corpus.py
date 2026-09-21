@@ -2,14 +2,14 @@
 full build order: scratchpad/stage2_build_order.md): tokenizes GSM8K train +
 OpenR1 solutions into the stage-2 gist corpus -- per solution, a question, its
 reasoning steps as TEXT, and each step's [k_slots]-id group(s) (see
-gist_tokenizer.GistTokenizer) -- doc-disjoint from every eval set stage 1/3
-reads: the 200 GSM8K-test docs run_gist_dict's stage-1b eval used
-(reproduced via build_eval_set, not re-invented) and the docs the
-summary-probe run scored (results/summary_probe_manifest.json: n_docs=993,
-GSM8K TEST, >=3-step filter).
+gist_tokenizer.GistTokenizer) -- doc-disjoint from EVERY GSM8K-test
+question (all 1319, one streaming pass), a strict superset of the eval sets
+stage 1/3 read: the 200 stage-1b eval docs (reproduced via build_eval_set,
+not re-invented) and the summary-probe run's 993 >=3-step docs.
 
 Pipeline: A. load the frozen model + stage-1 dictionary + a GistTokenizer.
-B. reproduce the two eval-adjacent question sets to exclude. C. stream GSM8K
+B. build the exclusion question set (stage-1b eval docs + all GSM8K test
+questions). C. stream GSM8K
 train + OpenR1 (run_stage2._doc_texts_qa), filtering each doc through
 exclude_doc, encoding the survivors, and writing+pushing JSONL shards as each
 one fills (build_corpus) -- resumable: shards already on --out-repo are
@@ -43,7 +43,17 @@ from marker.run_render import _push_with_retry
 BASE = 64
 MAX_SPAN = 64
 
-_RECORD_KEYS = ("src", "doc_id", "question", "steps", "ids", "answer", "n_groups")
+
+def _dataset_revision(name: str) -> str | None:
+    """The dataset repo's current commit sha (manifest provenance -- the
+    streaming loaders pin nothing, so record WHAT was streamed). Best
+    effort: None when the hub call fails, never a run-killing error."""
+    try:
+        from huggingface_hub import HfApi  # noqa: PLC0415
+
+        return HfApi().dataset_info(name).sha
+    except Exception:  # noqa: BLE001 -- provenance only, run must not die on it
+        return None
 
 
 # ── A. answer extraction (per source; build order item 2's schema) ─────────
@@ -124,9 +134,14 @@ def exclude_doc(question: str, solution: str, excl: dict) -> str | None:
 
 
 def write_jsonl(records: list[dict], path) -> None:  # noqa: ANN001
+    """Write-then-rename: a kill mid-write leaves only a `.tmp` (invisible
+    to the `shard_*.jsonl` glob _tally_shards and resume read), never a
+    truncated shard that looks complete."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in records))
+    tmp.replace(path)
 
 
 def _tally_shards(shard_paths: list) -> dict:
@@ -168,6 +183,25 @@ def list_existing_shards(out_repo, out_subdir: str, lister=None) -> set:  # noqa
             if tail.startswith("shard_") and tail.endswith(".jsonl"):
                 names.add(tail)
     return names
+
+
+def complete_shards(out_dir, names, shard_size: int) -> set:  # noqa: ANN001
+    """Of the already-downloaded shard files `names`, the ones holding
+    exactly `shard_size` records -- the ONLY shards a resume may skip.
+    A shard with fewer records is the trailing partial shard of an earlier
+    (shorter or interrupted) run: build_corpus skips every doc whose target
+    shard name is in existing_shards, so treating a partial shard as
+    complete would silently DROP the docs a larger resume numbers into its
+    unfilled tail. It is re-encoded and overwritten instead."""
+    out_dir = Path(out_dir)
+    full = set()
+    for name in names:
+        p = out_dir / name
+        if p.exists():
+            n = sum(1 for line in p.read_text().splitlines() if line.strip())
+            if n == shard_size:
+                full.add(name)
+    return full
 
 
 def _download_existing_shards(out_repo: str, out_subdir: str, names, out_dir) -> None:  # noqa: ANN001
@@ -310,25 +344,23 @@ def _eval_gsm8k_full_docs(doc_keys, n_candidates: int, dataset: str, smoke: bool
     return out
 
 
-def _summary_probe_test_questions(dataset: str, smoke: bool) -> list[str]:
-    """Reproduces the docs the summary-probe run scored (results/
-    summary_probe_manifest.json: n_docs=993; run_summary_probe.main reads
-    GSM8K TEST streaming and keeps every doc with >=3 reasoning steps, no
-    length/op filtering) -- so stage 2 excludes those questions too (OpenR1
-    contains GSM8K-derived items). --smoke has no real 993-doc set to
-    reproduce offline, so it returns none; reason (b)'s own mechanics are
-    unit-tested directly against exclude_doc (test_run_tokenize_corpus.py),
-    and the smoke manifest legitimately reports 0 contaminated docs here."""
+def _gsm8k_test_questions(dataset: str, smoke: bool) -> list[str]:
+    """EVERY GSM8K test question (all 1319) -- the contamination filter
+    excludes any OpenR1 item whose normalized question matches ANY of them
+    (OpenR1 contains GSM8K-derived items, sometimes reformatted). This is a
+    strict superset of the two eval-adjacent sets (the 200 stage-1b eval
+    docs and the summary-probe run's 993 >=3-step docs are both drawn from
+    this same test split), costs one streaming pass, and removes any
+    dependence on reproducing those runs' filters exactly. --smoke has no
+    real test split to stream offline, so it returns none; reason (b)'s own
+    mechanics are unit-tested directly against exclude_doc
+    (test_run_tokenize_corpus.py)."""
     if smoke:
         return []
     from datasets import load_dataset  # noqa: PLC0415
 
     ds = load_dataset(dataset, "main", split="test", streaming=True)
-    out = []
-    for row in ds:
-        if len(split_solution_steps(row.get("answer") or "")) >= 3:
-            out.append(row.get("question") or "")
-    return out
+    return [row.get("question") or "" for row in ds]
 
 
 # ── dictionary loading (real run vs --smoke) ────────────────────────────────
@@ -435,7 +467,7 @@ def main() -> None:  # noqa: PLR0915
     # ── B. eval sets: reproduce the stage-1b 200-doc GSM8K-test eval set
     # (never re-derived by hand -- build_eval_set IS the stage-1 definition)
     # and the summary-probe's 993-doc test set, for the contamination filter
-    _eval_steps, eval_doc_keys = build_eval_set(
+    eval_steps, eval_doc_keys = build_eval_set(
         _gsm8k_docs("test", args.n_eval_gsm8k * 3, args.gsm8k_dataset, smoke=args.smoke),
         tok,
         args.max_span,
@@ -444,13 +476,14 @@ def main() -> None:  # noqa: PLR0915
     eval_full_docs = _eval_gsm8k_full_docs(
         eval_doc_keys, args.n_eval_gsm8k * 3, args.gsm8k_dataset, args.smoke
     )
-    probe_questions = _summary_probe_test_questions(args.gsm8k_dataset, args.smoke)
+    test_questions = _gsm8k_test_questions(args.gsm8k_dataset, args.smoke)
     norm_questions = {normalize_question(d["question"]) for d in eval_full_docs} | {
-        normalize_question(q) for q in probe_questions
+        normalize_question(q) for q in test_questions
     }
     print(
-        f"eval-adjacent exclusion set: {len(eval_full_docs)} stage-1b eval docs + "
-        f"{len(probe_questions)} summary-probe docs -> {len(norm_questions)} distinct normalized questions",
+        f"exclusion set: {len(eval_full_docs)} stage-1b eval docs + ALL "
+        f"{len(test_questions)} GSM8K test questions -> {len(norm_questions)} "
+        f"distinct normalized questions",
         flush=True,
     )
 
@@ -502,9 +535,13 @@ def main() -> None:  # noqa: PLR0915
     )
     if existing_shards:
         _download_existing_shards(args.out_repo, args.out_subdir, existing_shards, out_dir)
+        full = complete_shards(out_dir, existing_shards, args.shard_size)
+        partial = sorted(existing_shards - full)
+        existing_shards = full
         print(
-            f"[TOKENIZE_CORPUS] resume: {len(existing_shards)} shards already on "
-            f"{args.out_repo}/{args.out_subdir}",
+            f"[TOKENIZE_CORPUS] resume: {len(full)} complete shards already on "
+            f"{args.out_repo}/{args.out_subdir}"
+            + (f"; re-encoding partial {', '.join(partial)}" if partial else ""),
             flush=True,
         )
 
@@ -518,6 +555,17 @@ def main() -> None:  # noqa: PLR0915
         "slot_order_note": "ids stored in natural order",
         "seq_cap": args.seq_cap,
         "max_groups_per_step": args.max_groups_per_step,
+        "shard_size": args.shard_size,
+        "n_gsm8k": args.n_gsm8k,
+        "n_openr1": args.n_openr1,
+        "datasets": {"gsm8k": args.gsm8k_dataset, "openr1": args.openr1_dataset},
+        "dataset_revisions": None
+        if args.smoke
+        else {
+            "gsm8k": _dataset_revision(args.gsm8k_dataset),
+            "openr1": _dataset_revision(args.openr1_dataset),
+        },
+        "n_excluded_questions": len(norm_questions),
     }
 
     def _push_snapshot() -> None:
@@ -546,8 +594,15 @@ def main() -> None:  # noqa: PLR0915
     }
 
     # ── D. eval_gsm8k_test.jsonl: the 200 eval docs' WHOLE solutions ────────
+    # build_eval_set selects docs in STREAM order and _eval_gsm8k_full_docs
+    # re-walks the same window in the same order, so entry i of each list is
+    # the same doc -- eval_step_index marks WHICH step of the whole solution
+    # is the stage-1b scored one. `.index` finds the first occurrence, which
+    # IS the selected one: build_eval_set takes the first passing step, and
+    # an identical earlier text would have passed identically.
     eval_records = []
-    for i, doc in enumerate(eval_full_docs):
+    for i, (doc, step) in enumerate(zip(eval_full_docs, eval_steps, strict=True)):
+        eval_step_index = doc["steps"].index(step.text)
         ids = [gtok.encode_step(s) for s in doc["steps"]]
         eval_records.append(
             {
@@ -558,6 +613,7 @@ def main() -> None:  # noqa: PLR0915
                 "ids": ids,
                 "answer": extract_answer("gsm8k", doc["answer_raw"]),
                 "n_groups": sum(len(g) for g in ids),
+                "eval_step_index": eval_step_index,
             }
         )
     write_jsonl(eval_records, out_dir / "eval_gsm8k_test.jsonl")

@@ -35,12 +35,25 @@ def _clause_split(sentence: str) -> list[str]:
 
 
 def _hard_split(tok, text: str, max_span: int) -> list[str]:  # noqa: ANN001
-    """Last resort: cut at exactly max_span TOKENS (not a boundary a human
-    would recognize) and decode each chunk back to text -- for a clause that
-    still has no punctuation to split on."""
+    """Last resort: cut at max_span TOKENS (not a boundary a human would
+    recognize) and decode each chunk back to text -- for a clause that still
+    has no punctuation to split on. decode->re-encode is NOT length-stable
+    for byte-level BPE (a cut mid character cluster can re-tokenize LONGER),
+    and encode_canonical hard-asserts on an over-length piece -- so each
+    chunk is shrunk until its DECODED TEXT re-tokenizes within max_span."""
     ids = tok(text, add_special_tokens=False).input_ids
-    chunks = [ids[i : i + max_span] for i in range(0, len(ids), max_span)]
-    return [tok.decode(c, skip_special_tokens=True).strip() for c in chunks]
+    pieces: list[str] = []
+    start = 0
+    while start < len(ids):
+        take = min(max_span, len(ids) - start)
+        piece = tok.decode(ids[start : start + take], skip_special_tokens=True).strip()
+        while take > 1 and _token_len(tok, piece) > max_span:
+            take -= 1
+            piece = tok.decode(ids[start : start + take], skip_special_tokens=True).strip()
+        start += take
+        if piece:  # a chunk of pure whitespace/special bytes decodes to ""
+            pieces.append(piece)
+    return pieces
 
 
 def split_long_step(text: str, tok, max_span: int) -> list[str]:  # noqa: ANN001

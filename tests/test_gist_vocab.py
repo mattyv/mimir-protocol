@@ -123,18 +123,21 @@ def test_grad_flows_to_every_trainable_block():
         g = getattr(v, name).grad
         assert g is not None, f"{name} got no grad"
         assert g.abs().sum() > 0, f"{name} grad is all-zero"
-    # P/Q and U/V are both LoRA-style zero-init pairs (correction = basis @
-    # (zero_code @ mu-or-nothing); e.g. corr = P @ (Q @ mu) with Q zero-init,
-    # delta_in = U @ c_in with c_in zero-init). At THIS very first backward,
-    # the RANDOM half of each pair (P, U, V) gets a genuinely zero gradient
-    # -- dL/dP = grad_corr @ (Q@mu)^T = 0 when Q=0, same reasoning for U/V
-    # against zero c_in/c_out (identical to why ordinary LoRA's A-side sees
-    # no gradient at init when B is zero-init). Only the zero-init half (Q)
-    # sees signal here; P/U/V are merely confirmed REACHABLE (grad exists,
-    # value may be 0) -- test_grad_flows_to_P_and_U_V_once_codes_are_nonzero
-    # below pins that they train once the codes move off zero.
-    assert v.Q.grad is not None and v.Q.grad.abs().sum() > 0
-    for name in ["P", "U", "V"]:
+    # P/Q, P_out/Q_out and U/V are LoRA-style zero-init pairs (correction =
+    # basis @ (zero_code @ mu-or-nothing); e.g. corr = P @ (Q @ mu) with Q
+    # zero-init, delta_in = U @ c_in with c_in zero-init). At THIS very first
+    # backward, the RANDOM half of each pair (P, P_out, U, V) gets a
+    # genuinely zero gradient -- dL/dP = grad_corr @ (Q@mu)^T = 0 when Q=0,
+    # same reasoning for the others (identical to why ordinary LoRA's A-side
+    # sees no gradient at init when B is zero-init). Only the zero-init
+    # halves (Q, Q_out) see signal here; the random halves are merely
+    # confirmed REACHABLE (grad exists, value may be 0) --
+    # test_grad_flows_to_p_and_u_v_once_codes_are_nonzero below pins that
+    # they train once the codes move off zero.
+    for name in ["Q", "Q_out"]:
+        g = getattr(v, name).grad
+        assert g is not None and g.abs().sum() > 0, f"{name} got no signal at first backward"
+    for name in ["P", "P_out", "U", "V"]:
         assert getattr(v, name).grad is not None, f"{name} unreachable by backward"
 
 
@@ -144,14 +147,26 @@ def test_grad_flows_to_p_and_u_v_once_codes_are_nonzero():
     v = _small_vocab()
     with torch.no_grad():
         v.Q.add_(0.05)
+        v.Q_out.add_(0.05)
         v.c_in.add_(0.05)
         v.c_out.add_(0.05)
     flat_ids = torch.tensor([v.flat_id(0, 0), v.flat_id(3, 2)])
     out_rows, _ = v.output_rows_all()
     (v.input_rows(flat_ids).sum() + out_rows.sum()).backward()
-    for name in ["P", "U", "V"]:
+    for name in ["P", "P_out", "U", "V"]:
         g = getattr(v, name).grad
         assert g is not None and g.abs().sum() > 0, f"{name} grad still zero"
+
+
+@pytest.mark.slow
+def test_param_count_at_real_dims_is_about_37m():
+    # The design doc budgets ~37M fp32 for GistVocab at the real geometry
+    # (d=3584, K=4096) -- and that budget only closes with the per-slot
+    # correction on BOTH A and B (33.4M without P_out/Q_out).
+    mu = torch.zeros(N_SLOTS, 4096, 3584)
+    v = GistVocab(mu, d_model=3584, d_out=3584, base_vocab=152064)
+    n = sum(p.numel() for p in v.parameters())
+    assert 36_000_000 < n < 38_000_000, f"param count {n} outside the ~37M budget"
 
 
 # ── model-touching tests (tiny UNTIED Qwen2, no network) ────────────────────

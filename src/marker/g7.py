@@ -169,7 +169,9 @@ def two_gather_loss(
     n_text = int(text_mask.sum())
     text_ce = zero
     if n_text:
-        text_logits = head.base_head(hidden[text_mask])
+        # .float(): CE in bf16 over a 150k-wide (text) or 4096-wide (gist)
+        # softmax adds ~1e-2 noise -- cheap to do the log-softmax in fp32.
+        text_logits = head.base_head(hidden[text_mask]).float()
         text_ce = func.cross_entropy(text_logits, targets[text_mask])
 
     n_gist = int(gist_mask.sum())
@@ -185,7 +187,7 @@ def two_gather_loss(
             sel = slots == s
             block_rows = rows[s * vocab.K : (s + 1) * vocab.K].to(gist_hidden.dtype)
             block_bias = bias[s * vocab.K : (s + 1) * vocab.K].to(gist_hidden.dtype)
-            block_logits = gist_hidden[sel] @ block_rows.T + block_bias
+            block_logits = (gist_hidden[sel] @ block_rows.T + block_bias).float()
             local_target = gist_targets[sel] - (vocab.base_vocab + s * vocab.K)
             losses.append(func.cross_entropy(block_logits, local_target, reduction="sum"))
         gist_ce = torch.stack(losses).sum() / n_gist

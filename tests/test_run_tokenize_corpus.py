@@ -246,6 +246,43 @@ def test_build_corpus_resume_skips_existing_shards_and_continues_numbering(tmp_p
     assert tally["docs"] == 7  # shards 0,1 untouched (still their old 4 docs) + 3 new
 
 
+def test_complete_shards_partial_trailing_shard_is_not_complete(tmp_path):
+    """The resume data-loss guard: a shard with fewer than shard_size records
+    (the trailing shard of a shorter earlier run) must NOT be skippable --
+    build_corpus drops every doc numbered into a skipped shard, so treating
+    a partial shard as complete silently loses the docs a larger resume
+    numbers into its unfilled tail."""
+    from marker.run_tokenize_corpus import complete_shards, write_jsonl
+
+    rec = {"steps": ["a"], "ids": [[1]], "n_groups": 1}
+    write_jsonl([rec, rec], tmp_path / "shard_0000.jsonl")  # full
+    write_jsonl([rec], tmp_path / "shard_0001.jsonl")  # partial trailing
+    names = {"shard_0000.jsonl", "shard_0001.jsonl", "shard_0002.jsonl"}  # 0002 never downloaded
+    assert complete_shards(tmp_path, names, shard_size=2) == {"shard_0000.jsonl"}
+
+
+def test_resume_after_partial_shard_loses_no_docs(tmp_path):
+    """End to end over build_corpus: run 1 stops with a partial trailing
+    shard; run 2 (more docs, existing_shards filtered through
+    complete_shards) must re-encode the partial shard so its tail fills --
+    every doc lands in exactly one shard, none lost."""
+    from marker.run_tokenize_corpus import _tally_shards, build_corpus, complete_shards
+
+    out_dir = tmp_path / "shards"
+    docs = [f"step a{i}\nstep b{i}" for i in range(3)]  # run 1: shard 0 full, shard 1 partial
+    build_corpus(_sources(docs), _excl(), _SpyGistTokenizer(), 2, out_dir, existing_shards=set())
+
+    more_docs = docs + [f"step a{i}\nstep b{i}" for i in range(3, 5)]  # run 2: 5 docs
+    on_hf = {"shard_0000.jsonl", "shard_0001.jsonl"}
+    existing = complete_shards(out_dir, on_hf, shard_size=2)
+    assert existing == {"shard_0000.jsonl"}
+    gtok2 = _SpyGistTokenizer()
+    build_corpus(_sources(more_docs), _excl(), gtok2, 2, out_dir, existing_shards=existing)
+    assert gtok2.calls == 6  # docs 2,3,4 re/newly encoded; docs 0,1 skipped
+    tally = _tally_shards(sorted(out_dir.glob("shard_*.jsonl")))
+    assert tally["docs"] == 5  # nothing lost: 2 + 2 + 1 across shards 0,1,2
+
+
 # ── end-to-end smoke ─────────────────────────────────────────────────────────
 
 
@@ -282,7 +319,17 @@ def test_smoke_manifest_runs_full_pipeline_and_writes_shards():
     assert len(shards) >= 1
     (eval_path,) = shard_dir.glob("eval_gsm8k_test.jsonl")
     rec = json.loads(eval_path.read_text().splitlines()[0])
-    assert set(rec) == {"src", "doc_id", "question", "steps", "ids", "answer", "n_groups"}
+    assert set(rec) == {
+        "src",
+        "doc_id",
+        "question",
+        "steps",
+        "ids",
+        "answer",
+        "n_groups",
+        "eval_step_index",
+    }
+    assert 0 <= rec["eval_step_index"] < len(rec["steps"])
     widths = {len(group) for step_groups in [rec["ids"]] for group in step_groups}
     assert len(widths) == 1  # every group the same k_slots width
 

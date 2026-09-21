@@ -17,24 +17,20 @@ Flat id layout: flat_id(s, j) = base_vocab + s*K + j (s = NATURAL slot index,
 (config.vocab_size) -- never hardcoded, so the same code runs on the tiny
 smoke model (vocab_size=200) and the real 7B (152,064).
 
-GistVocab per-id row parameterization (spec build order, Sept 2026):
+GistVocab per-id row parameterization (design doc "STAGES 2+3 DESIGN v3"):
   input_row(s, j)  = A'_s . mu[s,j] + U_s . c_in[s,j]     (A'_s = A + P_s Q_s)
-  output_row(s, j) = B   . mu[s,j] + V_s . c_out[s,j] + bias[s,j]
+  output_row(s, j) = B'_s . mu[s,j] + V_s . c_out[s,j] + bias[s,j]
+                                                      (B'_s = B + Pout_s Qout_s)
 A, B are SHARED across slots (init as a scaled identity so a fresh mu starts
-roughly embedding-scaled); P_s/Q_s is a per-slot rank-`r_slot` correction on
-the INPUT side only (Q zero-init, so it starts as a no-op); U_s/V_s are
-per-slot rank-`r_id` bases turning a small per-id code (c_in/c_out, zero-init)
-into a full-width delta, UNTIED between input and output (separate matrices,
-separate codes) per "STAGE 1b RESULT"'s slot-7/slot-3 blur finding.
-
-Resolved ambiguity (flagged for review): the build order lists one P_s/Q_s
-pair per slot, not two -- read here as correcting A only (the design doc's
-"output rows keep μ" note reads as a deliberate output-side simplicity: rare
-ids stay trainable only via the SHARED B and their own per-id delta, no extra
-per-slot output machinery). If Fable's intent was a *separate* per-slot
-correction on B as well, that is a small, additive change (mirror
-`P`/`Q`/`A'` as `Pout`/`Qout`/`B'`) -- flagged in the hand-back, not guessed
-at further here.
+roughly embedding-scaled); P_s/Q_s and Pout_s/Qout_s are per-slot
+rank-`r_slot` corrections on the input resp. output side (Q/Qout zero-init,
+so each starts as a no-op -- the design doc's formula names BOTH A'_s and
+B'_s, and the ~37M param budget only closes with both); U_s/V_s are per-slot
+rank-`r_id` bases turning a small per-id code (c_in/c_out, zero-init) into a
+full-width delta, UNTIED between input and output (separate matrices,
+separate codes) per "STAGE 1b RESULT"'s slot-7/slot-3 blur finding. "Output
+rows keep μ" holds throughout: μ is a frozen buffer, only the projections
+around it train.
 """
 
 from __future__ import annotations
@@ -113,6 +109,8 @@ class GistVocab(nn.Module):
         self.B = nn.Parameter(gamma_out * torch.eye(d_out, d_mu))
         self.P = nn.Parameter(torch.randn(n_slots, d_model, r_slot) * 0.01)
         self.Q = nn.Parameter(torch.zeros(n_slots, r_slot, d_mu))
+        self.P_out = nn.Parameter(torch.randn(n_slots, d_out, r_slot) * 0.01)
+        self.Q_out = nn.Parameter(torch.zeros(n_slots, r_slot, d_mu))
         self.U = nn.Parameter(torch.randn(n_slots, d_model, r_id) * 0.01)
         self.V = nn.Parameter(torch.randn(n_slots, d_out, r_id) * 0.01)
         self.c_in = nn.Parameter(torch.zeros(n_slots, K, r_id))
@@ -165,8 +163,11 @@ class GistVocab(nn.Module):
         for every id every forward pass). ([8K+2, d_out], [8K+2])."""
         mu_flat = self.mu.reshape(self.n_slots * self.K, self.d_mu)
         base = mu_flat @ self.B.T  # [n_slots*K, d_out]
+        # per-slot rank-r_slot correction on B (B'_s = B + Pout_s Qout_s)
+        tmp = torch.einsum("srd,skd->skr", self.Q_out, self.mu)  # [n_slots, K, r_slot]
+        corr = torch.einsum("sdr,skr->skd", self.P_out, tmp)  # [n_slots, K, d_out]
         delta = torch.einsum("sdr,skr->skd", self.V, self.c_out)  # [n_slots, K, d_out]
-        rows = base + delta.reshape(self.n_slots * self.K, self.d_out)
+        rows = base + (corr + delta).reshape(self.n_slots * self.K, self.d_out)
         bias = self.bias.reshape(-1)
         rows = torch.cat([rows, self.think_out.unsqueeze(0), self.commit_out.unsqueeze(0)], dim=0)
         bias = torch.cat([bias, self.think_commit_bias], dim=0)
@@ -258,6 +259,12 @@ def attach_g7(
         gamma_in=gamma_in,
         gamma_out=gamma_out,
     )
+    # The vocab must live where the base embedding lives (cuda:0 under
+    # device_map={"": 0}): its masters stay fp32, but indexing self.mu with a
+    # cuda `slot` tensor -- or matmul-ing cuda hidden states against cpu rows
+    # -- is a device-mismatch crash the all-CPU tiny-model tests can never
+    # see. ~37M fp32 params + the mu buffer on GPU is well under 1 GB.
+    vocab = vocab.to(base_embed.weight.device)
     base_model.set_input_embeddings(GistEmbedWrapper(base_embed, vocab))
     base_model.set_output_embeddings(GistHeadWrapper(base_head, vocab))
     base_model.config.vocab_size = base_vocab + vocab.n_slots * vocab.K + 2
