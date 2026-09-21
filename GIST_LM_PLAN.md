@@ -131,3 +131,27 @@ params) to input and output rows. (2) Emit slots in descending informativeness [
 rendered-margin bars must be no-ledger vs a no-ledger native (everything in stage 1 is ledger-on).
 (5) Varied fresh set for the stage-3 OOD cell. Odds: stage 3 holds ~50% (discretization risk
 down, soft-token-read risk now concrete); stage 4 ~35-40%.
+
+## STAGE 1b RESULT (2026-09-21): reader retrained on snapped KV — R_gsm8k 0.67 → 0.78, bar 0.8 missed by 0.02 (n=200, CI ±0.06)
+
+Two launches (~$0.60 total): training run (3000 steps, 8000 pairs 50/50 native/snapped, warm-start
+render_adapter_oneform; snapped loss 0.67/token) whose gate 0 (native ≥ 0.90) read 0.88 and
+skipped the eval — a gate written for placement bugs, not for a retrained reader (fixed:
+--gate0-soft); then an eval-only rerun with the pushed reader `render_adapter_snapped/`.
+Manifest: results/gist_dict_manifest_1b_snapped_reader.json.
+
+| kv_K4096, reader = | native gsm8k | quantized gsm8k | wrong-doc floor | **R gsm8k** | quantized fresh | R fresh |
+|---|---|---|---|---|---|---|
+| render_adapter_oneform (stage 1) | 0.93 | 0.73 | 0.32 | 0.67 | 0.94 | 0.91 |
+| render_adapter_snapped (1b) | 0.88 | 0.725 | **0.185** | **0.777** | 0.82 | 0.76 |
+op-from-IDs 0.91 (dictionary property, unchanged). Quantized F1 0.77 vs native 0.94.
+
+Read (pending Fable): the retrained reader did NOT raise the quantized score (0.725 vs 0.73); it
+raised the margin by LOWERING the wrong-doc floor 0.32 → 0.185 — it stopped reconstructing
+generic steps from the ledger alone and now depends on the KV. Native regressed 0.93 → 0.88 and
+the single-template fresh set fell 0.94 → 0.82. Net: R 0.777 vs bar 0.80, CI ≈ ±0.06 at n=200 —
+undecidable at this n, as predicted. The quantized ceiling (~0.73 exact relations on real steps
+with numbers handed) looks like a property of the CODES, not the reader.
+mu_separability (kv_K4096, per-slot NN cosine among μ): median 0.93-0.99; slots 3 and 7 have
+65-70% of entries within 0.98 of a neighbour → the per-id trainable delta is warranted for G7
+(slot 7 carries the operation).
