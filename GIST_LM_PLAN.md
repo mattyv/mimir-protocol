@@ -155,3 +155,25 @@ with numbers handed) looks like a property of the CODES, not the reader.
 mu_separability (kv_K4096, per-slot NN cosine among μ): median 0.93-0.99; slots 3 and 7 have
 65-70% of entries within 0.98 of a neighbour → the per-id trainable delta is warranted for G7
 (slot 7 carries the operation).
+
+**Fable ruling on 1b (2026-09-21): PROCEED to stage 2/3; bar recorded as missed-not-passed.**
+- The floor drop is the good kind: wrong-doc NLL (2.79) is now worse than random-ids NLL (2.54)
+  — a coherent wrong note misleads the reader, noise is partly ignored → KV dependence.
+- The ~0.73 quantized ceiling is the CODES, four convergent lines: quantized NLL fell 1.157 →
+  0.864 (−25%) while rel_exact stayed flat; snapped TRAIN loss floors at 0.67/token vs 0.2 native
+  (information destroyed upstream, not underfitting); quantized F1 0.77 vs native 0.94 same reader;
+  op-from-IDs 0.91 regardless of reader. Honesty: against the stage-1 native ceiling (0.93) R =
+  0.725 — report the band 0.72-0.78.
+- Why not re-measure ($0.5, n=700): ~even odds it still straddles 0.80, and no decision turns on
+  it. Why not VQ-VAE now ($10): it fixes the FALLBACK path before stage 3 says it's needed; its
+  trigger is now "stage-3 rendered-margin failure that traces to fidelity, not ID prediction".
+  Cheap slot-7 fixes target the wrong slot (the op is already saturated); if the ceiling is ever
+  chased, first localize it with a ~$0.3 leave-one-slot-native eval.
+- TWO readers, both frozen, $0: `render_adapter_oneform` → memory lane (native gists);
+  `render_adapter_snapped` → code path (IDs). They never share a forward pass.
+- G7 spec additions: per-id low-rank delta r=32, zero-init, UNTIED between input and output rows
+  (~4.2M params); stage-3 eval reports per-slot ID accuracy and a slot-7 confusion split
+  within-0.98-neighbourhood vs outside (separates "embedding blur" from "can't predict the op");
+  build the varied fresh set (3-4 sentence shapes) BEFORE stage 3 — registered in stage 1, not yet done.
+- Odds: stage 3 ~50-55% (op robust at 0.91, floor artefact resolved; new concrete risk = blurry
+  op-slot embeddings, mitigated by the delta). Next spend: stage 2 tokenize + stage 3 G7, ~$3-8.
