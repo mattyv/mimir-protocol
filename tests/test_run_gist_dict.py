@@ -739,6 +739,9 @@ def test_smoke_train_reader_check_mu_end_to_end():
     assert manifest["reader_verdict"] in {"PASS", "FAIL"}
     assert manifest["reader_subdir"] == "render_adapter_snapped"
     assert manifest["reader_trained_steps"] == 20
+    assert manifest["reader_n_pairs"] == 20  # spec: subdir/steps/PAIRS recorded
+    assert manifest["R_gsm8k_prev"] == 0.6721  # the old reader's bar number
+    assert "GRAD_OK" in proc.stdout  # step-0 gradient guard fired and passed
     assert len(manifest["mu_separability"]) == manifest["geometry"]["k_slots"]
     for cell in manifest["mu_separability"]:
         assert set(cell) == {"median", "p90", "frac_gt_0_98"}

@@ -23,6 +23,11 @@ REPO="${REPO:-mattyvee/mimir-artifacts}"       # stage-1 adapter + render_adapte
 DATASET="${DATASET:-openai/gsm8k}"
 NFIT="${NFIT:-40000}"                          # fit-set steps (GSM8K train + OpenR1), doc-disjoint from eval
 NEVAL="${NEVAL:-200}"                          # GSM8K TEST eval steps (Wilson CI ~±0.04 at p≈0.9)
+# fresh + fresh_v2 set size: 100 under TRAIN_READER (stage 1b's wall-clock
+# cut -- neither fresh set is load-bearing for reader_verdict, and 150 would
+# add ~300 generations ≈ 15m to a 240m budget), 150 otherwise (= the python
+# default, so base runs are unchanged).
+NFRESH="${NFRESH:-$([ -n "${TRAIN_READER:-}" ] && echo 100 || echo 150)}"
 KS="${KS:-256,1024,4096}"                      # comma-separated K for the plain kv_K* configs
 GPU="${GPU:-RTX_3090}"
 # Wall-clock budget (node 51724858 measured): 40k fit encodes ~60-80m on the
@@ -33,8 +38,12 @@ GPU="${GPU:-RTX_3090}"
 # is pushed the moment it is built and the shards right after the encode, so
 # a timeout or OOM can only cost work not yet done -- never the encode.
 # STAGE 1b (TRAIN_READER=1, on top of LOAD_SHARDS=1 LOAD_DICTS=1 -- no encode,
-# no k-means): setup + 18GB shard download ~25m, reader training 3000 steps
-# ~70m, eval (native + 1 config) ~40m, --check-mu diagnostics ~10m -> ~2.5h.
+# no k-means): setup + 18GB shard download ~25-30m, pair build (8000 mmap row
+# reads + detokenize) ~10m, reader training 3000 steps ~70m, weights push
+# ~5m, eval ~50-60m at NFRESH=100 (native 400 gens + kv_K4096 quantized/
+# wrong-doc 800 gens + 400 NLL-only, all at max_new=64; the per-config CPU
+# diagnostics are cut to kv_K4096 only under --train-reader), --check-mu ~1m
+# -> ~2.7-3h against the 240m cap. NFRESH=150 adds ~15m -- don't.
 TIMEOUT="${TIMEOUT:-$([ -n "${TRAIN_READER:-}" ] && echo 240m || echo 330m)}"
 # LOAD_SHARDS=1 resumes from the pushed fit-shard cache on ${REPO} (skips the
 # encode; requires a previous run to have gotten past the shard push).
@@ -122,7 +131,7 @@ timeout 1200 python -c "from huggingface_hub import snapshot_download; snapshot_
 echo "=== GIST DICTIONARY FIDELITY (dataset=${DATASET} n-fit=${NFIT} n-eval=${NEVAL} ks=${KS} train_reader=${TRAIN_READER:-0}) ==="
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_dict \
   --model-name "${MODEL}" --repo "${REPO}" --out-repo "${REPO}" \
-  --dataset "${DATASET}" --n-fit "${NFIT}" --n-eval "${NEVAL}" --ks "${KS}" \
+  --dataset "${DATASET}" --n-fit "${NFIT}" --n-eval "${NEVAL}" --n-fresh "${NFRESH}" --ks "${KS}" \
   --push-shards ${RESUME_FLAG} ${READER_FLAG} ${EVAL_CONFIGS_FLAG} \
   --eval --diagnose 2>&1 | tee /root/gist_dict.log
 echo "GIST_DICT_RC=\${PIPESTATUS[0]}" | tee -a /root/gist_dict.log

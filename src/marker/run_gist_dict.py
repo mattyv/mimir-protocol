@@ -331,6 +331,14 @@ def train_reader(
             loss = ledger_render_nll(pm, kv, pair.cs, ledger, tgt)
             opt.zero_grad()
             loss.backward()
+            if step == 0:
+                # run_render's GRAD FAIL guard, verbatim intent: the 4-bit
+                # quantized GPU path is unexercised by CPU tests -- a silent
+                # no-grad would "train" nothing for 3000 steps and fake a
+                # reader result. Fail LOUDLY at step 0 instead.
+                ok = any(p.grad is not None and p.grad.abs().sum() > 0 for _, p in render_params)
+                assert ok, "GRAD FAIL: no gradient reached the render LoRA (reader path)"
+                print("GRAD_OK (reader gradients flowing)", flush=True)
             torch.nn.utils.clip_grad_norm_([p for _, p in render_params], 1.0)
             opt.step()
             running[dialect][0] += float(loss.item())
@@ -1523,6 +1531,15 @@ def main() -> None:  # noqa: PLR0915
             f"{sorted(dicts)} -- pick a config that actually built"
         )
         assert render_params, "--train-reader needs a trainable render adapter"
+        # row-alignment guard: fit_ids.pt (--load-dicts) and the shard cache
+        # (--load-shards) are pushed by the same run, but nothing else ties
+        # them together -- a stale fit_ids from a different-NFIT run would
+        # silently pair step i's text with another step's snapped ids
+        assert fit_ids[args.reader_dict].shape[0] == len(fit_items), (
+            f"fit_ids[{args.reader_dict!r}] has {fit_ids[args.reader_dict].shape[0]} rows "
+            f"but the shard cache's fit_index has {len(fit_items)} steps -- "
+            "stale dict/shard caches from different runs"
+        )
         kv_dtype = probe_kv.keys[0].dtype  # the reader attends in THIS dtype
         pair_idx = pick_train_pair_indices(len(fit_items), args.n_train_pairs, args.seed)
         pairs = build_reader_pairs(
@@ -1545,9 +1562,14 @@ def main() -> None:  # noqa: PLR0915
             pm, tok, pairs, render_params, args.reader_steps, lr=args.reader_lr, seed=args.seed
         )
         pm.set_adapter("default")
+        del pairs  # ~7 GB of host-RAM KV at the real 8000-pair scale
         save_and_push_reader(pm, args.cache_dir, args.reader_out_subdir, args.out_repo, args.smoke)
         manifest["reader_subdir"] = args.reader_out_subdir
         manifest["reader_trained_steps"] = args.reader_steps
+        manifest["reader_n_pairs"] = len(pair_idx)
+        # the OLD reader's bar-defining number, for side-by-side reading
+        # (results/gist_dict_manifest.json, node 51724858)
+        manifest["R_gsm8k_prev"] = 0.6721
         print(
             f"[GISTDICT PARTIAL] {json.dumps(manifest, default=str)}", flush=True
         )  # reader trained
@@ -1572,6 +1594,16 @@ def main() -> None:  # noqa: PLR0915
             print(f"[GISTDICT] eval-configs skipped (build failed): {sorted(skipped)}", flush=True)
         eval_names &= set(all_names)
     manifest["eval_configs"] = sorted(eval_names)
+    # a --train-reader launch re-measures ONE config against the bar; the
+    # other configs' CPU diagnostics (tokenize_eval's per-step cdist against
+    # every codebook + full-shard reconstruction cosines + readout probes)
+    # replay ~25 min of stage-1 numbers already recorded in
+    # results/gist_dict_manifest.json for zero new information -- and the
+    # 240m stage-1b budget is tight. --smoke keeps every config
+    # (eval_configs='all' -> diag_names=all), so the full path stays tested.
+    diag_names = (
+        (eval_names | {args.reader_dict}) & set(all_names) if args.train_reader else set(all_names)
+    )
 
     # ── eval-step canonical encodes + per-config ids (needed by BOTH the
     # GPU eval and the CPU diagnostics) ─────────────────────────────────────
@@ -1591,13 +1623,15 @@ def main() -> None:  # noqa: PLR0915
                 for s in eval_fresh_v2
             ]
         for name, dict_ in dicts.items():
+            if name not in diag_names:
+                continue
             eval_ids_cache[name] = {
                 "gsm8k": tokenize_eval(natives["gsm8k"], dict_),
                 "fresh": tokenize_eval(natives["fresh"], dict_),
             }
             if eval_fresh_v2:
                 eval_ids_cache[name]["fresh_v2"] = tokenize_eval(natives["fresh_v2"], dict_)
-        print("eval steps encoded + tokenized under every config", flush=True)
+        print(f"eval steps encoded + tokenized ({sorted(eval_ids_cache)})", flush=True)
 
     gate0_ok = True
     if args.eval:
@@ -1742,6 +1776,8 @@ def main() -> None:  # noqa: PLR0915
         probe_docs = [fit_items[i][0] for i in probe_idx.tolist()]
 
         for name, dict_ in dicts.items():
+            if name not in diag_names:
+                continue
             K = _dict_k(dict_)
             cell = manifest["configs"].setdefault(name, {})
             cell.setdefault("kind", "whole" if dict_["kind"] == "whole" else "per_slot")
