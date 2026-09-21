@@ -177,3 +177,42 @@ mu_separability (kv_K4096, per-slot NN cosine among μ): median 0.93-0.99; slots
   build the varied fresh set (3-4 sentence shapes) BEFORE stage 3 — registered in stage 1, not yet done.
 - Odds: stage 3 ~50-55% (op robust at 0.91, floor artefact resolved; new concrete risk = blurry
   op-slot embeddings, mitigated by the delta). Next spend: stage 2 tokenize + stage 3 G7, ~$3-8.
+
+## STAGES 2+3 DESIGN v3 (2026-09-21, Fable-vetted) — G7 wiring, layout, corpus, gates
+Full build orders: scratchpad specs (g7_stage23_spec.md + Fable's ruling); summary here.
+- **Vocab wiring (option A′):** NO `resize_token_embeddings`, NO in-place row writes (invisible to
+  autograd — the vocabulary side would silently never train). `GistEmbedWrapper`/`GistHeadWrapper`
+  installed via set_input/output_embeddings BEFORE `get_peft_model`; ids ≥ 152,064 are computed on
+  the fly from `GistVocab`; head = cat(base lm_head, h·rows^T + bias); config.vocab_size=184,834;
+  standard HF `generate` works. Flat id = 152,064 + slot·4096 + j; `<think>`=184,832, `<commit>`=184,833.
+- **GistVocab (~37M fp32):** input row = A'_s μ + U_s c^in, output row = B'_s μ + V_s c^out + per-id
+  bias; A, B SHARED (3584², init γ·I with γ = emb_std/μ_std resp. lm_head_std/μ_std) + per-slot
+  rank-64 correction (P random, Q zero); per-id deltas rank-32 UNTIED (U/V random, c zero); output
+  rows keep μ (rare ids stay trained via sharing). Masters fp32, rows cast to bf16 in the wrapper.
+- **Layout:** `[question] <think> g^(1)..g^(m) <commit> [step m text] <eos>`; ONE think, ONE commit;
+  two sequences per solution per epoch: m=n and a random m∈[1,n-1]. NEVER interleave text between
+  thought groups (the model would read text instead of carrying meaning in gist tokens — scores
+  teacher-forced, collapses free-run). Losses: CE on gist positions (slot-block masked, two-gather,
+  never full 184k-wide CE) + CE on post-commit text incl. <eos>; none on question/control tokens.
+  Slot order [7,1,0,3,6,2,4,5] for BOTH layout and generation; corpus stores NATURAL order; one
+  shared `slot_for_position` used by loss and LogitsProcessor.
+- **Corpus v0:** 20k solutions (7.5k GSM8K train + 12.5k OpenR1), ~170k encodes, ~5 h, ~$1.5.
+  Steps >64 tokens: split sentence → clause → hard-64, never drop; nested schema
+  `ids: [[[8] per group] per step]`; commit target = whole step text; >4 groups per step → drop doc
+  (counted). Sequence cap 512. Contamination filter: normalized-question exact match vs the 200
+  GSM8K-test eval problems. Stage 2 is shard-append resumable so 20k → 57k needs no rework.
+  Pre-registered amendment: op-from-predicted in [0.50, 0.60) AND train gist-CE still falling →
+  ONE retry at 57k; < 0.50 → stop, no retry.
+- **Stage-3 smoke (~$1, 4090, 2k solutions, 1 epoch, eval blocks 1+2):** the spend gate for the
+  full run — tests the untested 70% risk "can the 7B read A·μ soft tokens". Pass = train gist-CE
+  < 6.5 (ln 4096 = 8.32) AND below the bigram baseline; next-id accuracy > bigram; op-from-predicted
+  > majority (0.45); generate output schedule-conformant. CE stuck ≈ 8.3 → debug, no full spend.
+- **Full stage 3 (~$4-5, 4090, 2 epochs):** gates as registered — STOP < 0.60; GREEN ≥ 0.63 AND
+  ≥ 0.49; render bar no-ledger vs no-ledger native with THREE arms (G7-commit on predicted ids,
+  G7-commit on TRUE ids, snapped reader on true ids); copy-previous-step baseline must sit
+  meaningfully below op-from-predicted; free-run greedy (10 steps, step-3 op) + one sampled arm
+  for usage entropy; NB refit with k_sizes=[4096]*8 (assert); reader/text decodes slice logits
+  [:152064]; eval ids come from the stage-2 cache (settings cross-asserted); encoder adapter never
+  loaded in stage 3; tiny smoke model must be UNTIED.
+- Budget ask: ~$8-9 (v0 path). Launchers keep `cpu_ram>=32` (the search filter is in GB —
+  verified empirically twice; Fable's "MB" note is the offer field, not the filter).
