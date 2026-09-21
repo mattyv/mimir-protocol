@@ -966,6 +966,16 @@ def eval_quantized_conditions(
     }
 
 
+def should_run_config_eval(gate0_ok: bool, smoke: bool, soft: bool) -> bool:
+    """Gate 0 exists to catch a PLACEMENT bug (native unreadable at the
+    canonical frame). For a RETRAINED reader a few points of native regression
+    (node 51833335: 0.93 -> 0.88 after snapped training) is not that bug, and
+    skipping the per-config eval there threw away the measurement the run was
+    for. --gate0-soft (set by the launcher under TRAIN_READER / RENDERSUB)
+    records the failure and still runs the eval; plain runs keep the hard skip."""
+    return gate0_ok or smoke or soft
+
+
 def gate0_pass(native_gsm8k: dict, native_fresh: dict) -> bool:
     """Gate 0 (section D): canonical placement must already be readable by
     the trained reader BEFORE any dictionary is involved -- else nothing
@@ -1240,6 +1250,13 @@ def main() -> None:  # noqa: PLR0915
         help="download every configured dictionary (gist_dict/dict_<cfg>.pt) and "
         "gist_dict/fit_ids.pt from --out-repo and SKIP k-means; falls back to "
         "building if any file is missing",
+    )
+    ap.add_argument(
+        "--gate0-soft",
+        action="store_true",
+        help="a failed gate 0 is recorded but does NOT skip the per-config eval "
+        "(use when scoring a retrained reader whose native reading may have "
+        "regressed a few points)",
     )
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--diagnose", action="store_true")
@@ -1661,8 +1678,16 @@ def main() -> None:  # noqa: PLR0915
             # spend hours of generation on it (verdict: INVALID_HARNESS).
             # --smoke still walks the whole path (its untrained render
             # adapter can't pass gate 0; the point is exercising the code).
-            print("[GISTDICT] GATE 0 FAILED -- skipping per-config GPU eval", flush=True)
-        if gate0_ok or args.smoke:
+            print(
+                "[GISTDICT] GATE 0 FAILED -- "
+                + (
+                    "continuing (--gate0-soft)"
+                    if args.gate0_soft
+                    else "skipping per-config GPU eval"
+                ),
+                flush=True,
+            )
+        if should_run_config_eval(gate0_ok, args.smoke, args.gate0_soft):
             wrong_idx = {
                 "gsm8k": pick_wrong_doc_indices(
                     len(eval_gsm8k), torch.Generator().manual_seed(args.seed)

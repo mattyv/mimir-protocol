@@ -772,3 +772,12 @@ def test_load_dicts_from_hf_round_trips_and_falls_back_when_missing(tmp_path):
     assert fit_ids["ro_K4"].shape == (3, 2)
     (tmp_path / "dict_ro_K4.pt").unlink()
     assert _load_dicts_from_hf("repo", names, downloader=dl) is None
+
+
+def test_should_run_config_eval_soft_gate_keeps_the_measurement():
+    from marker.run_gist_dict import should_run_config_eval
+
+    assert should_run_config_eval(True, False, False)
+    assert not should_run_config_eval(False, False, False)  # plain run: hard skip
+    assert should_run_config_eval(False, True, False)  # smoke walks the path
+    assert should_run_config_eval(False, False, True)  # retrained reader: record + continue

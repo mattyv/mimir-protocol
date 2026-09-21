@@ -63,6 +63,8 @@ TRAIN_READER="${TRAIN_READER:-}"
 READER_STEPS="${READER_STEPS:-}"
 NPAIRS="${NPAIRS:-}"
 EVAL_CONFIGS="${EVAL_CONFIGS:-}"
+RENDERSUB="${RENDERSUB:-}"          # RENDERSUB=render_adapter_snapped scores an existing pushed reader
+GATE0_SOFT="${GATE0_SOFT:-}"        # GATE0_SOFT=1: a failed gate 0 does not skip the eval (auto under TRAIN_READER/RENDERSUB)
 READER_FLAG=""
 if [ -n "$TRAIN_READER" ]; then
   READER_FLAG="--train-reader --check-mu"
@@ -71,6 +73,10 @@ if [ -n "$TRAIN_READER" ]; then
 fi
 EVAL_CONFIGS_FLAG=""
 [ -n "$EVAL_CONFIGS" ] && EVAL_CONFIGS_FLAG="--eval-configs ${EVAL_CONFIGS}"
+RENDERSUB_FLAG=""
+[ -n "$RENDERSUB" ] && RENDERSUB_FLAG="--render-subdir ${RENDERSUB}"
+GATE0_FLAG=""
+{ [ -n "$GATE0_SOFT" ] || [ -n "$TRAIN_READER" ] || [ -n "$RENDERSUB" ]; } && GATE0_FLAG="--gate0-soft"
 # poller cap must exceed TIMEOUT + setup (~20m); stage 1b's shorter TIMEOUT
 # gets a shorter cap too (spec: 240m/300 vs the base run's 330m/380).
 POLLER_CAP=$([ -n "$TRAIN_READER" ] && echo 300 || echo 380)
@@ -132,7 +138,7 @@ echo "=== GIST DICTIONARY FIDELITY (dataset=${DATASET} n-fit=${NFIT} n-eval=${NE
 timeout ${TIMEOUT} env PYTHONPATH=src python -u -m marker.run_gist_dict \
   --model-name "${MODEL}" --repo "${REPO}" --out-repo "${REPO}" \
   --dataset "${DATASET}" --n-fit "${NFIT}" --n-eval "${NEVAL}" --n-fresh "${NFRESH}" --ks "${KS}" \
-  --push-shards ${RESUME_FLAG} ${READER_FLAG} ${EVAL_CONFIGS_FLAG} \
+  --push-shards ${RESUME_FLAG} ${READER_FLAG} ${EVAL_CONFIGS_FLAG} ${RENDERSUB_FLAG} ${GATE0_FLAG} \
   --eval --diagnose 2>&1 | tee /root/gist_dict.log
 echo "GIST_DICT_RC=\${PIPESTATUS[0]}" | tee -a /root/gist_dict.log
 kill \$HB 2>/dev/null
