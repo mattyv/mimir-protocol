@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from pathlib import Path
 
 import torch
@@ -222,7 +223,14 @@ def _download_existing_shards(out_repo: str, out_subdir: str, names, out_dir) ->
 
 
 def build_corpus(
-    sources, excl: dict, gtok, shard_size: int, out_dir, existing_shards, on_shard=None
+    sources,
+    excl: dict,
+    gtok,
+    shard_size: int,
+    out_dir,
+    existing_shards,
+    on_shard=None,
+    first_shard_size: int = 200,
 ) -> dict:  # noqa: ANN001
     """`sources` = [(src_name, (question, solution) iterable, splitter), ...]
     -> counts {"docs_seen": {src: n}, "excluded": {reason: n}, "cache_hits",
@@ -257,10 +265,28 @@ def build_corpus(
         if on_shard is not None:
             on_shard(name, path)
 
+    t_start = time.time()
+    n_seen = 0
+    n_encodes = 0
+
+    def _progress(src: str, kept_n: int, reasons: dict) -> None:
+        """A multi-hour run that prints nothing until 2000 docs complete is
+        unobservable -- node 51912671 spent 100 minutes with no output and had
+        to be destroyed to diagnose it. Print a measured rate every 100 docs so
+        the FIRST minute tells us whether the throughput is survivable."""
+        el = max(1e-6, time.time() - t_start)
+        print(
+            f"[TOKENIZE_CORPUS] {src} seen={n_seen} kept={kept_n} "
+            f"encodes={n_encodes} ({n_encodes / el:.1f}/s, {kept_n / el * 60:.0f} docs/min) "
+            f"elapsed={el / 60:.1f}m excluded={dict(sorted(reasons.items()))}",
+            flush=True,
+        )
+
     for src, doc_iter, splitter in sources:
         counts["docs_seen"].setdefault(src, 0)
         for i, (question, solution) in enumerate(doc_iter):
             counts["docs_seen"][src] += 1
+            n_seen += 1
             reason = exclude_doc(question, solution, {**excl, "splitter": splitter})
             answer = None
             if reason is None:
@@ -282,6 +308,9 @@ def build_corpus(
 
             steps = splitter(solution)
             ids = [gtok.encode_step(s) for s in steps]
+            n_encodes += sum(len(g) for g in ids)
+            if kept % 100 == 0:
+                _progress(src, kept, counts["excluded"])
             buffer.append(
                 {
                     "src": src,
@@ -430,6 +459,15 @@ def main() -> None:  # noqa: PLR0915
         "reproduces the exact same 200 GSM8K-test docs",
     )
     ap.add_argument("--cache-dir", default="/tmp/gist_corpus_cache")  # noqa: S108
+    ap.add_argument(
+        "--step-cache",
+        action="store_true",
+        help="memoize encode_step to disk (one small file per step). OFF by "
+        "default for a corpus build: every step is a fresh miss, so the hash + "
+        "exists() + write is pure overhead ~250k times on a container "
+        "filesystem -- a prime suspect for node 51912671's ~1.3 encodes/s "
+        "against stage 1's 9-11/s. Turn it on for repeated/on-demand use.",
+    )
     ap.add_argument("--out-subdir", default="gist_corpus_K4096")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
@@ -461,7 +499,7 @@ def main() -> None:  # noqa: PLR0915
         tok,
         base=args.base,
         max_span=args.max_span,
-        cache_dir=str(Path(args.cache_dir) / "tok_cache"),
+        cache_dir=str(Path(args.cache_dir) / "tok_cache") if args.step_cache else None,
     )
 
     # ── B. eval sets: reproduce the stage-1b 200-doc GSM8K-test eval set
